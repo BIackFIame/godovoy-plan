@@ -45,13 +45,13 @@ def get_authorized(port, key, path):
     finally:
         conn.close()
 
-def server_flow(exe, directory):
+def server_flow(exe, directory, *, diagnose_test_volume=True):
     vault = directory / "vault"
     try:
         cli(exe, "init", vault, "Windows QA")
     except RuntimeError:
         # Read ACLs only along the temporary test volume; no profile contents.
-        for ancestor in [directory, *directory.parents]:
+        for ancestor in ([directory, *directory.parents] if diagnose_test_volume else []):
             print("Test directory permissions:", ancestor, flush=True)
             subprocess.run(["icacls.exe", str(ancestor)], check=False)
         raise
@@ -106,6 +106,17 @@ def main():
             extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
                             [online.name], standalone)
             server_flow(standalone / online.name, standalone)
+        # Exercise normal user-profile ACLs, including all ancestors of LocalAppData.
+        # Create only a unique child directory; do not repair or change inherited rights.
+        local = Path(os.environ["LOCALAPPDATA"]) / ("GodovoyQA-" + uuid.uuid4().hex)
+        local.mkdir()
+        try:
+            server_flow(online, local, diagnose_test_volume=False)
+            print("PASS: unmodified user LocalAppData accepted", flush=True)
+        finally:
+            shutil.rmtree(local)
+        if os.environ.get("GP_TEST_SCOPE") == "profile":
+            return
         for dll in ("opengl32.dll", "libgallium_wgl.dll"):
             shutil.copyfile(Path(os.environ["GP_TEST_RENDERER"]) / dll, directory / dll)
         subprocess.run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("window-smoke.ps1"),

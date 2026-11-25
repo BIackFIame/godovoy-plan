@@ -11,6 +11,11 @@ on:
         type: choice
         default: all
         options: [all, x64, x86, ARM64]
+      scope:
+        description: Проверить только профиль и сервер либо также графический интерфейс
+        type: choice
+        default: full
+        options: [full, profile]
       draft_id:
         description: Числовой ID черновика для проверки до выпуска
         type: string
@@ -92,7 +97,7 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/test-volume.ps1
       - name: Получить ранее проверенный драйвер нужной архитектуры
-        if: inputs.renderer_run != ''
+        if: inputs.scope != 'profile' && inputs.renderer_run != ''
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -101,7 +106,7 @@ jobs:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: ./packaging/windows/reuse-renderer.ps1
       - name: Собрать графический драйвер для виртуальной машины без GPU
-        if: inputs.renderer_run == ''
+        if: inputs.scope != 'profile' && inputs.renderer_run == ''
         shell: pwsh
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
@@ -120,10 +125,11 @@ jobs:
         shell: pwsh
         env:
           RELEASE_TAG: ${{ inputs.tag }}
+          GP_TEST_SCOPE: ${{ inputs.scope }}
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: python packaging/windows/smoke.py
       - name: Сохранить проверенный дополнительный рендерер
-        if: inputs.renderer_run == ''
+        if: inputs.scope != 'profile' && inputs.renderer_run == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: software-opengl-${{ matrix.arch }}
