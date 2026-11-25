@@ -7,7 +7,7 @@ use eframe::egui::{
 use godovoy_plan::model::{Category, Id};
 
 use crate::{
-    theme::{ACCENT, ACTION_TEXT, CONTROL_BORDER, INK, MUTED, PAPER, heading_font},
+    theme::{ACCENT, ACTION_TEXT, BORDER, INK, MUTED, TINT, heading_font},
     ui::{CalendarRow, event_count, short_date},
 };
 
@@ -72,30 +72,32 @@ pub fn year_wheel(
         let start = -FRAC_PI_2 + month as f32 * TAU / 12.0;
         let sweep = TAU / 12.0;
         let gap = 3.0 / radius;
+        let arc = (0..=12)
+            .map(|step| {
+                let mark = start + gap + (sweep - 2.0 * gap) * step as f32 / 12.0;
+                polar(center, radius, mark)
+            })
+            .collect();
         painter.add(Shape::line(
-            (0..=12)
-                .map(|step| {
-                    let mark = start + gap + (sweep - 2.0 * gap) * step as f32 / 12.0;
-                    polar(center, radius, mark)
-                })
-                .collect(),
-            if current {
-                Stroke::new(3.5, ACCENT)
-            } else {
-                Stroke::new(2.0, CONTROL_BORDER)
-            },
+            arc,
+            Stroke::new(
+                if current { 7.0 } else { 4.0 },
+                if current { ACCENT } else { BORDER },
+            ),
         ));
-        painter.text(
-            polar(center, radius + 19.0, start + sweep * 0.5),
-            Align2::CENTER_CENTER,
-            name,
-            if current {
-                heading_font(12.0)
-            } else {
-                FontId::proportional(12.0)
-            },
-            if current { ACTION_TEXT } else { MUTED },
-        );
+        if !needs_group(months[month], radius - 12.0) {
+            painter.text(
+                polar(center, radius + 18.0, start + sweep * 0.5),
+                Align2::CENTER_CENTER,
+                name,
+                if current {
+                    heading_font(12.0)
+                } else {
+                    FontId::proportional(12.0)
+                },
+                if current { ACTION_TEXT } else { MUTED },
+            );
+        }
     }
     if is_current_year {
         let mark = angle(today);
@@ -115,7 +117,7 @@ pub fn year_wheel(
             center - vec2(0.0, 7.0),
             Align2::CENTER_CENTER,
             MONTH_NAMES[month],
-            heading_font(if width < 235.0 { 17.0 } else { 22.0 }),
+            heading_font(if width < 235.0 { 20.0 } else { 26.0 }),
             INK,
         );
         painter.text(
@@ -140,8 +142,10 @@ pub fn year_wheel(
     for (month, rows) in months.into_iter().enumerate() {
         if needs_group(rows, marker_radius) {
             let month_angle = -FRAC_PI_2 + (month as f32 + 0.5) * TAU / 12.0;
-            let point = polar(center, marker_radius, month_angle);
-            let rect = Rect::from_center_size(point, vec2(25.0, 20.0));
+            let size = vec2(54.0, 22.0);
+            let bounds = response.rect.shrink2(size * 0.5);
+            let point = bounds.clamp(polar(center, radius + 18.0, month_angle));
+            let rect = Rect::from_center_size(point, size);
             let label = format!("{} · {}", MONTH_NAMES[month], event_count(rows.len()));
             let control = ui
                 .interact(
@@ -158,7 +162,7 @@ pub fn year_wheel(
                 )
             });
             let active = selected_event.is_some_and(|e| e.date.month0() as usize == month);
-            painter.rect_filled(rect, 6, if active { ACCENT } else { INK });
+            painter.rect_filled(rect, 6, if active { TINT } else { crate::theme::BACK });
             let count = if rows.len() > 99 {
                 "99+".to_owned()
             } else {
@@ -167,9 +171,9 @@ pub fn year_wheel(
             painter.text(
                 point,
                 Align2::CENTER_CENTER,
-                count,
+                format!("{} · {count}", MONTHS[month]),
                 heading_font(11.0),
-                PAPER,
+                if active { ACTION_TEXT } else { INK },
             );
             if control.has_focus() || control.hovered() {
                 painter.rect_stroke(

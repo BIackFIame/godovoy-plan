@@ -1118,25 +1118,37 @@ impl App {
             }
             return;
         }
-        let date_width = 80.0;
-        let row_height = 42.0;
+        let date_width = 46.0;
+        let row_height = 46.0;
         let height = ui.available_height().max(140.0);
         let mut scroll = ScrollArea::vertical()
             .id_salt("event-list")
             .max_height(height)
             .auto_shrink([false, false]);
+        let visible_rows = (height / row_height).floor().max(1.0) as usize;
+        let month_start = |index: usize| {
+            let month = events[index].date.month();
+            events[..index].partition_point(|row| row.date.month() < month)
+        };
+        // Leave enough room to bring December (or the last populated month) to the
+        // top, even when it has only a few dates. Short lists already fit in full.
+        let extra_rows = if events.len() > visible_rows {
+            (visible_rows + 1).saturating_sub(events.len() - month_start(events.len() - 1))
+        } else {
+            0
+        };
         if std::mem::take(&mut self.reveal_event)
             && let Some(index) = events
                 .iter()
                 .position(|event| Some(event.id) == self.selected)
         {
-            scroll =
-                scroll.vertical_scroll_offset((index as f32 * row_height - height * 0.45).max(0.0));
+            let first = month_start(index).max((index + 1).saturating_sub(visible_rows));
+            scroll = scroll.vertical_scroll_offset(first as f32 * row_height);
         }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            scroll.show_rows(ui, row_height, events.len(), |ui, range| {
-                for event in &events[range] {
+            scroll.show_rows(ui, row_height, events.len() + extra_rows, |ui, range| {
+                for event in &events[range.start.min(events.len())..range.end.min(events.len())] {
                     let active = self.selected == Some(event.id);
                     let (rect, response) = ui.allocate_exact_size(
                         vec2(ui.available_width(), row_height),
@@ -1175,11 +1187,19 @@ impl App {
                             egui::StrokeKind::Inside,
                         );
                     }
+                    let date_center = rect.left_center() + vec2(22.0, 0.0);
                     painter.text(
-                        rect.left_center() + vec2(8.0, 0.0),
-                        egui::Align2::LEFT_CENTER,
-                        date,
-                        egui::FontId::proportional(12.0),
+                        date_center - vec2(0.0, 6.0),
+                        egui::Align2::CENTER_CENTER,
+                        event.date.day().to_string(),
+                        heading_font(16.0),
+                        if active { ACTION_TEXT } else { INK },
+                    );
+                    painter.text(
+                        date_center + vec2(0.0, 10.0),
+                        egui::Align2::CENTER_CENTER,
+                        crate::chart::MONTHS[event.date.month0() as usize],
+                        egui::FontId::proportional(11.0),
                         MUTED,
                     );
                     draw_marker(
@@ -1190,9 +1210,9 @@ impl App {
                     );
                     let text_x = date_width + 20.0;
                     let font = if active {
-                        heading_font(13.0)
+                        heading_font(14.0)
                     } else {
-                        egui::FontId::proportional(13.0)
+                        egui::FontId::proportional(14.0)
                     };
                     let mut job = egui::text::LayoutJob::simple(
                         event.title.clone(),
@@ -1257,7 +1277,11 @@ impl App {
             _ => date,
         };
         muted(ui, when);
-        muted(ui, owner);
+        if event.event.owner.is_some() {
+            muted(ui, format!("Ответственный · {owner}"));
+        } else {
+            muted(ui, owner);
+        }
         if let Some(source) = calendar.plans[&event.id].source.as_ref() {
             muted(ui, format!("Источник · {}", source.name));
         }
@@ -1462,7 +1486,8 @@ impl App {
             }
             let active_year = event.year;
             let revision = state.revision()?;
-            state.workspace_mut()?
+            state
+                .workspace_mut()?
                 .calendar
                 .plans
                 .get_mut(&id)
@@ -1491,7 +1516,8 @@ impl App {
             }
             let active_year = event.year;
             let revision = state.revision()?;
-            state.workspace_mut()?
+            state
+                .workspace_mut()?
                 .calendar
                 .plans
                 .get_mut(&id)
@@ -1510,6 +1536,12 @@ impl App {
         egui::CentralPanel::default()
             .frame(page_frame())
             .show_inside(ui, |ui| {
+                let sheet = egui::Rect::from_min_size(
+                    ui.cursor().min,
+                    vec2(ui.available_width().min(840.0), ui.available_height()),
+                );
+                let mut sheet_ui = ui.new_child(egui::UiBuilder::new().max_rect(sheet));
+                let ui = &mut sheet_ui;
                 title(ui, "Мои задачи", PAGE_TITLE_SIZE);
                 ui.horizontal_wrapped(|ui| {
                     for (filter, label) in [
@@ -1602,23 +1634,61 @@ impl App {
                                             if let Some(task) = event.event.tasks.get(index) {
                                                 let mut checked = false;
                                                 ui.add_space(16.0);
+                                                let deadline = task_deadline(
+                                                    event.due(task),
+                                                    event.date,
+                                                    today,
+                                                );
                                                 let changed = ui
                                                     .push_id(
                                                         (event.id, event.year, task.id),
                                                         |ui| {
-                                                            ui.vertical(|ui| {
-                                                                task_checkbox(
-                                                                    ui,
-                                                                    &mut checked,
-                                                                    task,
-                                                                    event,
-                                                                    today,
+                                                            let title_width =
+                                                                (width - 214.0).max(100.0);
+                                                            let checkbox = ui
+                                                                .allocate_ui_with_layout(
+                                                                    vec2(title_width, 36.0),
+                                                                    Layout::left_to_right(
+                                                                        Align::Center,
+                                                                    ),
+                                                                    |ui| {
+                                                                        ui.spacing_mut()
+                                                                            .icon_spacing = 7.0;
+                                                                        ui.checkbox(
+                                                                            &mut checked,
+                                                                            semibold(
+                                                                                &task.title,
+                                                                                15.0,
+                                                                                INK,
+                                                                            ),
+                                                                        )
+                                                                    },
                                                                 )
-                                                            })
-                                                            .inner
+                                                                .inner
+                                                                .on_hover_text(&task.title);
+                                                            checkbox.widget_info(|| {
+                                                                egui::WidgetInfo::selected(
+                                                                    egui::WidgetType::Checkbox,
+                                                                    ui.is_enabled(),
+                                                                    checked,
+                                                                    format!(
+                                                                        "{}, {}",
+                                                                        task.title,
+                                                                        deadline.text()
+                                                                    ),
+                                                                )
+                                                            });
+                                                            checkbox.changed()
                                                         },
                                                     )
                                                     .inner;
+                                                ui.with_layout(
+                                                    Layout::right_to_left(Align::Center),
+                                                    |ui| {
+                                                        ui.add_space(10.0);
+                                                        ui.label(deadline.size(13.0));
+                                                    },
+                                                );
                                                 if changed {
                                                     self.check(
                                                         event.id, event.year, task.id, checked,
@@ -1627,31 +1697,41 @@ impl App {
                                             }
                                         } else {
                                             legend_marker(ui, event.event.category);
-                                            let title_width = (width - 265.0).max(140.0);
+                                            let title_width = (width - 204.0).max(100.0);
                                             ui.allocate_ui_with_layout(
                                                 vec2(title_width, 34.0),
                                                 Layout::left_to_right(Align::Center),
                                                 |ui| {
-                                                    ui.set_width(title_width);
-                                                    ui.add(
-                                                        egui::Label::new(semibold(
-                                                            &event.event.title,
-                                                            16.0,
-                                                            INK,
-                                                        ))
-                                                        .truncate(),
-                                                    )
-                                                    .on_hover_text(&event.event.title)
+                                                    let link = ui
+                                                        .add(
+                                                            egui::Button::new(semibold(
+                                                                &event.event.title,
+                                                                14.0,
+                                                                ACTION_TEXT,
+                                                            ))
+                                                            .frame_when_inactive(false)
+                                                            .truncate(),
+                                                        )
+                                                        .on_hover_text(format!(
+                                                            "Открыть событие «{}»",
+                                                            event.event.title
+                                                        ));
+                                                    if link.clicked() {
+                                                        self.open_event(event.year, event.id);
+                                                    }
                                                 },
                                             );
-                                            muted(ui, short_date(event.date));
                                             ui.with_layout(
                                                 Layout::right_to_left(Align::Center),
                                                 |ui| {
-                                                    if ui.add(quiet("Открыть событие")).clicked()
-                                                    {
-                                                        self.open_event(event.year, event.id);
-                                                    }
+                                                    ui.add_space(10.0);
+                                                    muted(
+                                                        ui,
+                                                        format!(
+                                                            "Событие · {}",
+                                                            short_date(event.date)
+                                                        ),
+                                                    );
                                                 },
                                             );
                                         }
@@ -3641,7 +3721,10 @@ impl eframe::App for App {
             || self.notification.busy()
         {
             Duration::from_millis(250)
-        } else if (self.network.as_ref().is_ok_and(Network::can_sync_automatically)
+        } else if (self
+            .network
+            .as_ref()
+            .is_ok_and(Network::can_sync_automatically)
             || self.api_controls.running_port().is_some())
             && !ctx.input(|input| input.viewport().minimized == Some(true))
         {
@@ -3650,9 +3733,8 @@ impl eframe::App for App {
         } else {
             // egui subtracts a predicted frame from repaint delays. Compensate
             // when waiting for an absolute deadline to avoid spinning just before it.
-            let frame_lead = ctx.input(|input| {
-                Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default()
-            });
+            let frame_lead = ctx
+                .input(|input| Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default());
             self.next_reminder_check
                 .saturating_duration_since(Instant::now())
                 .saturating_add(frame_lead)
