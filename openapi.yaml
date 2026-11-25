@@ -158,11 +158,12 @@ components:
         error: { type: string }
     Member:
       type: object
-      required: [id, name, revoked]
+      required: [id, name, revoked, employeeId]
       properties:
         id: { type: string, format: uuid }
         name: { type: string }
-        revoked: { type: boolean, description: True for a historical device whose access was revoked. New assignments require an active device. }
+        employeeId: { type: string, format: uuid, description: Идентификатор сотрудника для назначений. }
+        revoked: { type: boolean, description: Доступ этого устройства отозван. }
     Category:
       type: string
       enum: [Campaign, Partners, Team, Operations]
@@ -184,7 +185,7 @@ components:
           items: { $ref: '#/components/schemas/TaskInput' }
     Event:
       type: object
-      required: [id, year, title, description, date, category, yearly, ownerId, preparationDays, preparationDate, checklist, diary, source]
+      required: [id, year, title, description, date, category, yearly, ownerId, employeeId, preparationDays, preparationDate, checklist, diary, source]
       properties:
         id: { type: string, format: uuid }
         year: { type: integer }
@@ -193,7 +194,8 @@ components:
         description: { type: string }
         category: { $ref: '#/components/schemas/Category' }
         yearly: { type: boolean }
-        ownerId: { type: [string, 'null'], format: uuid }
+        ownerId: { type: [string, 'null'], format: uuid, description: Сохранённый идентификатор назначения. }
+        employeeId: { type: [string, 'null'], format: uuid, description: Текущий сотрудник с учётом объединения устройств. }
         preparationDays: { type: integer }
         preparationDate: { type: string, format: date }
         checklist:

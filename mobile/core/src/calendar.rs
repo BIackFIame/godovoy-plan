@@ -2,7 +2,7 @@ use super::{Session, alerts, year_check};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use godovoy_plan::{
     Fallible,
-    model::{Event, Id, Occurrence, Record},
+    model::{Calendar, Event, Id, Occurrence, Record},
     planning::{Milestone, Reminder, due_reminders, personal_events},
     storage::{LocalState, SharedStore},
 };
@@ -30,10 +30,10 @@ pub(super) struct LastState {
     token: Id,
 }
 
-fn occurrence(e: Occurrence<'_>) -> Value {
+fn occurrence(calendar: &Calendar, e: Occurrence<'_>) -> Value {
     let tasks = e.event.tasks.iter().map(|t| json!({"id":t.id,"title":t.title,"dueDate":e.due(t),"daysBefore":t.days_before,"done":e.checked(t.id)})).collect::<Vec<_>>();
     json!({"id":e.id,"year":e.year,"title":e.event.title,"date":e.date,"description":e.event.description,
-        "yearly":e.event.yearly,"category":e.event.category,"ownerId":e.event.owner,
+        "yearly":e.event.yearly,"category":e.event.category,"ownerId":e.event.owner,"employeeId":e.event.owner.map(|id|calendar.person_for(id)),
         "preparationDate":e.preparation_date(),"preparationDays":e.event.preparation_days,
         "note":e.note(),"revision":format!("{}:{}",e.revision.sequence,e.revision.operation),"checklist":tasks})
 }
@@ -83,7 +83,7 @@ pub(super) fn state(session: &mut Session, year: i32, if_token: Option<Id>) -> F
         return Ok(json!({"unchanged":true}));
     }
     let token = previous.unwrap_or_else(Id::new_v4);
-    let mut result = json!({"deviceId":snapshot.device,"workspaceName":null,"year":year,"members":[],"events":[],"tasks":[],"reminders":[],"notificationDates":[],
+    let mut result = json!({"deviceId":snapshot.device,"employeeId":null,"employees":[],"workspaceName":null,"year":year,"members":[],"events":[],"tasks":[],"reminders":[],"notificationDates":[],
         "address":context.address, "networkError":context.warning, "paused":context.paused, "stateToken":token,
         "lastSync":context.last_sync.and_then(|s| DateTime::from_timestamp(s,0)).map(|d|d.to_rfc3339()),
         "canManage":false,"accessManagerId":null});
@@ -113,6 +113,13 @@ pub(super) fn state(session: &mut Session, year: i32, if_token: Option<Id>) -> F
             })
             .collect::<Vec<_>>();
         result["notificationDates"] = json!(alerts::dates(&w.calendar, snapshot.device, today));
+        result["employeeId"] = json!(w.calendar.person_for(snapshot.device));
+        result["employees"] = json!(
+            w.employees()
+                .into_iter()
+                .map(|(id, name)| json!({"id":id,"name":name}))
+                .collect::<Vec<_>>()
+        );
         result["workspaceName"] = json!(w.name);
         result["accessManagerId"] = json!(w.access_manager);
         result["canManage"] = json!(w.access_manager.is_none_or(|id| id == snapshot.device));
@@ -120,12 +127,22 @@ pub(super) fn state(session: &mut Session, year: i32, if_token: Option<Id>) -> F
             w.calendar
                 .members
                 .iter()
-                .map(|(id, n)| json!({"id":id,"name":n.value,"revoked":w.is_revoked(*id)}))
+                .map(|(id, n)| json!({"id":id,"name":n.value,"revoked":w.is_revoked(*id),"employeeId":w.calendar.person_for(*id)}))
                 .collect::<Vec<_>>()
         );
-        result["events"] =
-            Value::Array(w.calendar.year(year).into_iter().map(occurrence).collect());
-        result["tasks"] = Value::Array(personal.into_iter().map(occurrence).collect());
+        result["events"] = Value::Array(
+            w.calendar
+                .year(year)
+                .into_iter()
+                .map(|e| occurrence(&w.calendar, e))
+                .collect(),
+        );
+        result["tasks"] = Value::Array(
+            personal
+                .into_iter()
+                .map(|e| occurrence(&w.calendar, e))
+                .collect(),
+        );
         result["reminders"] = Value::Array(reminders);
     }
     Ok(result)

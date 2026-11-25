@@ -10,10 +10,10 @@
 
 | Устройство | Пакет и установка |
 |---|---|
-| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
-| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
-| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
-| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.41/GodovoyPlan-0.5.41-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
+| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
+| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
+| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
+| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.42/GodovoyPlan-0.5.42-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
 
 Все файлы выпуска и их контрольные суммы доступны в [GitHub Releases](https://github.com/BIackFIame/godovoy-plan/releases/latest).
 
@@ -23,6 +23,8 @@
 2. Чтобы подключить коллегу, попросите его выбрать **Присоединиться** и прислать **запрос устройства**. В разделе **Синхронизация** создайте по этому запросу код и передайте его коллеге. Код действует 15 минут. Оба приложения должны оставаться открытыми и видеть друг друга в локальной сети.
 3. Создайте событие, например «Поздравить партнёров» на 20 декабря. Включите ежегодный повтор, назначьте ответственного и укажите начало подготовки 5 ноября. В чек-листе задайте сроки для списка адресатов, согласования текста и отправки.
 4. С начала подготовки событие появится в **Моих задачах** ответственного. Итог можно записать в дневнике. В следующем году список дел повторится с чистыми отметками, а запись за прошлый год сохранится.
+
+Если у сотрудника есть компьютер и телефон, после подключения свяжите их в разделе **Синхронизация → Устройства сотрудников**. Личные задачи будут видны на обоих устройствах. Доступ к каждому можно отозвать отдельно. [Пошаговая инструкция](GUIDE.md#один-сотрудник-на-компьютере-и-телефоне)
 
 ## Обмен и доступ
 

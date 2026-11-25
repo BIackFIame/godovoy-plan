@@ -26,8 +26,8 @@ use tokio::{
 use crate::{
     Fallible,
     model::{
-        Category, Event, ExternalSource, Id, MAX_PLANS, Occurrence, PLAN_LIMIT_ERROR, Record, Task,
-        YearChange,
+        Calendar, Category, Event, ExternalSource, Id, MAX_PLANS, Occurrence, PLAN_LIMIT_ERROR,
+        Record, Task, YearChange,
     },
     storage::{
         ImportResultKind, LocalState, ProfileSnapshot, ProfileUsage, SharedStore, Store,
@@ -308,6 +308,7 @@ struct EventView {
     date: NaiveDate,
     yearly: bool,
     owner_id: Option<Id>,
+    employee_id: Option<Id>,
     preparation_days: u16,
     preparation_date: NaiveDate,
     checklist: Vec<TaskView>,
@@ -324,7 +325,7 @@ struct TaskView {
     done: bool,
 }
 
-fn view(event: Occurrence<'_>, source: Option<ExternalSource>) -> EventView {
+fn view(event: Occurrence<'_>, calendar: &Calendar) -> EventView {
     EventView {
         id: event.id,
         year: event.year,
@@ -334,6 +335,7 @@ fn view(event: Occurrence<'_>, source: Option<ExternalSource>) -> EventView {
         date: event.date,
         yearly: event.event.yearly,
         owner_id: event.event.owner,
+        employee_id: event.event.owner.map(|id| calendar.person_for(id)),
         preparation_days: event.event.preparation_days,
         preparation_date: event.preparation_date(),
         checklist: event
@@ -349,7 +351,7 @@ fn view(event: Occurrence<'_>, source: Option<ExternalSource>) -> EventView {
             })
             .collect(),
         diary: event.note().to_owned(),
-        source,
+        source: calendar.plans[&event.id].source.clone(),
     }
 }
 
@@ -374,7 +376,7 @@ async fn list(
             .into_iter()
             .skip(query.offset.unwrap_or(0))
             .take(max)
-            .map(|event| view(event, calendar.plans[&event.id].source.clone()))
+            .map(|event| view(event, calendar))
             .collect(),
     ))
 }
@@ -394,12 +396,14 @@ async fn event(
     let occurrence = calendar
         .event(id, year)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Событие не найдено."))?;
-    Ok(Json(view(occurrence, calendar.plans[&id].source.clone())))
+    Ok(Json(view(occurrence, calendar)))
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct Member {
     id: Id,
+    employee_id: Id,
     name: String,
     revoked: bool,
 }
@@ -415,6 +419,7 @@ async fn members(Extension(snapshot): Extension<ProfileSnapshot>) -> ApiResult<J
                 id,
                 name: entry.value.clone(),
                 revoked: workspace.is_revoked(id),
+                employee_id: workspace.calendar.person_for(id),
             })
             .collect(),
     ))
@@ -471,6 +476,12 @@ fn build_event(
     let previous_owner = existing.and_then(|event| event.owner);
     let owner = input.owner_id.or(previous_owner);
     workspace.check_assignment(previous_owner, owner)?;
+    // Preserve the original owner when importing updates to a historical event.
+    let owner = if owner == previous_owner {
+        previous_owner
+    } else {
+        owner.map(|id| workspace.calendar.person_for(id))
+    };
     let tasks = if let Some(input) = input.checklist {
         input
             .into_iter()
@@ -550,13 +561,17 @@ fn create_event(
         .transaction(|state| {
             let event = build_event(input, id, None, state)?;
             let revision = state.revision()?;
-            let plan = state.workspace_mut()?.calendar.plans.entry(id).or_default();
-            plan.templates
+            let calendar = &mut state.workspace_mut()?.calendar;
+            calendar
+                .plans
+                .entry(id)
+                .or_default()
+                .templates
                 .insert(year, Record::new(revision, Some(event.into())));
-            let event = plan
+            let event = calendar
                 .event(id, year)
                 .ok_or("Не удалось прочитать созданное событие.")?;
-            Ok(view(event, None))
+            Ok(view(event, calendar))
         })
         .map_err(|e| invalid(e.to_string()))
 }

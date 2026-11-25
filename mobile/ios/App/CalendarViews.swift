@@ -66,7 +66,7 @@ struct DetailView: View {
     var body: some View {
         List {
             if let event {
-                Section { LabeledContent("Дата", value: GPDate.label(event.date)); LabeledContent("Начало подготовки", value: GPDate.label(event.preparationDate)); if let owner = model.state?.ownerName(event.ownerId) { LabeledContent("Ответственный", value: owner) }; if event.yearly { Label("Ежегодно", systemImage: "repeat") }; if !event.description.isEmpty { Text(event.description) } }
+                Section { LabeledContent("Дата", value: GPDate.label(event.date)); LabeledContent("Начало подготовки", value: GPDate.label(event.preparationDate)); if let owner = model.state?.ownerName(event.employeeId) { LabeledContent("Ответственный", value: owner) }; if event.yearly { Label("Ежегодно", systemImage: "repeat") }; if !event.description.isEmpty { Text(event.description) } }
                 if !event.checklist.isEmpty {
                     Section("Чек-лист") { ForEach(event.checklist) { t in
                         Button { Task { if await model.run("check", ["eventId": .string(id), "year": .integer(year), "taskId": .string(t.id), "done": .flag(!t.done)]) { await reload() } } } label: {

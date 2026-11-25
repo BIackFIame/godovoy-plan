@@ -79,6 +79,10 @@ enum Command {
         code: String,
         address: Option<SocketAddrV4>,
     },
+    LinkEmployeeDevice {
+        device_id: Id,
+        employee_id: Id,
+    },
     Revoke {
         device_ids: BTreeSet<Id>,
     },
@@ -312,6 +316,16 @@ impl Mobile {
                     .rejoin_async(code.trim().to_owned(), address)
                     .recv()??;
                 self.refresh()?;
+            }
+            Command::LinkEmployeeDevice {
+                device_id,
+                employee_id,
+            } => {
+                session
+                    .store
+                    .lock()
+                    .map_err(|_| "Профиль недоступен.")?
+                    .link_employee_device(device_id, employee_id)?;
             }
             Command::Revoke { device_ids } => {
                 session.net()?.revoke_devices_async(device_ids).recv()??;

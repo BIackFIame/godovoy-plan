@@ -33,13 +33,14 @@ struct GPError: LocalizedError {
     init(_ message: String) { self.message = message }
 }
 
-struct GPMember: Decodable, Identifiable { let id, name: String; let revoked: Bool }
+struct GPMember: Decodable, Identifiable { let id, name, employeeId: String; let revoked: Bool }
+struct GPEmployee: Decodable, Identifiable { let id, name: String }
 struct GPTask: Decodable, Identifiable { let id, title, dueDate: String; let done: Bool; let daysBefore: Int }
 struct GPEvent: Decodable, Identifiable {
     let id, title, date, category, preparationDate, note, description: String
     let year, preparationDays: Int
     let yearly: Bool
-    let ownerId: String?
+    let ownerId, employeeId: String?
     let checklist: [GPTask]
     let revision: String
     var month: Int { Int(date.dropFirst(5).prefix(2)) ?? 0 }
@@ -50,10 +51,17 @@ struct GPState: Decodable {
     let workspaceName, address, networkError, lastSync, accessManagerId, stateToken: String?
     let year: Int
     let canManage, paused: Bool
+    let employees: [GPEmployee]
     let members: [GPMember]
     let events, tasks: [GPEvent]
     let reminders: [GPReminder]
     let notificationDates: [String]
+    func employeeLabel(_ person: GPEmployee) -> String {
+        if employees.contains(where: { $0.name == person.name && $0.id != person.id }) {
+            return "\(person.name) · \(person.id.prefix(8))"
+        }
+        return person.name
+    }
     func ownerName(_ id: String?) -> String? { members.first { $0.id == id }?.name }
 }
 

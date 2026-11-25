@@ -16,7 +16,7 @@ import org.json.JSONObject;
 final class EventForm {
     private final MainActivity activity;
     private final JSONObject previous;
-    private final List<String> memberIds = new ArrayList<>();
+    private final List<String> employeeIds = new ArrayList<>();
     private final List<TaskFields> tasks = new ArrayList<>();
     private EditText title, preparation, description;
     private Spinner category, assignee, scope;
@@ -59,17 +59,18 @@ final class EventForm {
         category = choices(form, "Категория", CAT_NAMES, categoryIndex < 0 ? 3 : categoryIndex);
         List<String> names = new ArrayList<>();
         names.add("Без ответственного");
-        memberIds.add("");
-        String initialOwner = previous == null ? str(activity.state, "deviceId") : str(previous, "ownerId");
-        for (JSONObject m : items(array(activity.state, "members"))) {
-            String id = str(m, "id");
-            if (!m.optBoolean("revoked") || id.equals(initialOwner)) {
-                memberIds.add(id);
-                names.add(str(m, "name") + (m.optBoolean("revoked") ? " (доступ отозван)" : ""));
-            }
+        employeeIds.add("");
+        String initialOwner = previous == null ? str(activity.state, "employeeId") : str(previous, "employeeId");
+        for (JSONObject person : items(array(activity.state, "employees"))) {
+            employeeIds.add(str(person, "id"));
+            names.add(activity.employeeLabel(person));
+        }
+        if (!initialOwner.isEmpty() && !employeeIds.contains(initialOwner)) {
+            employeeIds.add(initialOwner);
+            names.add(activity.owner(initialOwner) + " · нет активных устройств");
         }
         assignee = choices(form, "Ответственный", names.toArray(new String[0]),
-                Math.max(0, memberIds.indexOf(initialOwner)));
+                Math.max(0, employeeIds.indexOf(initialOwner)));
         preparation = numberField(form, "За сколько дней начать подготовку",
                 previous == null ? 30 : previous.optInt("preparationDays"));
         activity.label(form, "Чек-лист", 18);
@@ -154,7 +155,9 @@ final class EventForm {
                 item.put("id", task.id);
             checklist.put(item);
         }
-        String owner = memberIds.get(assignee.getSelectedItemPosition());
+        String owner = employeeIds.get(assignee.getSelectedItemPosition());
+        if (previous != null && owner.equals(str(previous, "employeeId")))
+            owner = str(previous, "ownerId");
         JSONObject command = message(previous == null ? "createEvent" : "editEvent", "title", value(title),
                 "date", date.toString(), "description", description.getText().toString(), "yearly",
                 yearly.isChecked(), "preparationDays", lead, "ownerId", owner.isEmpty() ? null : owner,

@@ -206,6 +206,15 @@ public final class MainActivity extends Activity {
                 return str(m, "name");
         return "";
     }
+    String employeeLabel(JSONObject person) {
+        String name = str(person, "name");
+        String id = str(person, "id");
+        for (JSONObject other : items(array(state, "employees"))) {
+            if (name.equals(str(other, "name")) && !id.equals(str(other, "id")))
+                return name + " · " + id.substring(0, 8);
+        }
+        return name;
+    }
     static List<JSONObject> items(JSONArray a) {
         List<JSONObject> out = new ArrayList<>();
         for (int i = 0; i < a.length(); i++) {
@@ -451,7 +460,7 @@ public final class MainActivity extends Activity {
         });
     }
     private Row eventRow(JSONObject e) {
-        String who = owner(str(e, "ownerId"));
+        String who = owner(str(e, "employeeId"));
         String date = pretty(str(e, "date"));
         return new Row(str(e, "title"), date + (who.isEmpty() ? "" : "  ·  " + who), str(e, "id"),
                 e.optInt("year", year));
@@ -567,7 +576,7 @@ public final class MainActivity extends Activity {
         form.addView(button("‹ Назад", this::onBackPressed));
         label(form, str(e, "title"), 24);
         hint(form, pretty(str(e, "date")) + "  ·  " + catName(str(e, "category")));
-        String who = owner(str(e, "ownerId"));
+        String who = owner(str(e, "employeeId"));
         if (!who.isEmpty())
             hint(form, "Ответственный · " + who);
         hint(form,
@@ -726,11 +735,51 @@ public final class MainActivity extends Activity {
             String id = str(m, "id");
             hint(form,
                     str(m, "name") + (id.equals(str(state, "deviceId")) ? " · это устройство" : "")
-                            + (m.optBoolean("revoked") ? " · доступ отозван" : "") + "\n" + id);
+                            + (m.optBoolean("revoked") ? " · доступ отозван" : "") + "\n" + id
+                            + (!id.equals(str(m, "employeeId")) ? "\nНазначения: " + owner(str(m, "employeeId")) : ""));
         }
         if (state.optBoolean("canManage")) {
+            form.addView(button("Связать устройства сотрудника…", this::selectDeviceForAssignments));
             form.addView(button("Отозвать доступ…", this::revoke));
         }
+    }
+    private void selectDeviceForAssignments() {
+        List<JSONObject> devices = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        for (JSONObject member : items(array(state, "members"))) {
+            if (member.optBoolean("revoked")) continue;
+            devices.add(member);
+            labels.add(str(member, "name") + "\n" + str(member, "id"));
+        }
+        if (devices.size() < 2) {
+            feedback("Сначала подключите второе устройство к календарю.");
+            return;
+        }
+        chooser("Какое устройство связать?", labels.toArray(new String[0]), -1,
+                n -> selectEmployeeForDevice(devices.get(n)));
+    }
+    private void selectEmployeeForDevice(JSONObject device) {
+        String id = str(device, "id");
+        String current = str(device, "employeeId");
+        List<String> ids = new ArrayList<>();
+        List<String> labels = new ArrayList<>();
+        ids.add(id);
+        labels.add("Устройство отдельно");
+        for (JSONObject person : items(array(state, "employees"))) {
+            if (id.equals(str(person, "id"))) continue;
+            ids.add(str(person, "id"));
+            labels.add(employeeLabel(person));
+        }
+        chooser("Чьи задачи показывать?", labels.toArray(new String[0]), ids.indexOf(current), n -> {
+            String employee = ids.get(n);
+            if (employee.equals(current)) return;
+            String explanation = employee.equals(id)
+                    ? "Устройство снова получит отдельный список задач."
+                    : "На устройствах сотрудника будет общий список задач и напоминаний.";
+            confirm("Изменить назначения?", str(device, "name") + "\n" + id + "\n" + explanation,
+                    "Применить", () -> action(message("linkEmployeeDevice", "deviceId", id,
+                            "employeeId", employee), null));
+        });
     }
     private void revoke() {
         List<JSONObject> candidates = new ArrayList<>();

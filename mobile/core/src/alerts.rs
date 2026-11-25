@@ -10,9 +10,10 @@ pub(super) fn dates(calendar: &Calendar, member: Id, today: NaiveDate) -> Vec<Na
     let last_event = end
         .checked_add_days(Days::new(366))
         .unwrap_or(NaiveDate::MAX);
+    let employee = calendar.person_for(member);
     let mut dates = BTreeSet::new();
     for event in (today.year()..=last_event.year()).flat_map(|year| calendar.occurrences(year)) {
-        if event.event.owner != Some(member)
+        if event.event.owner.map(|id| calendar.person_for(id)) != Some(employee)
             || (!event.event.tasks.is_empty() && event.completed() == event.event.tasks.len())
         {
             continue;

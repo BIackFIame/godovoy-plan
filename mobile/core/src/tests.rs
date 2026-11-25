@@ -1,4 +1,5 @@
 use super::ffi::*;
+use chrono::{Datelike, Local};
 use godovoy_plan::{
     exchange,
     model::Id,
@@ -200,6 +201,9 @@ fn actual_desktop_peer_syncs_with_mobile_and_retires_its_key() {
     assert_eq!(renewed["canManage"], false);
     assert_eq!(renewed["events"][0]["title"], "Поздравления партнёрам");
     phone.reject(json!({"op":"renew"}));
+    phone.reject(
+        json!({"op":"linkEmployeeDevice","deviceId":id,"employeeId":renewed["accessManagerId"]}),
+    );
     desktop
         .revoke_devices_async([id].into_iter().collect())
         .recv_timeout(Duration::from_secs(15))
@@ -220,7 +224,7 @@ fn actual_desktop_peer_syncs_with_mobile_and_retires_its_key() {
 }
 
 #[test]
-fn mobile_manager_can_revoke_a_desktop_and_reopen_active_profile() {
+fn linked_employees_share_personal_work_but_keep_independent_device_access() {
     let tmp = TempDir::new().unwrap();
     let path = tmp.path().join("manager");
     let phone = Phone::open(&path);
@@ -242,7 +246,7 @@ fn mobile_manager_can_revoke_a_desktop_and_reopen_active_profile() {
     desktop
         .join_async(
             invite.as_str().unwrap().into(),
-            "Сотрудник".into(),
+            "Руководитель".into(),
             Some(address),
         )
         .recv_timeout(Duration::from_secs(15))
@@ -250,9 +254,49 @@ fn mobile_manager_can_revoke_a_desktop_and_reopen_active_profile() {
         .unwrap();
     let id = store.lock().unwrap().state().device;
     desktop.set_profile_paused(true).unwrap();
+    let own = &state["deviceId"];
+    let today = Local::now().date_naive();
+    let year = today.year();
+    let due = |owner: Value| {
+        json!({"op":"createEvent","title":"Общая подготовка",
+        "date":today,"yearly":false,"ownerId":owner,"category":"Partners","preparationDays":0,
+        "checklist":[{"title":"Отправить","daysBefore":0}]})
+    };
+    phone.ok(due(json!(id)));
+    let before = phone.state(year);
+    assert_eq!(
+        before["employees"].as_array().unwrap().len(),
+        2,
+        "equal display names must stay separate"
+    );
+    assert_eq!(before["tasks"], json!([]));
+    assert_eq!(before["notificationDates"], json!([]));
+
+    let link = json!({"op":"linkEmployeeDevice","deviceId":own,"employeeId":id});
+    phone.ok(link.clone());
+    let joined = phone.state(year);
+    assert_ne!(before["stateToken"], joined["stateToken"]);
+    assert_eq!(joined["employeeId"], json!(id));
+    assert_eq!(joined["employees"].as_array().unwrap().len(), 1);
+    assert_eq!(joined["members"].as_array().unwrap().len(), 2);
+    assert_eq!(joined["tasks"].as_array().unwrap().len(), 1);
+    assert!(!joined["reminders"].as_array().unwrap().is_empty());
+    assert_eq!(joined["notificationDates"], json!([today]));
+    phone.ok(json!({"op":"linkEmployeeDevice","deviceId":own,"employeeId":own}));
+    assert_eq!(phone.state(year)["tasks"], json!([]));
+    phone.ok(link);
+
     let stale = phone.ok(json!({"op":"export"}));
     phone.ok(json!({"op":"revoke","deviceIds":[id]}));
-    let current = phone.state(2027);
+    let current = phone.state(year);
+    assert_eq!(
+        current["employees"][0]["id"],
+        json!(id),
+        "revoked anchor is still a person with an active phone"
+    );
+    assert_eq!(current["tasks"].as_array().unwrap().len(), 1);
+    phone.ok(due(json!(id)));
+    phone.reject(json!({"op":"linkEmployeeDevice","deviceId":id,"employeeId":own}));
     assert_eq!(current["accessManagerId"], state["deviceId"]);
     assert_eq!(current["canManage"], true);
     assert!(
@@ -266,6 +310,8 @@ fn mobile_manager_can_revoke_a_desktop_and_reopen_active_profile() {
     phone.reject(json!({"op":"import","path":stale}));
     drop(phone);
     let phone = Phone::open(&path);
-    assert_eq!(phone.state(2027)["accessManagerId"], state["deviceId"]);
+    let reopened = phone.state(year);
+    assert_eq!(reopened["accessManagerId"], state["deviceId"]);
+    assert_eq!(reopened["tasks"].as_array().unwrap().len(), 2);
     phone.reject(json!({"op":"invite","request":request}));
 }

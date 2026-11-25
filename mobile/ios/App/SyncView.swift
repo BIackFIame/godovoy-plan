@@ -70,13 +70,22 @@ struct SyncView: View {
                 Section("Устройства команды") {
                     ForEach(state.members) { m in
                         HStack {
-                            VStack(alignment: .leading) { Text(m.name); Text(m.id).font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled) }
+                            VStack(alignment: .leading) {
+                                Text(m.name)
+                                Text(m.id).font(.caption2.monospaced()).foregroundStyle(.secondary).textSelection(.enabled)
+                                if m.id != m.employeeId, let person = state.ownerName(m.employeeId) {
+                                    Text("Назначения: \(person)").font(.caption).foregroundStyle(.secondary)
+                                }
+                            }
                             Spacer()
                             if m.id == state.deviceId { Text("Вы").foregroundStyle(.secondary) }
                             else if m.revoked { Text("Отозвано").foregroundStyle(.secondary) }
                         }
                     }
-                    if state.canManage { NavigationLink("Управлять доступом") { access(state) } }
+                    if state.canManage {
+                        NavigationLink("Связать устройства сотрудника") { deviceLinks }
+                        NavigationLink("Управлять доступом") { access(state) }
+                    }
                     else if let manager = state.ownerName(state.accessManagerId) { LabeledContent("Управляющее устройство", value: manager) }
                 }
                 Section {
@@ -101,6 +110,25 @@ struct SyncView: View {
             exported = nil
             switch result { case .success: message = "Файл обмена сохранён"; case .failure(let error): if (error as NSError).code != NSUserCancelledError { model.failure = error.localizedDescription } }
         }
+    }
+    private var deviceLinks: some View {
+        List {
+            if let state = model.state, state.canManage {
+                Section {
+                    ForEach(state.members.filter { !$0.revoked }) { device in
+                        NavigationLink {
+                            GPDeviceAssignments(deviceID: device.id)
+                        } label: {
+                            VStack(alignment: .leading) {
+                                Text(device.name)
+                                Text(device.id).font(.caption2.monospaced()).foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                } header: { Text("Выберите устройство") }
+                  footer: { Text("Подключите оба устройства к календарю, затем выберите, чьи задачи и напоминания будут на этом устройстве.") }
+            }
+        }.navigationTitle("Устройства сотрудника")
     }
     private func access(_ state: GPState) -> some View {
         Form {
@@ -132,5 +160,36 @@ struct SyncView: View {
     private func importPlan(_ url: URL) async {
         workingFile = true; defer { workingFile = false }
         do { try await model.core.importFile(url); await model.refresh(); message = "Обмен завершён" } catch { model.failure = error.localizedDescription }
+    }
+}
+
+private struct GPDeviceAssignments: View {
+    @EnvironmentObject private var model: CalendarModel
+    @Environment(\.dismiss) private var dismiss
+    let deviceID: String
+    @State private var selection: String?
+
+    var body: some View {
+        Form {
+            if let state = model.state, state.canManage,
+               let device = state.members.first(where: { $0.id == deviceID && !$0.revoked }) {
+                let chosen = selection ?? device.employeeId
+                Section {
+                    Text(device.name)
+                    Text(device.id).font(.caption.monospaced()).textSelection(.enabled)
+                } header: { Text("Устройство") }
+                Picker("Чьи задачи показывать?", selection: Binding(get: { chosen }, set: { selection = $0 })) {
+                    Text("Устройство отдельно").tag(deviceID)
+                    ForEach(state.employees.filter { $0.id != deviceID }) { person in
+                        Text(state.employeeLabel(person)).tag(person.id)
+                    }
+                }
+                Button("Применить") {
+                    Task {
+                        if await model.run("linkEmployeeDevice", ["deviceId": .string(deviceID), "employeeId": .string(chosen)]) { dismiss() }
+                    }
+                }.disabled(model.busy || chosen == device.employeeId)
+            } else { Text("Устройство больше недоступно.") }
+        }.navigationTitle("Назначения").navigationBarTitleDisplayMode(.inline)
     }
 }

@@ -45,9 +45,11 @@ use crate::{
 
 mod api_controls;
 mod drafts;
+mod people;
 mod reminder_work;
 use api_controls::{Action as ApiAction, ApiControls};
 use drafts::{Drafts, MAX_NOTE_DRAFTS};
+use people::{DeviceAssignments, employee_options};
 use reminder_work::{ReminderWork, Status as ReminderWorkStatus};
 
 #[derive(Clone, Copy, PartialEq)]
@@ -385,6 +387,7 @@ pub struct App {
     connections: bool,
     confirm_access_renewal: bool,
     selected_revocations: BTreeSet<Id>,
+    device_assignments: DeviceAssignments,
     access_work: bool,
     pub renewed_profile: Option<std::path::PathBuf>,
     sync_message: Option<(String, bool)>,
@@ -467,6 +470,7 @@ impl App {
             connections: false,
             confirm_access_renewal: false,
             selected_revocations: BTreeSet::new(),
+            device_assignments: DeviceAssignments::default(),
             access_work: false,
             renewed_profile: None,
             sync_message: None,
@@ -2521,6 +2525,7 @@ impl App {
             || self.join_result.is_some();
         let mut renew = false;
         let mut rejoin = false;
+        let mut link = None;
 
         settings_window(ctx, "Синхронизация", &mut open, |ui| {
             ui.set_min_width(440.0);
@@ -2733,7 +2738,15 @@ impl App {
                 });
                 ui.separator();
             }
-            title(ui, "Участники", SECTION_TITLE_SIZE);
+            if workspace.access_manager.is_none_or(|id| id == state.device) {
+                ui.collapsing("Устройства сотрудников", |ui| {
+                    link = self
+                        .device_assignments
+                        .show(ui, workspace, state.device, busy);
+                });
+                ui.separator();
+            }
+            title(ui, "Подключённые устройства", SECTION_TITLE_SIZE);
             ScrollArea::vertical().max_height(135.0).show(ui, |ui| {
                 for (&id, member) in &workspace.calendar.members {
                     let status = if id == state.device {
@@ -2749,10 +2762,31 @@ impl App {
                     } else {
                         ""
                     };
-                    ui.label(format!("{}{status}", member.value));
+                    let employee = workspace.calendar.person_for(id);
+                    let name = if employee == id {
+                        member.value.clone()
+                    } else {
+                        format!(
+                            "{} · {}",
+                            owner_name(&workspace.calendar, Some(employee)),
+                            member.value
+                        )
+                    };
+                    ui.label(format!("{name}{status}"))
+                        .on_hover_text(id.to_string());
                 }
             });
         });
+        if let Some((device, employee)) = link {
+            let result = self
+                .store
+                .lock()
+                .unwrap()
+                .link_employee_device(device, employee);
+            self.device_assignments.finish(result);
+            self.next_reminder_check = Instant::now();
+            ctx.request_repaint();
+        }
         if renew || rejoin {
             let result = (|| -> Fallible<_> {
                 self.flush_local_drafts()?;
@@ -2785,6 +2819,7 @@ impl App {
         if !open {
             self.confirm_access_renewal = false;
             self.selected_revocations.clear();
+            self.device_assignments = DeviceAssignments::default();
             self.sync_message = None;
         }
         if let Some(result) = address_result {
@@ -3069,12 +3104,13 @@ impl App {
                                 OwnerFilter::Unassigned,
                                 "Без ответственного",
                             );
-                            for (&id, member) in &workspace.calendar.members {
-                                ui.selectable_value(
-                                    &mut self.owner_filter,
-                                    OwnerFilter::Member(id),
-                                    &member.value,
-                                );
+                            for (id, label) in employee_options(workspace, true) {
+                                if ui.selectable_label(
+                                    matches!(self.owner_filter, OwnerFilter::Member(member) if workspace.calendar.person_for(member) == id),
+                                    label,
+                                ).clicked() {
+                                    self.owner_filter = OwnerFilter::Member(id);
+                                }
                             }
                         });
                 });
@@ -3659,9 +3695,9 @@ fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Workspace) {
             let owner = if editor
                 .event
                 .owner
-                .is_some_and(|id| workspace.is_revoked(id))
+                .is_some_and(|id| !workspace.person_is_active(id))
             {
-                std::borrow::Cow::Owned(format!("{owner} · доступ отозван"))
+                std::borrow::Cow::Owned(format!("{owner} · нет активных устройств"))
             } else {
                 std::borrow::Cow::Borrowed(owner)
             };
@@ -3671,9 +3707,10 @@ fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Workspace) {
                 .selected_text(owner.as_ref())
                 .show_ui(ui, |ui| {
                     ui.selectable_value(&mut editor.event.owner, None, "Без ответственного");
-                    for (&id, member) in &calendar.members {
-                        if !workspace.is_revoked(id) {
-                            ui.selectable_value(&mut editor.event.owner, Some(id), &member.value);
+                    let selected = editor.event.owner.map(|id| calendar.person_for(id));
+                    for (id, label) in employee_options(workspace, false) {
+                        if ui.selectable_label(selected == Some(id), label).clicked() {
+                            editor.event.owner = Some(id);
                         }
                     }
                 })
@@ -4127,10 +4164,10 @@ fn resolve_item(
 }
 
 fn owner_name(calendar: &Calendar, id: Option<Id>) -> &str {
-    id.and_then(|id| calendar.members.get(&id))
-        .map_or("Без ответственного", |member| {
-            &member.value
-        })
+    match id {
+        Some(id) => calendar.person_name(id).unwrap_or("Неизвестный сотрудник"),
+        None => "Без ответственного",
+    }
 }
 
 fn parse_address(input: &str) -> Fallible<SocketAddrV4> {

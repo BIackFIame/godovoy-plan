@@ -29,7 +29,7 @@ struct EventEditor: View {
         _yearly = State(initialValue: event?.yearly ?? false)
         _prep = State(initialValue: event?.preparationDays ?? 7)
         _category = State(initialValue: event?.category ?? "Team")
-        _owner = State(initialValue: event?.ownerId ?? "")
+        _owner = State(initialValue: event?.employeeId ?? "")
         _details = State(initialValue: event?.description ?? "")
         _tasks = State(initialValue: event?.checklist.map { DraftTask(savedID: $0.id, title: $0.title, days: $0.daysBefore) } ?? [])
     }
@@ -43,7 +43,12 @@ struct EventEditor: View {
                 Picker("Категория", selection: $category) { ForEach(GPCategory.allCases, id: \.rawValue) { Text($0.label).tag($0.rawValue) } }
                 Picker("Ответственный", selection: $owner) {
                     Text("Без ответственного").tag("")
-                    ForEach(model.state?.members.filter { !$0.revoked || $0.id == event?.ownerId } ?? []) { person in Text(person.name + (person.revoked ? " · доступ отозван" : "")).tag(person.id) }
+                    if let state = model.state {
+                        ForEach(state.employees) { person in Text(state.employeeLabel(person)).tag(person.id) }
+                        if let original = event?.employeeId, !state.employees.contains(where: { $0.id == original }) {
+                            Text((state.ownerName(original) ?? original) + " · нет активных устройств").tag(original)
+                        }
+                    }
                 }
                 TextField("Описание", text: $details, axis: .vertical).lineLimit(2...8)
             }
@@ -70,7 +75,7 @@ struct EventEditor: View {
     }
     private var modified: Bool {
         guard let event else { return !title.isEmpty || !tasks.isEmpty || !details.isEmpty || !owner.isEmpty || yearly || prep != 7 || category != "Team" }
-        if title != event.title || details != event.description || GPDate.iso(day) != event.date || owner != (event.ownerId ?? "") || yearly != event.yearly || prep != event.preparationDays || category != event.category || tasks.count != event.checklist.count { return true }
+        if title != event.title || details != event.description || GPDate.iso(day) != event.date || owner != (event.employeeId ?? "") || yearly != event.yearly || prep != event.preparationDays || category != event.category || tasks.count != event.checklist.count { return true }
         return zip(tasks, event.checklist).contains { draft, saved in draft.savedID != saved.id || draft.title != saved.title || draft.days != saved.daysBefore }
     }
     private func save() async {
@@ -79,7 +84,8 @@ struct EventEditor: View {
             if let id = task.savedID { row["id"] = .string(id) }
             return .object(row)
         }
-        var fields: GPCommand = ["title": .string(title), "date": .string(GPDate.iso(day)), "yearly": .flag(yearly), "preparationDays": .integer(prep), "ownerId": owner.isEmpty ? .null : .string(owner), "category": .string(category), "checklist": .list(checklist), "description": .string(details)]
+        let savedOwner = event?.employeeId == owner ? (event?.ownerId ?? owner) : owner
+        var fields: GPCommand = ["title": .string(title), "date": .string(GPDate.iso(day)), "yearly": .flag(yearly), "preparationDays": .integer(prep), "ownerId": savedOwner.isEmpty ? .null : .string(savedOwner), "category": .string(category), "checklist": .list(checklist), "description": .string(details)]
         if let event { fields["eventId"] = .string(event.id); fields["year"] = .integer(event.year); fields["revision"] = .string(event.revision); fields["scope"] = .string(event.yearly ? scope : "future") }
         if await model.run(event == nil ? "createEvent" : "editEvent", fields) { model.year = GPDate.gregorian.component(.year, from: day); dismiss() }
     }

@@ -308,9 +308,46 @@ fn date_before(date: NaiveDate, days: u16) -> NaiveDate {
 pub struct Calendar {
     pub members: BTreeMap<Id, Record<String>>,
     pub plans: BTreeMap<Id, Plan>,
+    // Planning aliases only. Membership, enrollment and revocation always use device IDs.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) device_people: BTreeMap<Id, Record<Id>>,
 }
 
 impl Calendar {
+    /// Resolve a historical assignment or a device to its employee. Older calendars
+    /// and unlinked devices keep their original IDs. A self-link overrides an older
+    /// association when a device is explicitly detached.
+    pub fn person_for(&self, id: Id) -> Id {
+        let mut current = id;
+        for _ in 0..=self.device_people.len() {
+            let Some(link) = self.device_people.get(&current) else {
+                return current;
+            };
+            if link.value == current {
+                return current;
+            }
+            current = link.value;
+        }
+        // Offline peers can concurrently link A to B and B to A. All replicas
+        // pick the smallest ID in that cycle; incoming paths are not part of it.
+        let first = current;
+        let mut anchor = current;
+        while let Some(link) = self.device_people.get(&current) {
+            current = link.value;
+            if current == first {
+                break;
+            }
+            anchor = anchor.min(current);
+        }
+        anchor
+    }
+
+    pub fn person_name(&self, id: Id) -> Option<&str> {
+        self.members
+            .get(&self.person_for(id))
+            .map(|m| m.value.as_str())
+    }
+
     pub fn occurrences(&self, year: i32) -> impl Iterator<Item = Occurrence<'_>> {
         self.plans
             .iter()
@@ -341,6 +378,7 @@ impl Calendar {
 
     pub fn merge(&mut self, incoming: Self) {
         merge_map(&mut self.members, incoming.members);
+        merge_map(&mut self.device_people, incoming.device_people);
         for (id, plan) in incoming.plans {
             self.plans.entry(id).or_default().merge(plan);
         }
@@ -350,6 +388,11 @@ impl Calendar {
         self.members
             .values()
             .map(|r| r.revision.sequence)
+            .chain(
+                self.device_people
+                    .values()
+                    .map(|link| link.revision.sequence),
+            )
             .chain(self.plans.values().map(Plan::latest))
             .max()
             .unwrap_or(0)
@@ -428,6 +471,13 @@ impl Calendar {
         {
             return Err("Превышено ограничение числа участников или длины имени.");
         }
+        if self.device_people.len() > self.members.len()
+            || self.device_people.iter().any(|(device, employee)| {
+                !self.members.contains_key(device) || !self.members.contains_key(&employee.value)
+            })
+        {
+            return Err("Связь сотрудника с устройством содержит неизвестного участника.");
+        }
         for plan in self.plans.values() {
             if plan.templates.len() > 150
                 || plan.years.len() > 200
@@ -467,5 +517,55 @@ impl Calendar {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod employee_tests {
+    use super::*;
+
+    #[test]
+    fn reciprocal_offline_links_converge_and_detach_wins_over_stale_or_legacy_snapshots() {
+        let a = Id::from_u128(3);
+        let b = Id::from_u128(2);
+        let c = Id::from_u128(1);
+        let revision = |sequence, operation| Revision {
+            sequence,
+            operation,
+        };
+        let mut old = Calendar::default();
+        for device in [a, b, c] {
+            old.members
+                .insert(device, Record::new(revision(1, device), "Анна".into()));
+        }
+        let json = serde_json::to_string(&old).unwrap();
+        assert!(!json.contains("device_people"));
+        let legacy: Calendar = serde_json::from_str(&json).unwrap();
+        assert_eq!(legacy.person_for(a), a);
+        let mut left = legacy.clone();
+        let mut right = legacy.clone();
+        left.device_people.insert(a, Record::new(revision(2, a), b));
+        right
+            .device_people
+            .insert(b, Record::new(revision(2, b), a));
+        left.device_people.insert(c, Record::new(revision(3, c), a));
+        let mut reordered = right.clone();
+        reordered.merge(left.clone());
+        left.merge(right);
+        assert_eq!(left, reordered);
+        for device in [a, b, c] {
+            assert_eq!(left.person_for(device), b);
+        }
+        assert_eq!(left.latest(), 3);
+        left.device_people.insert(a, Record::new(revision(4, a), a));
+        left.merge(reordered);
+        left.merge(legacy);
+        assert_eq!(left.person_for(a), a);
+        assert_eq!(left.person_for(b), a);
+        assert_eq!(left.latest(), 4);
+        left.validate().unwrap();
+        left.device_people
+            .insert(c, Record::new(revision(5, c), Id::new_v4()));
+        assert!(left.validate().is_err());
     }
 }

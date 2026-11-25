@@ -860,8 +860,8 @@ fn revoked_owner_is_historical_and_cannot_receive_new_assignments() {
     let port = api.port();
     let members = secure::get(port, 33, "/v1/members").unwrap();
     let rows = members.as_array().unwrap();
-    assert!(rows.contains(&json!({"id":former,"name":"Борис","revoked":true})));
-    assert!(rows.contains(&json!({"id":active,"name":"Анна","revoked":false})));
+    assert!(rows.contains(&json!({"id":former,"name":"Борис","revoked":true,"employeeId":former})));
+    assert!(rows.contains(&json!({"id":active,"name":"Анна","revoked":false,"employeeId":active})));
     let bad = secure::request(
         port,
         ApiKeyKind::Main,
@@ -902,4 +902,48 @@ fn revoked_owner_is_historical_and_cannot_receive_new_assignments() {
         secure::get(port, 33, &path).unwrap()["ownerId"],
         json!(active)
     );
+}
+
+#[test]
+fn api_preserves_legacy_owner_and_reports_linked_employee() {
+    use godovoy_plan::model::Record;
+    let fixture = Fixture::new();
+    let phone = Id::new_v4();
+    let computer = fixture.store.lock().unwrap().state().device;
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|s| {
+            let revision = s.revision()?;
+            s.workspace_mut()?
+                .calendar
+                .members
+                .insert(phone, Record::new(revision, "Телефон Анны".into()));
+            Ok(())
+        })
+        .unwrap();
+    let port = fixture.server.port();
+    let batch = json!({"events":[{"externalId":"spring","event":{"date":"2027-03-15","title":"Весенняя акция","ownerId":phone}}]});
+    secure::put(port, 22, "/v1/imports/crm", &batch).unwrap();
+    fixture
+        .store
+        .lock()
+        .unwrap()
+        .link_employee_device(phone, computer)
+        .unwrap();
+    let rows = secure::get(port, 11, "/v1/members").unwrap();
+    assert!(
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .any(|row| row["id"] == json!(phone) && row["employeeId"] == json!(computer))
+    );
+    let events = secure::get(port, 11, "/v1/events?year=2027").unwrap();
+    assert_eq!(events[0]["ownerId"], json!(phone));
+    assert_eq!(events[0]["employeeId"], json!(computer));
+    let second = json!({"events":[{"externalId":"autumn","event":{"date":"2027-10-01","title":"Осенняя акция","ownerId":phone}}]});
+    secure::put(port, 22, "/v1/imports/crm", &second).unwrap();
+    let events = secure::get(port, 11, "/v1/events?year=2027").unwrap();
+    assert_eq!(events[1]["ownerId"], json!(computer));
 }

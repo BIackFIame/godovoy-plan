@@ -156,6 +156,37 @@ pub struct LocalState {
 }
 
 impl Workspace {
+    /// Active assignees, deduplicated across devices. Names alone never link accounts.
+    pub fn employees(&self) -> BTreeMap<Id, String> {
+        let mut people = BTreeMap::new();
+        for device in self
+            .calendar
+            .members
+            .keys()
+            .filter(|id| !self.is_revoked(**id))
+        {
+            let person = self.calendar.person_for(*device);
+            if let Some(name) = self.calendar.members.get(&person) {
+                people.entry(person).or_insert_with(|| name.value.clone());
+            }
+        }
+        people
+    }
+
+    pub fn person_is_active(&self, id: Id) -> bool {
+        if !self.calendar.members.contains_key(&id) {
+            return false;
+        }
+        if !self.is_revoked(id) {
+            return true;
+        }
+        let person = self.calendar.person_for(id);
+        self.calendar
+            .members
+            .keys()
+            .any(|device| !self.is_revoked(*device) && self.calendar.person_for(*device) == person)
+    }
+
     /// Historical owners stay readable; only a new assignment requires current access.
     pub fn check_assignment(&self, previous: Option<Id>, owner: Option<Id>) -> Fallible<()> {
         if let Some(id) = owner
@@ -164,7 +195,9 @@ impl Workspace {
             if !self.calendar.members.contains_key(&id) {
                 return Err("Указанный ответственный отсутствует в списке участников.".into());
             }
-            if self.is_revoked(id) {
+            if !self.person_is_active(id)
+                || (self.is_revoked(id) && self.calendar.person_for(id) != id)
+            {
                 return Err(
                     "Доступ ответственного отозван. Выберите действующего участника.".into(),
                 );
@@ -287,8 +320,7 @@ pub struct ProfileSnapshot {
 #[derive(Clone)]
 pub struct StoreReader(
     Arc<RwLock<ProfileSnapshot>>,
-    #[cfg(feature = "desktop")]
-    Arc<RwLock<import_status::View>>,
+    #[cfg(feature = "desktop")] Arc<RwLock<import_status::View>>,
 );
 
 impl StoreReader {
@@ -528,6 +560,58 @@ impl Store {
         acknowledged: &[Reminder],
     ) -> Fallible<()> {
         self.reminders.acknowledge(today, acknowledged)
+    }
+
+    /// Manager action that changes planning aliases without touching enrollment,
+    /// encryption keys or stored event records. The identity is chosen explicitly.
+    pub fn link_employee_device(&mut self, device: Id, employee: Id) -> Fallible<()> {
+        self.transaction(|state| {
+            let actor = state.device;
+            let revision = state.revision()?;
+            let workspace = state.workspace_mut()?;
+            workspace.require_manager(actor)?;
+            workspace.require_device_access(actor)?;
+            workspace.require_device_access(device)?;
+            if !workspace.calendar.members.contains_key(&device) {
+                return Err("Устройство отсутствует в этом календаре.".into());
+            }
+            if !workspace.person_is_active(employee) {
+                return Err("Выберите действующего сотрудника.".into());
+            }
+            let calendar = &mut workspace.calendar;
+            let target = if device == employee {
+                device
+            } else {
+                calendar.person_for(employee)
+            };
+            let previous = calendar.person_for(device);
+            if previous == target
+                && (device != employee
+                    || calendar
+                        .device_people
+                        .get(&device)
+                        .is_none_or(|link| link.value == device))
+            {
+                return Ok(());
+            }
+            for (&dependent, link) in &mut calendar.device_people {
+                if dependent == device || link.value != device {
+                    continue;
+                }
+                if previous == device && target != device {
+                    return Err(
+                        "Сначала отсоедините устройства, связанные с этим сотрудником.".into(),
+                    );
+                }
+                // Concurrent edits can leave a chain through this device. Keep
+                // other devices in their current group when moving this one.
+                *link = Record::new(revision, previous);
+            }
+            calendar
+                .device_people
+                .insert(device, Record::new(revision, target));
+            Ok(())
+        })
     }
 
     pub fn transaction<T>(
@@ -932,6 +1016,74 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn employee_roster_preserves_device_access_and_revoked_anchor_assignments() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("office")).unwrap();
+        let mut store = store.lock().unwrap();
+        let laptop = store.state().device;
+        let phone = Id::new_v4();
+        let guest = Id::new_v4();
+        store
+            .transaction(|s| {
+                s.create_workspace("Офис".into(), "Анна".into())?;
+                let rev = s.revision()?;
+                let members = &mut s.workspace_mut()?.calendar.members;
+                for id in [phone, guest] {
+                    members.insert(id, Record::new(rev, "Анна".into()));
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            store.state().workspace.as_ref().unwrap().employees().len(),
+            3
+        );
+        let before = store.snapshot();
+        store.link_employee_device(laptop, guest).unwrap();
+        assert!(store.link_employee_device(guest, phone).is_err());
+        store.link_employee_device(laptop, laptop).unwrap();
+        let workspace = store.state().workspace.as_ref().unwrap();
+        assert_eq!(workspace.employees().len(), 3);
+        assert_eq!(workspace.key, before.workspace.as_ref().unwrap().key);
+        assert_eq!(store.state().join_proof, before.join_proof);
+        assert!(store.link_employee_device(Id::new_v4(), guest).is_err());
+        assert!(store.link_employee_device(guest, Id::new_v4()).is_err());
+
+        // Keep the active laptop when the employee's original anchor and a
+        // secondary alias are both revoked by a real key rotation.
+        store.link_employee_device(laptop, phone).unwrap();
+        store.link_employee_device(guest, phone).unwrap();
+        store
+            .renew_workspace_key(&[phone, guest].into_iter().collect())
+            .unwrap();
+        let successor = Store::open_existing(&store.successor_directory().unwrap()).unwrap();
+        let mut current = successor.lock().unwrap();
+        let w = current.state().workspace.as_ref().unwrap().clone();
+        assert_eq!(w.employees().keys().copied().collect::<Vec<_>>(), [phone]);
+        assert!(w.require_device_access(phone).is_err());
+        assert!(w.check_assignment(None, Some(phone)).is_ok());
+        assert!(w.check_assignment(None, Some(guest)).is_err());
+        assert!(w.check_assignment(Some(guest), Some(guest)).is_ok());
+        assert!(current.link_employee_device(guest, guest).is_err());
+
+        let peer = Store::open(&tmp.path().join("peer")).unwrap();
+        let mut peer = peer.lock().unwrap();
+        peer.transaction(|s| {
+            s.workspace = Some(w);
+            let rev = s.revision()?;
+            let id = s.device;
+            s.workspace_mut()?
+                .calendar
+                .members
+                .insert(id, Record::new(rev, "Борис".into()));
+            Ok(())
+        })
+        .unwrap();
+        let id = peer.state().device;
+        assert!(peer.link_employee_device(id, laptop).is_err());
+    }
 
     fn unsuitable_filesystem(_: &Path, _: &Path) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())

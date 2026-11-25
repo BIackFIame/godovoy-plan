@@ -51,11 +51,13 @@ pub enum OwnerFilter {
 }
 
 impl OwnerFilter {
-    fn includes(self, owner: Option<Id>) -> bool {
+    fn includes(self, calendar: &Calendar, owner: Option<Id>) -> bool {
         match self {
             Self::Everyone => true,
             Self::Unassigned => owner.is_none(),
-            Self::Member(id) => owner == Some(id),
+            Self::Member(id) => {
+                owner.is_some_and(|owner| calendar.person_for(owner) == calendar.person_for(id))
+            }
         }
     }
 }
@@ -75,9 +77,14 @@ fn through(date: NaiveDate, days: u64) -> NaiveDate {
 }
 
 pub fn personal_events(calendar: &Calendar, today: NaiveDate, member: Id) -> Vec<Occurrence<'_>> {
+    let employee = calendar.person_for(member);
     let mut events: Vec<_> = (today.year() - 1..=through(today, 366).year())
         .flat_map(|year| calendar.occurrences(year))
-        .filter(|event| event.needs_attention(today, member))
+        .filter(|event| {
+            event.event.owner.is_some_and(|owner| {
+                calendar.person_for(owner) == employee && event.needs_attention(today, owner)
+            })
+        })
         .collect();
     events.sort_unstable_by_key(|event| (event.date, event.id));
     events
@@ -118,7 +125,7 @@ pub fn agenda(
     let mut result = Vec::new();
     for event in (today.year()..=through(end, 366).year())
         .flat_map(|year| calendar.occurrences(year))
-        .filter(|event| owner.includes(event.event.owner))
+        .filter(|event| owner.includes(calendar, event.event.owner))
     {
         if in_range.contains(&event.date) {
             result.push(item(event, event.date, Milestone::Event));
@@ -146,7 +153,7 @@ pub fn overdue(calendar: &Calendar, today: NaiveDate, owner: OwnerFilter) -> Vec
     let mut result = Vec::new();
     for event in (start.year()..=through(yesterday, 366).year())
         .flat_map(|year| calendar.occurrences(year))
-        .filter(|event| owner.includes(event.event.owner))
+        .filter(|event| owner.includes(calendar, event.event.owner))
     {
         append_open_tasks(&mut result, event, &in_range);
     }

@@ -310,3 +310,63 @@ fn failed_preparation_keeps_old_calendar_and_safe_retry_path() {
     let active = Store::open_existing(&Store::active_directory(&directory).unwrap()).unwrap();
     assert!(has_event(&active, event));
 }
+
+#[test]
+fn offline_employee_link_survives_file_exchange_and_one_device_revocation() {
+    use chrono::NaiveDate;
+    use godovoy_plan::planning::personal_events;
+    use std::collections::BTreeSet;
+
+    let temp = TempDir::new().unwrap();
+    let host_path = temp.path().join("office");
+    let (host_store, host) = open(&host_path);
+    host_store
+        .lock()
+        .unwrap()
+        .transaction(|s| s.create_workspace("Офис".into(), "Анна".into()))
+        .unwrap();
+    let (phone_store, phone) = open(&temp.path().join("phone"));
+    join(&host, &phone, "Анна");
+    host.set_paused(true);
+    phone.set_paused(true);
+    let computer_id = host_store.lock().unwrap().state().device;
+    let phone_id = phone_store.lock().unwrap().state().device;
+    assert_ne!(computer_id, phone_id);
+
+    let mine = |store: &SharedStore| -> BTreeSet<Id> {
+        let s = store.lock().unwrap().snapshot();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 25).unwrap();
+        personal_events(&s.workspace.as_ref().unwrap().calendar, today, s.device)
+            .into_iter()
+            .map(|e| e.id)
+            .collect()
+    };
+    let first = Id::new_v4();
+    let second = Id::new_v4();
+    add_event(&host_store, first, "Контакты партнёров");
+    add_event(&phone_store, second, "Рассылка");
+    let inbox = temp.path().join("phone.yrplan");
+    export_file(&phone_store, &inbox).unwrap();
+    import_file(&host_store, &inbox).unwrap();
+    assert_eq!(mine(&host_store), BTreeSet::from([first]));
+
+    host_store
+        .lock()
+        .unwrap()
+        .link_employee_device(phone_id, computer_id)
+        .unwrap();
+    assert_eq!(mine(&host_store), BTreeSet::from([first, second]));
+    let updated = temp.path().join("updated.yrplan");
+    export_file(&host_store, &updated).unwrap();
+    import_file(&phone_store, &updated).unwrap();
+    assert_eq!(mine(&phone_store), mine(&host_store));
+
+    host.set_paused(false);
+    finish(host.revoke_devices_async([phone_id].into_iter().collect())).unwrap();
+    let active_dir = Store::active_directory(&host_path).unwrap();
+    let surviving = Store::open_existing(&active_dir).unwrap();
+    assert_eq!(mine(&surviving), BTreeSet::from([first, second]));
+    let rotated = temp.path().join("rotated.yrplan");
+    export_file(&surviving, &rotated).unwrap();
+    assert!(import_file(&phone_store, &rotated).is_err());
+}
