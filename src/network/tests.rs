@@ -127,10 +127,15 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
         )
         .unwrap()
     };
-    let wait = |f: &dyn Fn() -> bool| {
+    let wait = |stage: &str, f: &dyn Fn() -> bool| {
         let deadline = Instant::now() + Duration::from_secs(2);
         while !f() {
-            assert!(Instant::now() < deadline);
+            assert!(
+                Instant::now() < deadline,
+                "Discovery timed out at {stage}, port={udp}, paused={}, warning={:?}",
+                peer.paused(),
+                peer.core.inbound.get().unwrap().warning(),
+            );
             thread::sleep(Duration::from_millis(5));
         }
     };
@@ -144,7 +149,9 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     // A group beacon alone cannot complete enrollment.
     sender.send_to(&beacon(&group_key), address).unwrap();
     let join = peer.join_async(fields.join("."), "Борис".into(), None);
-    wait(&|| peer.core.pending_discovery.lock().unwrap().is_some());
+    wait("pending invitation", &|| {
+        peer.core.pending_discovery.lock().unwrap().is_some()
+    });
     sender.send_to(&beacon(&group_key), address).unwrap();
     assert!(matches!(
         join.recv_timeout(Duration::from_millis(150)),
@@ -155,7 +162,7 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     assert!(peer.core.pending_discovery.lock().unwrap().is_none());
     peer.core.discovered.lock().unwrap().clear();
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait(&seen);
+    wait("group beacon after enrollment", &seen);
     peer.set_paused(true);
     peer.core.discovered.lock().unwrap().clear();
     let monitor = UdpSocket::bind(address).unwrap();
@@ -170,7 +177,7 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     drop(monitor);
     peer.set_paused(false);
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait(&seen);
+    wait("group beacon after resume", &seen);
 }
 
 #[test]
