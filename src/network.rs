@@ -219,14 +219,13 @@ impl Network {
             status.warning = Some(warning);
         }
         status.route_warning = self.core.routes.lock().unwrap().warning.clone();
-        status.recent_peers = self
-            .core
-            .connected
-            .lock()
-            .unwrap()
+        let connected = self.core.connected.lock().unwrap();
+        let now = Instant::now();
+        status.recent_peers = connected
             .values()
-            .filter(|seen| seen.elapsed() < DISCOVERY_TTL)
+            .filter(|&&seen| now - seen < DISCOVERY_TTL)
             .count();
+        drop(connected);
         status.merge_error = self
             .core
             .merge_errors
@@ -236,6 +235,12 @@ impl Network {
             .next()
             .map(|(peer, message)| format!("{peer}: {message}"));
         status
+    }
+
+    pub fn has_recent_peer(&self) -> bool {
+        let connected = self.core.connected.lock().unwrap();
+        let now = Instant::now();
+        connected.values().any(|&seen| now - seen < DISCOVERY_TTL)
     }
 
     pub fn paused(&self) -> bool {
@@ -579,9 +584,10 @@ impl Core {
 
     fn synchronized(&self, device: Id) {
         let mut connected = self.connected.lock().unwrap();
-        connected.retain(|_, seen| seen.elapsed() < DISCOVERY_TTL);
+        let now = Instant::now();
+        connected.retain(|_, seen| now - *seen < DISCOVERY_TTL);
         if connected.len() < MAX_PEERS || connected.contains_key(&device) {
-            connected.insert(device, Instant::now());
+            connected.insert(device, now);
         }
         drop(connected);
         self.status.lock().unwrap().last_sync = Some(Utc::now().timestamp());

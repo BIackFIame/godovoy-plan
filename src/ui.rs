@@ -785,7 +785,7 @@ impl App {
                             && let Ok(network) = self.network.as_ref()
                         {
                             let paused = network.paused();
-                            let connected = !paused && network.status().recent_peers > 0;
+                            let connected = !paused && network.has_recent_peer();
                             let caption = if paused {
                                 "На паузе"
                             } else if connected {
