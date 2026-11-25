@@ -16,6 +16,9 @@
         hidden: "Для просмотра календаря требуется соединение с компьютером компании.",
     };
     const leaseMs = 9000;
+    const requestMs = 4500;
+    const calendarBodyMs = 45000;
+    const validTag = tag => /^(?:W\/)?"[!#-~]{1,128}"$/.test(tag || "");
     const controllers = new Set();
     let credential = "";
     let generation = 0;
@@ -24,6 +27,8 @@
     let requestNumber = 0;
     let heartbeatRunning = false;
     let heartbeatTimer = null;
+    let leaseTimer = null;
+    let activeRead = null;
     let currentYear = new Date().getFullYear();
     let mode = "all";
     let limit = 80;
@@ -77,6 +82,9 @@
     // Drop all workspace DOM, including modal form values. Late responses are
     // fenced by generation even if a browser completes an aborted fetch.
     function clearWorkspace(message, retainCredential = false) {
+        clearTimeout(leaseTimer);
+        leaseTimer = null;
+        activeRead = null;
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
         generation++;
@@ -112,12 +120,22 @@
     }
 
     class Problem extends Error {}
-    async function api(path, {body, data = false, validator = null, receipt = null} = {}) {
+    function verified(at) {
+        if (at <= lastVerified) return;
+        lastVerified = at;
+        clearTimeout(leaseTimer);
+        leaseTimer = setTimeout(() => clearWorkspace(writing ? prompts.uncertain : prompts.disconnected),
+            Math.max(0, lastVerified + leaseMs - performance.now()));
+    }
+
+    async function api(path, {body, data = false, validator = null, receipt = null, read = null, head = false} = {}) {
         const epoch = generation;
         if (!credential || document.hidden) throw new Problem();
-        const controller = new AbortController();
+        const started = performance.now();
+        const current = () => epoch === generation && !document.hidden && (!read || read === activeRead && read.number === requestNumber);
+        const controller = read?.controller || new AbortController();
         controllers.add(controller);
-        const timeout = setTimeout(() => controller.abort(), 4500);
+        let timeout = setTimeout(() => controller.abort(), requestMs);
         try {
             const headers = {Authorization: "Bearer " + credential};
             if (body !== undefined) headers["Content-Type"] = "application/json";
@@ -127,15 +145,16 @@
             }
             if (validator) {
                 headers["If-None-Match"] = validator;
-                headers["X-Godovoy-Delta"] = "event-v1";
+                if (!head) headers["X-Godovoy-Delta"] = "event-v1";
             }
             const response = await fetch(path, {
-                method: body === undefined ? "GET" : "POST",
+                method: head ? "HEAD" : body === undefined ? "GET" : "POST",
                 body: body === undefined ? undefined : JSON.stringify(body),
                 headers, cache: "no-store", credentials: "omit", referrerPolicy: "no-referrer",
                 mode: "same-origin", redirect: "error", signal: controller.signal,
             });
-            if (epoch !== generation || document.hidden) throw new Problem();
+            if (!current()) throw new Problem();
+            if (performance.now() - started >= requestMs) throw new Error("Response headers timed out");
             const restriction = response.headers.get("x-godovoy-access");
             const textPolicy = response.headers.get("x-godovoy-allow-free-text");
             const scope = response.headers.get("x-godovoy-assigned-only");
@@ -147,16 +166,21 @@
                 throw new Error("Unexpected conditional calendar response");
             }
             const authorized = response.ok || unchanged;
+            const editPolicy = response.headers.get("x-godovoy-can-edit");
+            const editChanged = authorized && state && (editPolicy === "true" || editPolicy === "false") &&
+                state.canEdit !== (editPolicy === "true");
             const scopeChanged = authorized && state && (scope === "true" || scope === "false") &&
                 (state.assignedOnly === true) !== (scope === "true");
             const textChanged = authorized && state && (textPolicy === "true" || textPolicy === "false") &&
                 (state.allowFreeText !== false) !== (textPolicy === "true");
-            if (scopeChanged || textChanged || (response.status === 403 &&
+            if (scopeChanged || textChanged || editChanged || (response.status === 403 &&
                 (restriction === "free-text-disabled" || restriction === "assigned-only"))) {
                 let message = "Администратор закрыл описания и дневник. Названия событий и чек-листы доступны.";
                 if (textPolicy === "true") message = "Администратор разрешил описания и дневник.";
                 if (scopeChanged || restriction === "assigned-only") message = scope === "false"
                     ? "Теперь вам доступен весь календарь." : "Теперь вам доступны только назначенные вам события.";
+                if (editChanged) message = editPolicy === "true"
+                    ? "Теперь вы можете изменять календарь." : "Теперь календарь доступен только для чтения.";
                 clearWorkspace(message, true);
                 const updated = generation;
                 load(currentYear).then(() => { if (updated === generation) notice(message); }).catch(() => {});
@@ -184,25 +208,46 @@
                 if (epoch !== generation || document.hidden) throw new Problem();
                 throw new Problem(typeof problem.error === "string" ? problem.error : "Компьютер компании отклонил изменение.");
             }
+            if (head && !unchanged) {
+                if (response.status !== 200 || !validTag(tag)) throw new Error("Invalid calendar version");
+                return {unchanged: false};
+            }
             const hasReceipt = receipt && response.status === 200;
             const expectJson = (data && !unchanged) || hasReceipt;
             if (expectJson ? response.status !== 200 || !/^application\/json(?:;|$)/i.test(response.headers.get("Content-Type") || "")
                            : response.status !== (unchanged ? 304 : 204)) {
                 throw new Error("Unexpected response from calendar host");
             }
-            const result = expectJson ? await response.json() : null;
-            if (epoch !== generation || document.hidden) throw new Problem();
-            const until = response.headers.get("x-godovoy-standby-until") || "";
-            standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
-            lastVerified = performance.now();
-            if (hasReceipt) return {value: result, tag: response.headers.get("x-godovoy-state-tag")};
             const base = response.headers.get("x-godovoy-delta-base");
-            if (data && base !== null) {
-                return {value: result, base, tag: response.headers.get("x-godovoy-state-tag")};
+            const viewTag = base === null ? tag : response.headers.get("x-godovoy-state-tag");
+            // Only an authenticated, versioned calendar body may outlive the short request timeout.
+            const extended = read && !head && expectJson && validTag(viewTag);
+            if (extended) {
+                if (!state) el("gate-status").textContent = "Загружаем календарь…";
+                clearTimeout(timeout);
+                timeout = setTimeout(() => controller.abort(), calendarBodyMs);
             }
-            return data ? {value: result, tag, unchanged} : null;
+            const bodyStarted = performance.now();
+            const result = expectJson ? await response.json() : null;
+            if (!current()) throw new Problem();
+            const now = performance.now();
+            if (controller.signal.aborted || now - bodyStarted >= calendarBodyMs ||
+                (!extended && now - started >= requestMs) || (state && now - lastVerified >= leaseMs)) {
+                throw new Error("Calendar authorization timed out");
+            }
+            const slow = extended && now - started >= requestMs;
+            if (!slow) {
+                const until = response.headers.get("x-godovoy-standby-until") || "";
+                standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
+                verified(started);
+            }
+            if (hasReceipt) return {value: result, tag: response.headers.get("x-godovoy-state-tag")};
+            if (!data) return null;
+            const reply = {value: result, tag: viewTag, unchanged, slow, scope, textPolicy};
+            if (base !== null) reply.base = base;
+            return reply;
         } catch (error) {
-            if (!(error instanceof Problem) && epoch === generation) {
+            if (!(error instanceof Problem) && current()) {
                 clearWorkspace(writing ? prompts.uncertain : prompts.disconnected);
             }
             throw error;
@@ -212,20 +257,43 @@
         }
     }
 
-    async function load(year = currentYear) {
-        const sequence = ++requestNumber;
+    function load(year = currentYear) {
+        if (activeRead?.year === year && activeRead.number === requestNumber) return activeRead.promise;
+        activeRead?.controller.abort();
+        const read = {year, number: ++requestNumber, controller: new AbortController()};
+        activeRead = read;
+        read.promise = readYear(read).finally(() => { if (activeRead === read) activeRead = null; });
+        return read.promise;
+    }
+
+    async function readYear(read) {
+        const {number, year} = read;
         const prior = state;
         const validator = year === currentYear ? stateTag : null;
         const path = "/v1/state?year=" + year;
-        let response = await api(path, {data: true, validator});
-        if (sequence !== requestNumber) throw new Problem();
-        if (response.base !== undefined) {
+        let response;
+        for (let attempt = 0; attempt < 2; attempt++) {
+            response = await api(path, {data: true, validator: attempt === 0 ? validator : null, read});
+            if (number !== requestNumber) throw new Problem();
+            if (response.slow) {
+                if (!state) el("gate-status").textContent = "Проверяем актуальность календаря…";
+                const proof = await api(path, {data: true, validator: response.tag, read, head: true});
+                if (number !== requestNumber) throw new Problem();
+                if (!proof.unchanged || proof.scope !== response.scope || proof.textPolicy !== response.textPolicy) {
+                    response = null;
+                    continue;
+                }
+            }
+            if (response.base === undefined) break;
             if (prior && state === prior && stateTag === validator && currentYear === year &&
                 response.base === validator && response.tag !== validator &&
                 (response.value?.events?.length || response.value?.tasks?.length) &&
                 applyReceipt(response, response.value?.id, year)) return;
-            response = await api(path, {data: true});
-            if (sequence !== requestNumber) throw new Problem();
+            response = null;
+        }
+        if (!response) {
+            clearWorkspace("Календарь изменился во время загрузки. Войдите снова, чтобы открыть актуальную версию.");
+            throw new Problem();
         }
         if (response.unchanged) {
             lastLoaded = performance.now();
@@ -238,7 +306,7 @@
         }
         state = next;
         if (heartbeatTimer === null) heartbeatTimer = setInterval(heartbeat, 3000);
-        stateTag = /^(?:W\/)?"[!#-~]{1,128}"$/.test(response.tag || "") ? response.tag : null;
+        stateTag = validTag(response.tag) ? response.tag : null;
         currentYear = year;
         lastLoaded = performance.now();
         el("gate").hidden = true;
@@ -650,6 +718,7 @@
             const receipt = stateTag && year === currentYear && (command.op === "check" || command.op === "note")
                 ? {tag: stateTag, year} : null;
             ++requestNumber;
+            activeRead?.controller.abort();
             const reply = await api("/v1/command", {body: command, receipt});
             if (epoch !== generation || document.hidden) return;
             writing = false;
@@ -691,6 +760,8 @@
         }
         credential = token;
         loginPending = true;
+        el("login").hidden = true;
+        el("logout").hidden = false;
         el("token").value = "";
         el("connect").disabled = true;
         el("gate-status").textContent = "Подключение…";
@@ -725,8 +796,9 @@
         const epoch = generation;
         heartbeatRunning = true;
         try {
-            if (performance.now() - lastLoaded > 60000 && !el("sheet").open && !writing) {
-                await load();
+            if (performance.now() - lastLoaded > 60000 && !activeRead && !el("sheet").open && !writing) {
+                // The next heartbeat must still check access while this snapshot is downloading.
+                load().catch(() => {});
             } else {
                 await api("/v1/session");
             }

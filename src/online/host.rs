@@ -469,9 +469,18 @@ async fn state(
     .await
 }
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
-    with_auth(host, headers, AuthOperation::Session, |_, _, _, _, _, _| {
-        StatusCode::NO_CONTENT.into_response()
-    })
+    with_auth(
+        host,
+        headers,
+        AuthOperation::Session,
+        |_, _, _, _, edit, _| {
+            (
+                StatusCode::NO_CONTENT,
+                [("x-godovoy-can-edit", if edit { "true" } else { "false" })],
+            )
+                .into_response()
+        },
+    )
     .await
 }
 async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> Response {
@@ -1450,10 +1459,17 @@ mod tests {
             f.request("/v1/session", "invalid", None).await.0,
             StatusCode::UNAUTHORIZED
         );
-        assert_eq!(
-            f.request("/v1/session", &reader, None).await.0,
-            StatusCode::NO_CONTENT
-        );
+        for (key, can_edit) in [(&f.key, "true"), (&reader, "false")] {
+            let request = Request::builder()
+                .uri("/v1/session")
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            let session = f.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(session.status(), StatusCode::NO_CONTENT);
+            assert_eq!(session.headers()["x-godovoy-can-edit"], can_edit);
+        }
         assert_eq!(
             f.request("/v1/command", &reader, Some(f.create())).await.0,
             StatusCode::FORBIDDEN

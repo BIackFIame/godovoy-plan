@@ -31,6 +31,36 @@ mod conditional_tests {
     }
 
     #[tokio::test]
+    async fn head_confirms_the_authorized_year_without_sending_a_calendar_body() {
+        let f = Fixture::new();
+        let (tag, _) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let check = || {
+            let request = Request::builder()
+                .method(Method::HEAD)
+                .uri("/v1/state?year=2028")
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+                .header(header::IF_NONE_MATCH, &tag)
+                .body(Body::empty())
+                .unwrap();
+            f.app.clone().oneshot(request)
+        };
+
+        assert_unchanged(check().await.unwrap(), &tag).await;
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let changed = check().await.unwrap();
+        assert_eq!(changed.status(), StatusCode::OK);
+        assert_ne!(changed.headers()[header::ETAG], tag.as_str());
+        assert!(to_bytes(changed.into_body(), 0).await.unwrap().is_empty());
+
+        f.vault.lock().unwrap().revoke(f.credential).unwrap();
+        let denied = check().await.unwrap();
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(denied.headers().get(header::ETAG).is_none());
+        assert!(to_bytes(denied.into_body(), 0).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn colleague_poll_rebuilds_only_its_own_representation_and_rejects_stale_bases() {
         let f = Fixture::new();
         let (grant, _, reader) = f.vault.lock().unwrap().grant("Обзор", None, true).unwrap();
