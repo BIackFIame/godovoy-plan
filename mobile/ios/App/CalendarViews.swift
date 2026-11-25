@@ -56,7 +56,15 @@ struct TasksView: View {
                 Section("Подготовка") { if state.tasks.isEmpty { Text("На сегодня задач нет").foregroundStyle(.secondary) }; ForEach(state.tasks, id: \.selfKey) { EventLink(event: $0) } }
                 Section("Напоминания") {
                     if state.reminders.isEmpty { Text("Напоминаний пока нет").foregroundStyle(.secondary) }
-                    ForEach(Array(state.reminders.enumerated()), id: \.offset) { _, r in NavigationLink { DetailView(id: r.eventId, year: r.year) } label: { VStack(alignment: .leading) { Text(r.title); Text(GPDate.label(r.date)).foregroundStyle(.secondary).font(.subheadline) } } }
+                    ForEach(state.reminders.indices, id: \.self) { index in
+                        let reminder = state.reminders[index]
+                        NavigationLink { DetailView(id: reminder.eventId, year: reminder.year) } label: {
+                            VStack(alignment: .leading) {
+                                Text(reminder.title)
+                                Text(GPDate.label(reminder.date)).foregroundStyle(.secondary).font(.subheadline)
+                            }
+                        }
+                    }
                 }
             }
         }.navigationTitle("Мои задачи").refreshable { await model.refresh() }
