@@ -79,21 +79,24 @@ dialog::backdrop { background: rgba(13,22,38,.55); }
 input[type=checkbox] { width: 1.15rem; height: 1.15rem; accent-color: var(--accent); flex: 0 0 auto; }
 .task span { overflow-wrap: anywhere; }
 .danger { color: var(--error); }
+.month.overdue h2, .month.overdue .date, .task .late { color: var(--error); }
+.task.current-task { background: var(--selected); border-radius: .45rem; padding-inline: .55rem; }
+.segments button:focus-visible { outline-offset: -3px; }
+.event.personal { grid-template-columns: 4.6rem minmax(0, 1fr); }
+.personal .date { white-space: nowrap; }
 @media (max-width: 37rem) {
+  .heading { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: .35rem .6rem; margin-bottom: 1rem; }
+  .heading > div { display: contents; }
+  .heading .eyebrow { grid-column: 1 / -1; margin: 0; overflow-wrap: anywhere; }
+  .heading button { padding-inline: .6rem; font-size: .94rem; }
   .year-tools { margin-inline-start: 0; }
   .tools { gap: .4rem; }
+  .tools button { padding-inline: .6rem; }
   .event { grid-template-columns: 3.5rem minmax(0,1fr) auto; padding: .75rem .6rem; gap: .5rem; }
   dialog { padding: 1rem; }
   .edit-task { grid-template-columns: minmax(0,1fr) 4.4rem auto; }
 }
-.month.overdue h2, .month.overdue .date { color: var(--error); }
-.task.current-task { background: var(--selected); border-radius: .45rem; padding-inline: .55rem; }
-.segments button:focus-visible { outline-offset: -3px; }
-.task .late { color: var(--error); }
-@media (max-width: 37rem) {
-  .heading { gap: .6rem; margin-bottom: 1rem; }
-  .tools button { padding-inline: .6rem; }
+@media (max-width: 21rem) {
+  .heading h1 { font-size: 1.5rem; }
+  .tools button { padding-inline: .45rem; font-size: .94rem; }
 }
-
-.event.personal { grid-template-columns: 4.6rem minmax(0, 1fr); }
-.personal .date { white-space: nowrap; }
