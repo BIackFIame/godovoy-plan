@@ -98,6 +98,8 @@ def main():
             extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
                             [online.name], standalone)
             server_flow(standalone / online.name, standalone)
+        subprocess.run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("window-smoke.ps1"),
+                        desktop, directory / "desktop-profile"], check=True, timeout=75)
 
     finally:
         shutil.rmtree(directory)
