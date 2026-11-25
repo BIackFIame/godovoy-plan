@@ -27,7 +27,7 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
-    io::Read,
+    io::{Read, Seek},
     path::{Path, PathBuf},
 };
 use subtle::ConstantTimeEq;
@@ -272,15 +272,53 @@ fn sync_directory(directory: &Path) -> Fallible<()> {
     let _ = directory;
     Ok(())
 }
+/// An opened vault data file. Metadata only guides the choice of reading strategy.
+pub struct CalendarFile<'vault> {
+    _vault: std::marker::PhantomData<&'vault ()>,
+    file: File,
+    metadata: fs::Metadata,
+}
+
+impl CalendarFile<'_> {
+    pub fn byte_len(&self) -> usize {
+        self.metadata.len() as usize
+    }
+
+    pub fn modified(&self) -> Option<std::time::SystemTime> {
+        self.metadata.modified().ok()
+    }
+
+    pub fn into_bytes(self) -> Fallible<Vec<u8>> {
+        let mut bytes = Vec::with_capacity(self.byte_len());
+        self.file
+            .take(DATA_LIMIT as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > DATA_LIMIT {
+            return Err("Хранилище превышает допустимый размер.".into());
+        }
+        Ok(bytes)
+    }
+
+    pub fn fingerprint(&mut self, mut source: Blake2b<U32>) -> Fallible<[u8; 32]> {
+        let mut bounded = (&mut self.file).take(DATA_LIMIT as u64 + 1);
+        std::io::copy(&mut bounded, &mut source)?;
+        if bounded.limit() == 0 {
+            return Err("Хранилище превышает допустимый размер.".into());
+        }
+        self.file.rewind()?;
+        Ok(source.finalize().into())
+    }
+}
+
 impl LockedVault<'_> {
-    fn open_bounded(&self, name: &str, limit: usize) -> Fallible<(File, usize)> {
+    fn open_bounded(&self, name: &str, limit: usize) -> Fallible<(File, fs::Metadata)> {
         let path = self.directory.join(name);
         let (file, metadata) = open_regular(&path)?;
         let size = metadata.len();
         if size > limit as u64 {
             return Err("Хранилище превышает допустимый размер.".into());
         }
-        Ok((file, size as usize))
+        Ok((file, metadata))
     }
     fn read<T: DeserializeOwned>(&self, name: &str, limit: usize) -> Fallible<T> {
         let (file, _) = self.open_bounded(name, limit)?;
@@ -290,8 +328,8 @@ impl LockedVault<'_> {
         // The ACL is small and read on each request under the vault lock.
         // Parse the current file directly from a bounded contiguous buffer.
         let mut acl: Access = {
-            let (mut file, size) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
-            let mut bytes = vec![0; size];
+            let (mut file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
+            let mut bytes = vec![0; metadata.len() as usize];
             file.read_exact(&mut bytes)?;
             if file.read(&mut [0])? != 0 {
                 return Err("Размер файла прав изменился во время чтения.".into());
@@ -349,15 +387,16 @@ impl LockedVault<'_> {
     pub fn data(&self) -> Fallible<Data> {
         Ok(serde_json::from_slice(&self.data_bytes()?)?)
     }
-    /// Read the exact bytes used for both the conditional view fingerprint and decoding.
+    pub fn open_data(&self) -> Fallible<CalendarFile<'_>> {
+        let (file, metadata) = self.open_bounded(DATA, DATA_LIMIT)?;
+        Ok(CalendarFile {
+            file,
+            metadata,
+            _vault: std::marker::PhantomData,
+        })
+    }
     pub fn data_bytes(&self) -> Fallible<Vec<u8>> {
-        let (file, size) = self.open_bounded(DATA, DATA_LIMIT)?;
-        let mut bytes = Vec::with_capacity(size);
-        file.take(DATA_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
-        if bytes.len() > DATA_LIMIT {
-            return Err("Хранилище превышает допустимый размер.".into());
-        }
-        Ok(bytes)
+        self.open_data()?.into_bytes()
     }
     pub fn save_data(&self, data: &Data) -> Fallible<()> {
         self.persist_data(data, |_| {})

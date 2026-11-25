@@ -6,7 +6,7 @@ use axum::{
 };
 use blake2::{Blake2b, Digest, digest::consts::U32};
 use chrono::{Datelike, NaiveDate};
-use godovoy_plan::{Fallible, model::Id};
+use godovoy_plan::{Fallible, model::Id, storage::online::CalendarFile};
 use std::{
     collections::VecDeque,
     io::{BufWriter, Write},
@@ -16,9 +16,22 @@ use std::{
 const MAX_VIEWS: usize = 128;
 type InputDigest = [u8; 32];
 
+#[derive(Copy, Clone, Eq, PartialEq)]
+struct ReadHint {
+    credential: Id,
+    size: usize,
+    modified: std::time::SystemTime,
+}
+
+struct Entry {
+    digest: InputDigest,
+    tag: HeaderValue,
+    hint: Option<ReadHint>,
+}
+
 pub(super) struct Views {
     nonce: Id,
-    entries: Mutex<VecDeque<(InputDigest, HeaderValue)>>,
+    entries: Mutex<VecDeque<Entry>>,
 }
 
 impl Default for Views {
@@ -55,17 +68,34 @@ impl Views {
     }
 
     pub(super) fn lookup(&self, key: &InputDigest) -> Fallible<Option<HeaderValue>> {
-        let entries = self
+        self.lookup_and_refresh(key, None)
+    }
+
+    fn lookup_and_refresh(
+        &self,
+        key: &InputDigest,
+        hint: Option<ReadHint>,
+    ) -> Fallible<Option<HeaderValue>> {
+        let mut entries = self
             .entries
             .lock()
             .map_err(|_| "Ошибка проверки версии календаря.")?;
         Ok(entries
-            .iter()
-            .find(|(digest, _)| digest == key)
-            .map(|(_, tag)| tag.clone()))
+            .iter_mut()
+            .find(|entry| &entry.digest == key)
+            .map(|entry| {
+                if hint.is_some() {
+                    entry.hint = hint;
+                }
+                entry.tag.clone()
+            }))
     }
 
     pub(super) fn remember(&self, key: InputDigest, tag: HeaderValue) -> Fallible<()> {
+        self.store(key, tag, None)
+    }
+
+    fn store(&self, key: InputDigest, tag: HeaderValue, hint: Option<ReadHint>) -> Fallible<()> {
         let mut entries = self
             .entries
             .lock()
@@ -73,7 +103,11 @@ impl Views {
         if entries.len() == MAX_VIEWS {
             entries.pop_front();
         }
-        entries.push_back((key, tag));
+        entries.push_back(Entry {
+            digest: key,
+            tag,
+            hint,
+        });
         Ok(())
     }
 
@@ -107,13 +141,40 @@ impl Views {
         credential: Id,
         context: ViewContext<'_>,
         today: NaiveDate,
-        data: Vec<u8>,
+        mut file: CalendarFile<'_>,
         condition: &[HeaderValue],
     ) -> Fallible<Response> {
         // This internal fingerprint may change when another employee edits a private
         // event. Only the digest of the caller's rendered representation leaves the host.
+        let hint = file.modified().map(|modified| ReadHint {
+            credential,
+            size: file.byte_len(),
+            modified,
+        });
+        // A matching hint only chooses streaming. Every 304 still verifies the full
+        // file, current credential, permissions, local date and rendered-view tag.
+        if let ([condition], Some(hint)) = (condition, hint) {
+            let candidate = self
+                .entries
+                .lock()
+                .map_err(|_| "Ошибка проверки версии календаря.")?
+                .iter()
+                .rev()
+                .find(|entry| entry.hint == Some(hint) && entry.tag == condition)
+                .map(|entry| entry.digest);
+            if let Some(expected) = candidate {
+                let source = Self::input_hasher(credential, &context, today)?;
+                if file.fingerprint(source)? == expected {
+                    return Ok(tagged(
+                        StatusCode::NOT_MODIFIED.into_response(),
+                        condition.clone(),
+                    ));
+                }
+            }
+        }
+        let data = file.into_bytes()?;
         let key = Self::input(credential, &context, today, &data)?;
-        let known = self.lookup(&key)?;
+        let known = self.lookup_and_refresh(&key, hint)?;
         if let Some(tag) = &known
             && matches_tag(condition, tag)
         {
@@ -129,7 +190,7 @@ impl Views {
             tag
         } else {
             let tag = Self::tag(self.tag_hasher(credential).chain_update(&body))?;
-            self.remember(key, tag.clone())?;
+            self.store(key, tag.clone(), hint)?;
             tag
         };
         let response = if matches_tag(condition, &tag) {

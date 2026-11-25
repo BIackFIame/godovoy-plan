@@ -381,11 +381,11 @@ async fn state(
         false,
         move |lock, acl, id, employee, edit, mode| {
             let context = actions::ViewContext::new(acl, query.year, employee, edit);
-            let Ok(data) = lock.data_bytes() else {
+            let Ok(data) = lock.open_data() else {
                 return unavailable();
             };
             let today = chrono::Local::now().date_naive();
-            let parallel_audit = data.len() >= 128 * 1024 && condition.is_empty();
+            let parallel_audit = data.byte_len() >= 128 * 1024 && condition.is_empty();
             let prepare = || views.response(id, context, today, data, &condition);
             let audit = || lock.audit_security("state_requested", Some(id), Some(employee), None);
             let result = if parallel_audit {

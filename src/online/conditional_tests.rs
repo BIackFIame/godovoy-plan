@@ -56,6 +56,32 @@ mod conditional_tests {
     }
 
     #[tokio::test]
+    async fn matching_size_and_timestamp_still_require_current_calendar_bytes() {
+        let f = Fixture::new();
+        let mut event = f.create();
+        event["title"] = json!("First title");
+        assert_eq!(f.cmd(event).await, StatusCode::NO_CONTENT);
+        let (tag, _) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let path = f._tmp.path().join("host/online-calendar-v1.json");
+        let modified = path.metadata().unwrap().modified().unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let changed = original.replace("First title", "Other title");
+        assert_ne!(original, changed);
+        assert_eq!(original.len(), changed.len());
+        std::fs::write(&path, changed).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), modified);
+        let (fresh_tag, state) = snapshot(get(&f, 2028, &f.key, &[&tag]).await).await;
+        assert_ne!(tag, fresh_tag);
+        assert_eq!(state["events"][0]["title"], "Other title");
+    }
+
+    #[tokio::test]
     async fn receipt_matches_entire_authorized_snapshot_and_detects_other_changes() {
         let f = Fixture::new();
         let (_, colleague, other_key) =
@@ -324,15 +350,19 @@ mod conditional_tests {
         event["preparationDays"] = json!(0);
         event["checklist"] = json!([]);
         assert_eq!(f.cmd(event).await, StatusCode::NO_CONTENT);
-        let (acl, data) = {
-            let lock = f.vault.lock().unwrap();
-            (lock.access().unwrap(), lock.data_bytes().unwrap())
-        };
+        let lock = f.vault.lock().unwrap();
+        let acl = lock.access().unwrap();
         let views = conditional::Views::default();
         let render = |today, conditions: &[HeaderValue]| {
             let context = actions::ViewContext::new(&acl, 2029, f.employee, true);
             views
-                .response(f.credential, context, today, data.clone(), conditions)
+                .response(
+                    f.credential,
+                    context,
+                    today,
+                    lock.open_data().unwrap(),
+                    conditions,
+                )
                 .unwrap()
         };
         let before = NaiveDate::from_ymd_opt(2027, 12, 31).unwrap();
