@@ -3,6 +3,8 @@
 mod actions;
 #[path = "../online/admin.rs"]
 mod admin;
+#[path = "../online/assets.rs"]
+mod assets;
 #[path = "../online/host.rs"]
 mod host;
 

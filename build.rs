@@ -1,7 +1,33 @@
 use std::{env, path::PathBuf, process::Command};
 
+#[cfg(feature = "server")]
+fn compress_web_assets(output: &std::path::Path) -> std::io::Result<()> {
+    use flate2::{Compression, write::GzEncoder};
+    use std::{fs, io, path::Path};
+    for name in [
+        "index.html",
+        "calendar.js",
+        "calendar.css",
+        "admin.html",
+        "admin.js",
+        "admin.css",
+    ] {
+        let source = Path::new("src/online").join(name);
+        println!("cargo::rerun-if-changed={}", source.display());
+        let mut input = fs::File::open(source)?;
+        let file = fs::File::create(output.join(format!("{name}.gz")))?;
+        let mut encoder = GzEncoder::new(file, Compression::best());
+        io::copy(&mut input, &mut encoder)?;
+        encoder.finish()?;
+    }
+    Ok(())
+}
+
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
+    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"));
+    #[cfg(feature = "server")]
+    compress_web_assets(&output_dir).expect("compress static web assets");
     if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
         || env::var_os("CARGO_FEATURE_DESKTOP").is_none()
     {
@@ -10,7 +36,6 @@ fn main() {
 
     println!("cargo::rerun-if-changed=packaging/windows/AppIcon.ico");
     println!("cargo::rerun-if-changed=packaging/windows/app.rc");
-    let output_dir = PathBuf::from(env::var_os("OUT_DIR").expect("Cargo output directory"));
     let target = env::var("TARGET").expect("Cargo build target");
     let (mut compiler, object) = if target.ends_with("-msvc") {
         println!("cargo::rerun-if-env-changed=RC");

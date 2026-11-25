@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -329,24 +329,17 @@ async fn update_scope(
 }
 fn router(c: Console) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("admin.html")) }))
+        .route(
+            "/",
+            get(|headers| async move { crate::assets::ADMIN.serve(&headers) }),
+        )
         .route(
             "/admin.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("admin.js"),
-                )
-            }),
+            get(|headers| async move { crate::assets::ADMIN_JS.serve(&headers) }),
         )
         .route(
             "/admin.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("admin.css"),
-                )
-            }),
+            get(|headers| async move { crate::assets::ADMIN_CSS.serve(&headers) }),
         )
         .route("/v1/settings", get(settings).put(apply_settings))
         .route("/v1/operator", get(operator).put(apply_operator))
