@@ -383,8 +383,19 @@ impl Calendar {
     pub fn merge(&mut self, incoming: Self) {
         merge_map(&mut self.members, incoming.members);
         merge_map(&mut self.device_people, incoming.device_people);
-        for (id, plan) in incoming.plans {
-            self.plans.entry(id).or_default().merge(plan);
+        // A new replica can keep the validated plans and their history intact.
+        if self.plans.is_empty() {
+            self.plans = incoming.plans;
+        } else {
+            use std::collections::btree_map::Entry;
+            for (id, plan) in incoming.plans {
+                match self.plans.entry(id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(plan);
+                    }
+                    Entry::Occupied(mut slot) => slot.get_mut().merge(plan),
+                }
+            }
         }
     }
 
