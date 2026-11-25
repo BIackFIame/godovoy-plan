@@ -196,6 +196,8 @@ fn divergent_calendars_converge_via_files_without_syncing_local_settings() {
     let left_packet = fs::read(&from_left).unwrap();
     let right_packet = fs::read(&from_right).unwrap();
 
+    // An unchanged local import must not hide a different export from a colleague.
+    assert!(!import_file(&left.store, &from_left).unwrap());
     assert!(import_file(&left.store, &from_right).unwrap());
     assert!(import_file(&right.store, &from_left).unwrap());
 
