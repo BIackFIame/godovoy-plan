@@ -32,7 +32,7 @@ for target in aarch64-linux-android x86_64-linux-android armv7-linux-androideabi
 done
 "$bt/aapt2" compile --dir "$package/res" -o "$package/res.zip"
 "$bt/aapt2" link --manifest "$source_dir/src/main/AndroidManifest.xml" -I "$platform" -o "$package/app.apk" --java "$package/gen" "$package/res.zip"
-find "$source_dir/src/main/java" "$package/gen" -name '*.java' -print0 | xargs -0 "$java/bin/javac" -encoding UTF-8 --release 8 -Xlint:-options -classpath "$platform" -d "$package/classes"
+find "$source_dir/src/main/java" "$package/gen" -type f -name '*.java' ! -name '* [0-9]*.java' -print0 | xargs -0 "$java/bin/javac" -encoding UTF-8 --release 8 -Xlint:-options -classpath "$platform" -d "$package/classes"
 "$java/bin/jar" cf "$package/classes.jar" -C "$package/classes" .
 "$java/bin/java" -cp "$bt/lib/d8.jar" com.android.tools.r8.D8 --min-api 26 --lib "$platform" --output "$package/dex" "$package/classes.jar"
 (cd "$package" && zip -q -0 app.apk lib/*/*.so)

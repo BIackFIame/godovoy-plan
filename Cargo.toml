@@ -3,6 +3,8 @@ name = "godovoy-plan"
 version = "0.6.2"
 edition = "2024"
 default-run = "godovoy-plan"
+# Only the named integration suites below are executable test targets.
+autotests = false
 rust-version = "1.94"
 description = "Локальный годовой календарь команды"
 
@@ -30,12 +32,40 @@ name = "api_scenarios"
 required-features = ["desktop"]
 
 [[test]]
+name = "backup"
+
+[[test]]
+name = "calendar"
+
+[[test]]
+name = "device_access"
+
+[[test]]
+name = "exchange"
+
+[[test]]
+name = "exchange_scenarios"
+
+[[test]]
 name = "import_cross_year"
 required-features = ["desktop"]
 
 [[test]]
+name = "lan"
+
+[[test]]
+name = "online_mcp"
+required-features = ["server"]
+
+[[test]]
 name = "online_vault"
 required-features = ["server"]
+
+[[test]]
+name = "planning_scenarios"
+
+[[test]]
+name = "storage_permissions"
 
 [features]
 default = ["desktop"]

@@ -73,4 +73,6 @@ cargo build --release --locked
 cargo test --locked
 ```
 
+При добавлении нового интеграционного набора в `tests/` зарегистрируйте его в секции `[[test]]` корневого `Cargo.toml`. Список целей можно проверить командой `cargo metadata --no-deps --format-version 1`.
+
 Готовое приложение и мост интеграций появятся в `target/release`. Мобильные клиенты используют то же ядро Rust. Команды сборки и требования к инструментам находятся в инструкциях для [Android](mobile/android/README.md) и [iOS](mobile/ios/README.md).
