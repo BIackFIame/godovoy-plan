@@ -21,7 +21,8 @@ $python = "$work\tools-venv\Scripts\python.exe"
 $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
 $vs = & $vswhere -latest -products '*' -property installationPath
 Import-Module "$vs\Common7\Tools\Microsoft.VisualStudio.DevShell.dll"
-Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-arch=$Arch"
+$targetArch = $Arch.ToLowerInvariant()
+Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments "-host_arch=x64 -arch=$targetArch"
 $env:PATH = "$work\tools;$work\tools-venv\Scripts;$env:PATH"
 $env:CC = 'cl'
 $env:CXX = 'cl'
