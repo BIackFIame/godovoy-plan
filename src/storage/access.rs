@@ -37,6 +37,8 @@ fn managed(name: &std::ffi::OsStr) -> bool {
     matches!(
         name.as_str(),
         "calendar.json"
+            | "online-access-v1.json"
+            | "online-calendar-v1.json"
             | "profile.lock"
             | "team-initialized"
             | "reminders-v1.json"

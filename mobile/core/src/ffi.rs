@@ -103,3 +103,17 @@ pub unsafe extern "C" fn gp_string_free(s: *mut c_char) {
         drop(unsafe { CString::from_raw(s) });
     }
 }
+
+/// Validate a user-entered server origin without opening a calendar profile.
+/// # Safety
+/// The caller supplies a live buffer of exactly `length` bytes for this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn gp_valid_hosted_address(input: *const u8, length: usize) -> u8 {
+    if input.is_null() || length == 0 || length > 300 {
+        return 0;
+    }
+    let bytes = unsafe { std::slice::from_raw_parts(input, length) };
+    u8::from(
+        std::str::from_utf8(bytes).is_ok_and(godovoy_plan::hosted_address::valid_hosted_address),
+    )
+}

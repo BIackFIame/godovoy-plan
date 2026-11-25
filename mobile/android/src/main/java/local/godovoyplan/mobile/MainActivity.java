@@ -341,6 +341,7 @@ public final class MainActivity extends Activity {
             hint(form, "Создайте календарь на этом устройстве или подключитесь к календарю коллег.");
             form.addView(button("Создать календарь", () -> connect(true, false)));
             form.addView(button("Присоединиться", () -> connect(false, false)));
+            form.addView(button("Серверный календарь", this::hostedCalendar));
             return;
         }
         JSONObject selected = selectedEvent();
@@ -685,9 +686,40 @@ public final class MainActivity extends Activity {
                                             nullable(value(addr)));
                 }, null);
     }
+    private void hostedCalendar() {
+        LinearLayout panel = vertical();
+        pad(panel, 20, 10);
+        hint(panel, "Отдельный календарь компании работает в браузере, пока доступен сервер. События с этого устройства автоматически не переносятся.");
+        EditText address = field(panel, "Адрес от администратора", "", false);
+        address.setHint("https://calendar.example.org");
+        address.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_URI | InputType.TYPE_TEXT_FLAG_NO_SUGGESTIONS);
+        address.setImportantForAutofill(View.IMPORTANT_FOR_AUTOFILL_NO);
+        address.setSaveEnabled(false);
+        address.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(300)});
+        AlertDialog prompt = new AlertDialog.Builder(this).setTitle("Серверный календарь")
+                .setView(panel).setNegativeButton("Отмена", null)
+                .setPositiveButton("Открыть в браузере", null).create();
+        track(prompt);
+        prompt.getButton(-1).setOnClickListener(v -> {
+            String value = address.getText().toString().trim();
+            if (!Core.validHostedAddress(value.getBytes(java.nio.charset.StandardCharsets.UTF_8))) {
+                address.setError("Нужен HTTPS-адрес без пути, кода и параметров. Для туннеля используйте http://127.0.0.1:45838.");
+                return;
+            }
+            Intent open = new Intent(Intent.ACTION_VIEW, Uri.parse(value)).addCategory(Intent.CATEGORY_BROWSABLE);
+            try {
+                startActivity(open);
+                prompt.dismiss();
+            } catch (android.content.ActivityNotFoundException absent) {
+                address.setError("Браузер на этом устройстве недоступен.");
+            }
+        });
+    }
+
     private void access() {
         LinearLayout form = scroller();
         label(form, str(state, "workspaceName"), 21);
+        form.addView(button("Серверный календарь", this::hostedCalendar));
         String addr = str(state, "address");
         if (!addr.isEmpty())
             hint(form, "Адрес устройства · " + addr);

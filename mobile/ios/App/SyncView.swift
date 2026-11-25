@@ -42,6 +42,7 @@ struct SyncView: View {
     var body: some View {
         Form {
             if let state = model.state {
+                Section { NavigationLink("Серверный календарь") { HostedCalendarEntry() } }
                 Section("Локальная сеть") {
                     LabeledContent("Команда", value: state.workspaceName ?? "")
                     if let address = state.address { LabeledContent("Этот адрес", value: address).textSelection(.enabled) }

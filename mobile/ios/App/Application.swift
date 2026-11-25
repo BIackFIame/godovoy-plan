@@ -128,6 +128,7 @@ struct WelcomeView: View {
                         else { _ = await model.run("createWorkspace", ["name": .string(team), "employee": .string(name)]) } }
                 }.disabled(model.busy || name.isBlank || (joining ? code.isBlank : team.isBlank)).accessibilityIdentifier("welcomeSubmit")
             }
+            Section { NavigationLink("Серверный календарь") { HostedCalendarEntry() } }
         }.navigationTitle("Годовой план")
     }
 }
@@ -139,4 +140,35 @@ extension String {
 struct AddressField: View {
     @Binding var address: String
     var body: some View { DisclosureGroup("Указать адрес вручную") { TextField("IPv4 и порт", text: $address).textInputAutocapitalization(.never).keyboardType(.numbersAndPunctuation).autocorrectionDisabled() } }
+}
+
+struct HostedCalendarEntry: View {
+    @Environment(\.openURL) private var openURL
+    @State private var address = ""
+    @State private var error = ""
+    var body: some View {
+        Form {
+            Section {
+                TextField("https://calendar.example.org", text: $address)
+                    .keyboardType(.URL).textInputAutocapitalization(.never).autocorrectionDisabled()
+                    .accessibilityLabel("Адрес от администратора")
+                Button("Открыть в браузере") {
+                    let text = address.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard text.utf8.count <= 300,
+                          Array(text.utf8).withUnsafeBufferPointer({ gp_valid_hosted_address($0.baseAddress, $0.count) != 0 }),
+                          let url = URL(string: text) else {
+                        error = "Нужен HTTPS-адрес без пути, кода и параметров. Для туннеля используйте http://127.0.0.1:45838."
+                        return
+                    }
+                    openURL(url) { accepted in
+                        if accepted { address = ""; error = "" }
+                        else { error = "Не удалось открыть браузер." }
+                    }
+                }.disabled(address.isBlank)
+                if !error.isEmpty { Text(error).foregroundStyle(.red) }
+            } header: { Text("Адрес от администратора") } footer: {
+                Text("Отдельный календарь компании работает в браузере, пока доступен сервер. События с этого устройства автоматически не переносятся.")
+            }
+        }.navigationTitle("Серверный календарь").navigationBarTitleDisplayMode(.inline)
+    }
 }

@@ -1,0 +1,60 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="referrer" content="no-referrer">
+  <meta name="color-scheme" content="light dark">
+  <title>Годовой план</title>
+  <link rel="stylesheet" href="/calendar.css">
+  <script defer src="/calendar.js"></script>
+</head>
+<body>
+  <header class="topbar">
+    <div class="top-inner">
+      <span class="brand">Годовой план</span>
+      <button id="logout" type="button" hidden>Выйти</button>
+    </div>
+  </header>
+  <main>
+    <section id="gate" class="gate" aria-labelledby="gate-title">
+      <h1 id="gate-title">Календарь компании</h1>
+      <p id="gate-status" role="status">Введите личный ключ, который вам выдал администратор календаря.</p>
+      <noscript>Для подключения включите JavaScript в браузере.</noscript>
+      <form id="login" autocomplete="off">
+        <label for="token">Ключ доступа</label>
+        <input id="token" type="password" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" maxlength="180" required>
+        <button id="connect" class="primary" type="submit" disabled>Открыть календарь</button>
+      </form>
+    </section>
+    <section id="workspace" hidden aria-label="Рабочий календарь">
+      <div class="heading">
+        <div>
+          <p id="account" class="eyebrow"></p>
+          <h1 id="calendar-name"></h1>
+        </div>
+        <button id="create" class="primary" type="button">Новое событие</button>
+      </div>
+      <div class="tools">
+        <div class="segments" role="group" aria-label="Раздел">
+          <button type="button" id="all" aria-pressed="true">Календарь</button>
+          <button type="button" id="mine" aria-pressed="false">Мои задачи</button>
+        </div>
+        <div class="year-tools" id="year-tools">
+          <button type="button" id="previous" aria-label="Предыдущий год">‹</button>
+          <output id="year"></output>
+          <button type="button" id="next" aria-label="Следующий год">›</button>
+        </div>
+        <button type="button" id="refresh">Обновить</button>
+      </div>
+      <p id="feedback" role="status" class="feedback"></p>
+      <div id="list"></div>
+    </section>
+  </main>
+  <dialog id="sheet" aria-labelledby="sheet-title">
+    <div class="sheet-head"><h2 id="sheet-title"></h2><button type="button" id="close" aria-label="Закрыть">×</button></div>
+    <div id="sheet-body"></div>
+    <p id="sheet-error" class="error" role="alert"></p>
+  </dialog>
+</body>
+</html>

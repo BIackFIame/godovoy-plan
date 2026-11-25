@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "godovoy-plan"
-version = "0.5.42"
+version = "0.5.43"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1579,6 +1579,8 @@ dependencies = [
  "eframe",
  "flate2",
  "getrandom 0.4.3",
+ "hyper",
+ "hyper-util",
  "libc",
  "notify-rust",
  "rfd",

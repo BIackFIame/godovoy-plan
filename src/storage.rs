@@ -18,6 +18,8 @@ use crate::{
 
 mod access;
 mod generations;
+#[cfg(feature = "desktop")]
+pub mod online;
 use access::{check_directory as check_private_directory, validate_profile_access};
 mod backup;
 pub use backup::{BackupEntry, RestoreResult, RestoredProfile};
@@ -383,6 +385,9 @@ impl Store {
             directories.recursive(true);
             use std::os::unix::fs::DirBuilderExt;
             directories.mode(0o700).create(directory)?;
+        }
+        if directory.join("online-access-v1.json").try_exists()? || directory.join("online-calendar-v1.json").try_exists()? {
+            return Err("Этот каталог принадлежит центральному узлу. Запустите godovoy-online.".into());
         }
         let profile_lock = match open_profile_lock(directory) {
             Err(error)

@@ -45,6 +45,7 @@ use crate::{
 
 mod api_controls;
 mod drafts;
+mod hosted;
 mod people;
 mod reminder_work;
 use api_controls::{Action as ApiAction, ApiControls};
@@ -397,6 +398,7 @@ pub struct App {
     pairing_request: String,
     company: String,
     employee: String,
+    hosted_entry: hosted::HostedEntry,
     join_mode: bool,
     onboarding_focus: bool,
     join_result: Option<Receiver<Fallible<()>>>,
@@ -480,6 +482,7 @@ impl App {
             pairing_request: String::new(),
             company: String::new(),
             employee: String::new(),
+            hosted_entry: hosted::HostedEntry::default(),
             join_mode: false,
             onboarding_focus: true,
             join_result: None,
@@ -633,6 +636,8 @@ impl App {
                                 }
                                 self.draw_message(ui);
                             });
+                            ui.add_space(8.0);
+                            self.hosted_entry.show(ui);
                             let ui = &mut columns[1];
                             ui.add_space(10.0);
                             year_wheel(ui, today.year(), today, &[], None);
@@ -2529,6 +2534,8 @@ impl App {
 
         settings_window(ctx, "Синхронизация", &mut open, |ui| {
             ui.set_min_width(440.0);
+            self.hosted_entry.show(ui);
+            ui.separator();
             title(ui, "Пригласить коллегу", SECTION_TITLE_SIZE);
             if let Ok(network) = &self.network {
                 let mut paused = network.paused();

@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.5.42"
+version = "0.5.43"
 edition = "2024"
 default-run = "godovoy-plan"
 rust-version = "1.94"
@@ -16,12 +16,19 @@ name = "godovoy-bridge"
 path = "src/bin/godovoy-bridge.rs"
 required-features = ["desktop"]
 
+[[bin]]
+name = "godovoy-online"
+path = "src/bin/godovoy-online.rs"
+required-features = ["desktop"]
+
 [features]
 default = ["desktop"]
-desktop = ["dep:axum", "dep:tower", "dep:tokio", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+desktop = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
 
 [dependencies]
 curve25519-dalek = { version = "4", default-features = false }
+hyper = { version = "1", features = ["http1", "server"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "service"], optional = true }
 axum = { optional = true, version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
 tower = { optional = true, version = "0.5", features = ["util"] }
 subtle = "2"

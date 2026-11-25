@@ -4,6 +4,7 @@ pub mod api;
 #[cfg(feature = "desktop")]
 mod import_report;
 pub mod exchange;
+pub mod hosted_address;
 
 pub mod model;
 pub mod network;

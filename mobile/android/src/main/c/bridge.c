@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+extern uint8_t gp_valid_hosted_address(const uint8_t *, size_t);
 extern void *gp_open(const char *);
 extern char *gp_open_error(void);
 extern char *gp_request(void *, const char *);
@@ -68,4 +69,15 @@ JNIEXPORT void JNICALL Java_local_godovoyplan_mobile_Core_close(JNIEnv *env, jcl
     (void)env;
     (void)cls;
     if (handle) gp_close((void *)(intptr_t)handle);
+}
+
+JNIEXPORT jboolean JNICALL Java_local_godovoyplan_mobile_Core_validHostedAddress(JNIEnv *env, jclass cls, jbyteArray input) {
+    (void)cls;
+    if (!input) return JNI_FALSE;
+    jsize length = (*env)->GetArrayLength(env, input);
+    if (length <= 0 || length > 300) return JNI_FALSE;
+    jbyte bytes[300];
+    (*env)->GetByteArrayRegion(env, input, 0, length, bytes);
+    if ((*env)->ExceptionCheck(env)) return JNI_FALSE;
+    return gp_valid_hosted_address((const uint8_t *)bytes, (size_t)length) ? JNI_TRUE : JNI_FALSE;
 }
