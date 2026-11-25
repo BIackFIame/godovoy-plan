@@ -7,9 +7,10 @@ from pathlib import Path
 import queue
 import re
 import subprocess
-import tempfile
+import shutil
 import threading
 import urllib.request
+import uuid
 import zipfile
 
 def cli(exe, *args):
@@ -80,8 +81,10 @@ def main():
         release = json.load(response)
     assert release["tag_name"] == tag and not release["draft"]
     version = tag[1:]
-    with tempfile.TemporaryDirectory(dir=os.environ["GP_TEST_VOLUME"], prefix="GodovoyQA-") as work:
-        directory = Path(work)
+    # Inherit the dedicated NTFS volume ACL. TemporaryDirectory installs its own OWNER RIGHTS ACE.
+    directory = Path(os.environ["GP_TEST_VOLUME"]) / ("GodovoyQA-" + uuid.uuid4().hex)
+    directory.mkdir()
+    try:
         extract_release(release, f"GodovoyPlan-{version}-Windows-{arch}.zip",
                         ["godovoy-plan.exe", "godovoy-online.exe"], directory)
         desktop = directory / "godovoy-plan.exe"
@@ -95,6 +98,9 @@ def main():
             extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
                             [online.name], standalone)
             server_flow(standalone / online.name, standalone)
+
+    finally:
+        shutil.rmtree(directory)
 
 if __name__ == "__main__":
     main()
