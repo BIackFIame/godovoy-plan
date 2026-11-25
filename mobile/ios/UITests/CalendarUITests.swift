@@ -27,12 +27,32 @@ final class CalendarUITests: XCTestCase {
         title.typeText("Team review")
         app.buttons["eventSave"].tap()
         let entry = app.buttons.containing(.staticText, identifier: "Team review").firstMatch
-        if !entry.isHittable { app.swipeUp() }
-        XCTAssertTrue(entry.waitForExistence(timeout: 5))
+        func revealSavedEvent() -> Bool {
+            let list = app.collectionViews.firstMatch
+            guard list.waitForExistence(timeout: 10) else { return false }
+            for attempt in 0..<5 {
+                if entry.waitForExistence(timeout: 2) {
+                    let frame = entry.frame
+                    if !frame.isEmpty, !frame.isInfinite, !frame.isNull,
+                       list.frame.intersects(frame), entry.isHittable { return true }
+                }
+                if attempt < 4 { list.swipeUp() }
+            }
+            return false
+        }
+        let dismissed = XCTNSPredicateExpectation(predicate: NSPredicate(format: "exists == false"), object: title)
+        XCTAssertEqual(XCTWaiter.wait(for: [dismissed], timeout: 10), .completed)
+        guard revealSavedEvent() else {
+            XCTFail("Сохранённое событие не появилось в списке")
+            return
+        }
         app.terminate()
         app.launch()
         XCTAssertTrue(app.buttons["newEvent"].waitForExistence(timeout: 15))
-        if !entry.isHittable { app.swipeUp() }
+        guard revealSavedEvent() else {
+            XCTFail("Событие не появилось после перезапуска")
+            return
+        }
         entry.tap()
         XCTAssertTrue(app.navigationBars["Team review"].waitForExistence(timeout: 5))
     }
