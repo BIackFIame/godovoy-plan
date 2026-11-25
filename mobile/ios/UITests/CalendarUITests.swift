@@ -7,7 +7,7 @@ final class CalendarUITests: XCTestCase {
         app.launchArguments = ["-AppleLanguages", "(ru)", "-AppleLocale", "ru_RU"]
         app.launch()
         addUIInterruptionMonitor(withDescription: "Local network access") { alert in
-            let allow = alert.buttons.matching(NSPredicate(format: "label IN %@", ["Разрешить", "Allow", "OK"])).first
+            let allow = alert.buttons.matching(NSPredicate(format: "label IN %@", ["Разрешить", "Allow", "OK"])).firstMatch
             if allow.exists { allow.tap(); return true }
             return false
         }
@@ -26,7 +26,7 @@ final class CalendarUITests: XCTestCase {
         title.tap()
         title.typeText("Team review")
         app.buttons["eventSave"].tap()
-        let entry = app.buttons.containing(.staticText, identifier: "Team review").first
+        let entry = app.buttons.containing(.staticText, identifier: "Team review").firstMatch
         if !entry.isHittable { app.swipeUp() }
         XCTAssertTrue(entry.waitForExistence(timeout: 5))
         app.terminate()

@@ -35,6 +35,8 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/package/GodovoyPlan-iOS"
+          # Drive the released app with the regression test from this workflow commit.
+          curl --fail --silent --show-error --retry 3 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/mobile/ios/UITests/CalendarUITests.swift" -o UITests/CalendarUITests.swift
           xcrun simctl list -j devices available > "$RUNNER_TEMP/devices.json"
           phone=$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1]))["devices"]; print(next(d["udid"] for runtime,devices in reversed(list(data.items())) if ".iOS-" in runtime for d in devices if d["name"].startswith("iPhone") and d["isAvailable"]))' "$RUNNER_TEMP/devices.json")
           xcrun simctl bootstatus "$phone" -b

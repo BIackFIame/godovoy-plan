@@ -43,7 +43,14 @@ def http(port, key, path):
 
 def server_flow(exe, directory):
     vault = directory / "vault"
-    cli(exe, "init", vault, "Windows QA")
+    try:
+        cli(exe, "init", vault, "Windows QA")
+    except RuntimeError:
+        # Read ACLs only along the temporary test volume; no profile contents.
+        for ancestor in [directory, *directory.parents]:
+            print("Test directory permissions:", ancestor, flush=True)
+            subprocess.run(["icacls.exe", str(ancestor)], check=False)
+        raise
     key = cli(exe, "grant", vault, "Employee", "--read-only").splitlines()[-1]
     process = subprocess.Popen([exe, "serve", vault, "--port", "0"], stderr=subprocess.PIPE,
                                text=True, encoding="utf-8")
