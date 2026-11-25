@@ -49,7 +49,9 @@ struct EventLink: View {
     var showsPreparation = false
 
     var body: some View {
-        NavigationLink { DetailView(id: event.id, year: event.year) } label: {
+        NavigationLink {
+            DetailView(id: event.id, year: event.year, targetTask: showsPreparation ? event.nextOpenTask?.id : nil)
+        } label: {
             VStack(alignment: .leading, spacing: 4) {
                 if showsPreparation, let task = event.nextOpenTask {
                     Text(task.title).font(.headline)
@@ -74,7 +76,7 @@ struct TasksView: View {
                     if state.reminders.isEmpty { Text("Напоминаний пока нет").foregroundStyle(.secondary) }
                     ForEach(state.reminders.indices, id: \.self) { index in
                         let reminder = state.reminders[index]
-                        NavigationLink { DetailView(id: reminder.eventId, year: reminder.year) } label: {
+                        NavigationLink { DetailView(id: reminder.eventId, year: reminder.year, targetTask: reminder.taskId) } label: {
                             VStack(alignment: .leading) {
                                 Text(reminder.title)
                                 Text(GPDate.label(reminder.date)).foregroundStyle(.secondary).font(.subheadline)
@@ -92,13 +94,34 @@ struct DetailView: View {
     @Environment(\.dismiss) var dismiss
     let id: String
     let year: Int
+    var targetTask: String? = nil
+    @State private var revealedTask: String?
+    @AccessibilityFocusState private var focusedTask: String?
     @State private var event: GPEvent?
     @State private var note = ""
     @State private var base = ""
     @State private var edit = false
     @State private var remove = false
     @State private var loaded = false
+    private var availableTarget: String? {
+        guard let targetTask, event?.checklist.contains(where: { $0.id == targetTask }) == true else { return nil }
+        return targetTask
+    }
+
     var body: some View {
+        ScrollViewReader { scroll in
+            detailList.task(id: availableTarget) {
+                guard let target = availableTarget, revealedTask != target else { return }
+                await Task.yield()
+                guard !Task.isCancelled else { return }
+                revealedTask = target
+                scroll.scrollTo(target, anchor: .center)
+                focusedTask = target
+            }
+        }
+    }
+
+    private var detailList: some View {
         List {
             if let event {
                 Section { LabeledContent("Дата", value: GPDate.label(event.date)); LabeledContent("Начало подготовки", value: GPDate.label(event.preparationDate)); if let owner = model.state?.ownerName(event.employeeId) { LabeledContent("Ответственный", value: owner) }; if event.yearly { Label("Ежегодно", systemImage: "repeat") }; if !event.description.isEmpty { Text(event.description) } }
@@ -106,7 +129,10 @@ struct DetailView: View {
                     Section("Чек-лист") { ForEach(event.checklist) { t in
                         Button { Task { if await model.check(event: event, task: t), model.state?.year != year { await reload() } } } label: {
                             HStack { Image(systemName: t.done ? "checkmark.circle.fill" : "circle").foregroundStyle(Color.accentColor); VStack(alignment: .leading) { Text(t.title).foregroundStyle(.primary); Text(GPDate.label(t.dueDate)).font(.caption).foregroundStyle(.secondary) } }
-                        }.disabled(model.busy).accessibilityValue(t.done ? "Выполнено" : "Открыто")
+                        }.disabled(model.busy)
+                        .accessibilityValue(t.done ? "Выполнено" : "Открыто")
+                        .accessibilityFocused($focusedTask, equals: t.id)
+                        .id(t.id)
                     } }
                 }
                 Section("Дневник за \(String(year)) год") { TextField("Заметка", text: $note, axis: .vertical).lineLimit(3...12); Button("Сохранить заметку") { Task { if await model.run("note", ["eventId": .string(id), "year": .integer(year), "text": .string(note), "base": .string(base)]) { base = note; await reload() } } }.disabled(model.busy || note == base) }

@@ -1,0 +1,22 @@
+name: Проверка исходников клиента iOS
+on: workflow_dispatch
+permissions: {}
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Получить точную версию приложения
+        run: |
+          git init --quiet
+          git fetch --quiet --no-tags --depth=1 "https://github.com/$GITHUB_REPOSITORY.git" "$GITHUB_SHA"
+          git checkout --quiet --detach FETCH_HEAD
+      - name: Собрать ядро Rust и запустить тесты приложения на iPhone
+        run: |
+          set -euo pipefail
+          rustup toolchain install 1.94.0 --profile minimal --target aarch64-apple-ios,aarch64-apple-ios-sim
+          export RUSTUP_TOOLCHAIN=1.94.0
+          export GP_BUILD_DIR="$RUNNER_TEMP/build"
+          xcrun simctl list -j devices available > "$RUNNER_TEMP/devices.json"
+          phone=$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1]))["devices"]; print(next(d["udid"] for runtime,devices in reversed(list(data.items())) if ".iOS-" in runtime for d in devices if d["name"].startswith("iPhone") and d["isAvailable"]))' "$RUNNER_TEMP/devices.json")
+          mobile/ios/build.sh --test "$phone"

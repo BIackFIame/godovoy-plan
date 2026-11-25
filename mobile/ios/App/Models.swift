@@ -73,7 +73,11 @@ struct GPYearSections {
     }
 }
 
-struct GPReminder: Equatable, Decodable { let eventId, title, date: String; let year: Int }
+struct GPReminder: Equatable, Decodable {
+    let eventId, title, date: String
+    let year: Int
+    let taskId: String?
+}
 struct GPState: Equatable, Decodable {
     let deviceId: String
     let workspaceName, address, networkError, accessManagerId: String?
