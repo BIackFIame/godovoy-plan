@@ -69,8 +69,11 @@ name = "storage_permissions"
 
 [features]
 default = ["desktop"]
-server = ["serde_json/raw_value", "dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
+server = ["dep:flate2", "serde_json/raw_value", "dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
 desktop = ["server", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+
+[build-dependencies]
+flate2 = { optional = true, version = "1", default-features = false, features = ["rust_backend"] }
 
 [dependencies]
 curve25519-dalek = { version = "4", default-features = false }

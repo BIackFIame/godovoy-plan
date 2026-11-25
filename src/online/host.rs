@@ -16,7 +16,7 @@ use axum::{
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
 use blake2::Digest;
@@ -658,24 +658,17 @@ fn prepare_command(
 }
 pub fn router(host: Host) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
+        .route(
+            "/",
+            get(|headers| async move { crate::assets::INDEX.serve(&headers) }),
+        )
         .route(
             "/calendar.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("calendar.js"),
-                )
-            }),
+            get(|headers| async move { crate::assets::CALENDAR_JS.serve(&headers) }),
         )
         .route(
             "/calendar.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("calendar.css"),
-                )
-            }),
+            get(|headers| async move { crate::assets::CALENDAR_CSS.serve(&headers) }),
         )
         .route("/mcp", post(mcp::handle))
         .route("/v1/session", get(session))
