@@ -1,5 +1,7 @@
 use chrono::NaiveDate;
-use godovoy_plan::model::{Calendar, Category, Event, Id, Record, Revision, Task, YearChange};
+use godovoy_plan::model::{
+    Calendar, Category, Event, Id, MAX_TASKS, Record, Revision, Task, YearChange,
+};
 
 fn date(y: i32, m: u32, d: u32) -> NaiveDate {
     NaiveDate::from_ymd_opt(y, m, d).unwrap()
@@ -633,4 +635,28 @@ fn diary_update_shares_the_event_without_mutating_previous_snapshots() {
     ));
     assert_eq!(old.event(id, 2026).unwrap().note(), "");
     assert_eq!(new.event(id, 2026).unwrap().note(), "Напоминание");
+}
+
+#[test]
+fn checklist_validation_respects_size_and_unique_ids_in_any_order() {
+    let mut event = template(Id::nil(), date(2026, 12, 20));
+    event.tasks.clear();
+    assert!(event.validate().is_ok());
+    for i in (0..MAX_TASKS).rev() {
+        event.tasks.push(Task {
+            id: Id::from_u128(i as u128),
+            title: format!("Пункт {i}"),
+            days_before: 0,
+        });
+    }
+    assert!(event.validate().is_ok());
+    let extra = Task {
+        id: Id::from_u128(MAX_TASKS as u128),
+        ..event.tasks[0].clone()
+    };
+    event.tasks.push(extra);
+    assert!(event.validate().is_err());
+    event.tasks.pop();
+    event.tasks[0].id = event.tasks[MAX_TASKS - 1].id;
+    assert!(event.validate().is_err());
 }

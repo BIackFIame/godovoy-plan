@@ -12,8 +12,15 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.UUID;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.RejectedExecutionException;
+import java.util.concurrent.SynchronousQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 import org.json.JSONException;
 import org.json.JSONObject;
 
@@ -26,6 +33,8 @@ public final class CalendarApplication extends Application {
     }
 
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
+    private final ExecutorService documents = new ThreadPoolExecutor(0, 1, 30, TimeUnit.SECONDS,
+            new SynchronousQueue<>());
     private final Handler ui = new Handler(Looper.getMainLooper());
     private long handle;
     private File profile;
@@ -71,8 +80,8 @@ public final class CalendarApplication extends Application {
         return result.opt("data");
     }
 
-    void queue(Work work, Reply reply) {
-        worker.execute(() -> {
+    private void queue(ExecutorService executor, Work work, Reply reply) {
+        executor.execute(() -> {
             Object result = null;
             String issue = null;
             try {
@@ -88,7 +97,33 @@ public final class CalendarApplication extends Application {
     }
 
     void call(JSONObject command, Reply reply) {
-        queue(() -> invoke(command), reply);
+        queue(worker, () -> invoke(command), reply);
+    }
+
+    private void transfer(Work work, Reply reply) {
+        try {
+            queue(documents, work, reply);
+        } catch (RejectedExecutionException busy) {
+            if (reply != null)
+                ui.post(() -> reply.accept(null, "Дождитесь завершения обмена файлом."));
+        }
+    }
+
+    // Only the document worker waits here. The core worker never waits for provider I/O.
+    private <T> T coreStep(Callable<T> step) throws Exception {
+        try {
+            return CompletableFuture.supplyAsync(() -> {
+                try {
+                    return step.call();
+                } catch (Exception issue) {
+                    throw new CompletionException(issue);
+                }
+            }, worker).join();
+        } catch (CompletionException failed) {
+            if (failed.getCause() instanceof Exception)
+                throw (Exception) failed.getCause();
+            throw failed;
+        }
     }
 
     private static final int FILE_LIMIT = 9 * 1024 * 1024;
@@ -114,15 +149,17 @@ public final class CalendarApplication extends Application {
     }
 
     void importDocument(Uri source, Reply reply) {
-        queue(() -> {
-            open();
-            File imported = new File(exchangeFolder(), UUID.randomUUID() + ".yrplan");
+        transfer(() -> {
+            File imported = coreStep(() -> {
+                open();
+                return new File(exchangeFolder(), UUID.randomUUID() + ".yrplan");
+            });
             try {
                 try (InputStream in = getContentResolver().openInputStream(source);
                         OutputStream out = new FileOutputStream(imported)) {
                     copy(in, out);
                 }
-                return invoke(message("import", "path", imported.getAbsolutePath()));
+                return coreStep(() -> invoke(message("import", "path", imported.getAbsolutePath())));
             } finally {
                 imported.delete();
             }
@@ -130,8 +167,9 @@ public final class CalendarApplication extends Application {
     }
 
     void exportDocument(Uri target, Reply reply) {
-        queue(() -> {
-            File exported = new File((String) invoke(message("export"))).getCanonicalFile();
+        transfer(() -> {
+            String path = coreStep(() -> (String) invoke(message("export")));
+            File exported = new File(path).getCanonicalFile();
             if (!exchangeFolder().equals(exported.getParentFile())
                     || !exported.getName().endsWith(".yrplan")) {
                 throw new IOException("Некорректный файл обмена.");

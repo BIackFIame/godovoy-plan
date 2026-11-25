@@ -137,6 +137,10 @@
                 load(currentYear).then(() => { if (updated === generation) notice(message); }).catch(() => {});
                 throw new Problem();
             }
+            if (response.status === 429) {
+                clearWorkspace("Проверка ключей занята. Подождите секунду и войдите снова.");
+                throw new Problem();
+            }
             if (response.status === 401 || response.status === 403) {
                 const messages = {
                     "office-only": "Этот ключ действует только в офисе. Откройте внутренний адрес календаря или запросите удалённый доступ.",

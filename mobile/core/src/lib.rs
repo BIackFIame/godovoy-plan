@@ -124,7 +124,7 @@ struct Session {
 }
 
 impl Session {
-    fn load(initial: &Path) -> Fallible<Self> {
+    fn load(initial: &Path, background: bool) -> Fallible<Self> {
         let active = Store::active_directory(initial)?;
         let store = if active == initial {
             Store::open(initial)?
@@ -137,11 +137,11 @@ impl Session {
             network_error: None,
             last_state: None,
         };
-        session.connect();
+        session.connect(background);
         Ok(session)
     }
 
-    fn connect(&mut self) {
+    fn connect(&mut self, background: bool) {
         #[cfg(not(test))]
         let mut config = Config::default();
         #[cfg(test)]
@@ -153,16 +153,17 @@ impl Session {
         {
             config.discovery_port = None;
         }
-        let result = Network::start(self.store.clone(), config).or_else(|e| {
-            if e.downcast_ref::<io::Error>()
-                .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse)
-            {
-                config.listen.set_port(0);
-                Network::start(self.store.clone(), config)
-            } else {
-                Err(e)
-            }
-        });
+        let result =
+            Network::start_with_pause(self.store.clone(), config, background).or_else(|e| {
+                if e.downcast_ref::<io::Error>()
+                    .is_some_and(|e| e.kind() == io::ErrorKind::AddrInUse)
+                {
+                    config.listen.set_port(0);
+                    Network::start_with_pause(self.store.clone(), config, background)
+                } else {
+                    Err(e)
+                }
+            });
         match result {
             Ok(net) => {
                 self.network = Some(net);
@@ -207,7 +208,7 @@ impl Mobile {
         if !initial.is_absolute() || initial.file_name().is_none() {
             return Err("Требуется приватная папка приложения.".into());
         }
-        let session = Session::load(&initial)?;
+        let session = Session::load(&initial, false)?;
         staging::prepare(&initial)?;
         Ok(Self {
             initial,
@@ -228,7 +229,10 @@ impl Mobile {
             self.session = None;
         }
         if self.session.is_none() {
-            self.session = Some(Session::load(&self.initial)?);
+            self.session = Some(Session::load(
+                &self.initial,
+                self.background_pause.is_some(),
+            )?);
         }
         self.session
             .as_mut()
@@ -337,16 +341,14 @@ impl Mobile {
             }
             Command::Peer { address } => session.net()?.remember_peer(address)?,
             Command::Pause { paused } => {
-                if let Some(network) = session.network.as_ref() {
+                if let Some(preference) = self.background_pause.as_mut() {
+                    // A preference change cannot restart the transport while in background.
+                    session.store.lock().unwrap().set_sync_paused(paused)?;
+                    *preference = paused;
+                } else if let Some(network) = session.network.as_ref() {
                     network.set_profile_paused(paused)?;
-                    if self.background_pause.is_some() {
-                        network.set_paused(true);
-                    }
                 } else {
                     session.store.lock().unwrap().set_sync_paused(paused)?;
-                }
-                if self.background_pause.is_some() {
-                    self.background_pause = Some(paused);
                 }
             }
             Command::Background => {
@@ -362,7 +364,7 @@ impl Mobile {
             }
             Command::Foreground => {
                 if session.network.is_none() {
-                    session.connect();
+                    session.connect(false);
                 }
                 if let Some(previous) = self.background_pause.take()
                     && let Some(net) = &session.network

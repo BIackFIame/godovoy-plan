@@ -132,3 +132,73 @@ fn linked_backup_inputs_are_rejected() {
     fs::hard_link(vault.0.join(ACCESS), &part).unwrap();
     assert!(OnlineVault::verify_backup(&backup).is_err());
 }
+
+#[test]
+fn concurrent_changes_stay_outside_the_captured_journal_prefix_and_acl() {
+    let (temp, vault) = setup();
+    let snapshot = staging(temp.path()).unwrap();
+    let capture = CapturedBackup::capture(&vault, snapshot.path()).unwrap();
+    let (journal, prefix) = capture.journals.first().unwrap();
+    let journal = journal.clone();
+    let expected = fs::read(vault.0.join(&journal)).unwrap();
+    assert_eq!(prefix.limit(), expected.len() as u64);
+
+    // This uses the normal grant path while the pending snapshot still has open files.
+    let (_, _, key) = vault.lock().unwrap().grant("Ada", None, true).unwrap();
+    assert!(
+        vault
+            .lock()
+            .unwrap()
+            .access()
+            .unwrap()
+            .authorize(&key)
+            .is_some()
+    );
+    capture.write_to(snapshot.path()).unwrap();
+    assert_eq!(
+        fs::read(snapshot.path().join(format!("part-{journal}"))).unwrap(),
+        expected
+    );
+
+    let restored = staging(temp.path()).unwrap();
+    reconstruct(snapshot.path(), restored.path()).unwrap();
+    let old = OnlineVault::open(restored.path()).unwrap();
+    assert!(
+        old.lock()
+            .unwrap()
+            .access()
+            .unwrap()
+            .authorize(&key)
+            .is_none()
+    );
+}
+
+#[test]
+fn histories_longer_than_the_handle_budget_include_every_month() {
+    let (temp, vault) = setup();
+    let snapshot = staging(temp.path()).unwrap();
+    for offset in 0..=MAX_PINNED_JOURNALS {
+        let month = format!("{:04}-{:02}", 2000 + offset / 12, 1 + offset % 12);
+        let mut journal = create_file(&vault.0.join(format!("security-{month}.jsonl"))).unwrap();
+        writeln!(
+            journal,
+            r#"{{"at":"{month}-01T00:00:00Z","action":"grant_requested"}}"#
+        )
+        .unwrap();
+    }
+    let capture = CapturedBackup::capture(&vault, snapshot.path()).unwrap();
+    assert_eq!(capture.journals.len(), MAX_PINNED_JOURNALS);
+    // Historical months plus the live month containing backup_requested.
+    assert_eq!(capture.manifest.files.len(), 2);
+    capture.write_to(snapshot.path()).unwrap();
+    let out = staging(temp.path()).unwrap();
+    let manifest = reconstruct(snapshot.path(), out.path()).unwrap();
+    assert_eq!(
+        manifest
+            .files
+            .keys()
+            .filter(|name| evidence::audit_month(name).is_some())
+            .count(),
+        MAX_PINNED_JOURNALS + 2
+    );
+}

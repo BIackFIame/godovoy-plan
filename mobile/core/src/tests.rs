@@ -315,3 +315,18 @@ fn linked_employees_share_personal_work_but_keep_independent_device_access() {
     assert_eq!(reopened["tasks"].as_array().unwrap().len(), 2);
     phone.reject(json!({"op":"invite","request":request}));
 }
+
+#[test]
+fn reopening_a_session_keeps_background_pause_until_foreground() {
+    let tmp = TempDir::new().unwrap();
+    let mut phone = super::Mobile::open(tmp.path().join("profile")).unwrap();
+    phone.request(json!({"op":"background"})).unwrap();
+    phone.session = None;
+    let paused =
+        |phone: &mut super::Mobile| phone.refresh().unwrap().network.as_ref().unwrap().paused();
+    assert!(paused(&mut phone));
+    phone.request(json!({"op":"pause","paused":false})).unwrap();
+    assert!(paused(&mut phone));
+    phone.request(json!({"op":"foreground"})).unwrap();
+    assert!(!paused(&mut phone));
+}

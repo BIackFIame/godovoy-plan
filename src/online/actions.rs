@@ -4,25 +4,106 @@ use godovoy_plan::{
     planning::personal_events,
     storage::online::{Access, Data},
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize, Serializer};
 use std::collections::BTreeSet;
 
-pub(crate) fn occurrence(data: &Data, e: Occurrence<'_>, allow_free_text: bool) -> Value {
-    let event = e.event;
-    let description = if allow_free_text {
-        event.description.as_str()
-    } else {
-        ""
-    };
-    let note = if allow_free_text { e.note() } else { "" };
-    let checklist=event.tasks.iter().map(|t|json!({"id":t.id,"title":t.title,"daysBefore":t.days_before,"dueDate":e.due(t),"done":e.checked(t.id)})).collect::<Vec<_>>();
-    json!({"id":e.id,"year":e.year,"title":event.title,"description":description,"category":event.category,
-        "date":e.date,"yearly":event.yearly,"ownerId":event.owner.map(|id|data.calendar.person_for(id)),
-        "preparationDays":event.preparation_days,"preparationDate":e.preparation_date(),"checklist":checklist,
-        "note":note,"revision":format!("{}:{}",e.revision.sequence,e.revision.operation)})
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ChecklistItem<'a> {
+    id: Id,
+    title: &'a str,
+    days_before: u16,
+    due_date: NaiveDate,
+    done: bool,
 }
-pub fn state(data: &Data, acl: &Access, year: i32, employee: Id, can_edit: bool) -> Value {
+
+// Serialize checklist entries straight into the response buffer.
+struct Checklist<'a>(Occurrence<'a>);
+impl Serialize for Checklist<'_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let event = self.0;
+        serializer.collect_seq(event.event.tasks.iter().map(|task| ChecklistItem {
+            id: task.id,
+            title: &task.title,
+            days_before: task.days_before,
+            due_date: event.due(task),
+            done: event.checked(task.id),
+        }))
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct EventView<'a> {
+    id: Id,
+    year: i32,
+    title: &'a str,
+    description: &'a str,
+    category: Category,
+    date: NaiveDate,
+    yearly: bool,
+    owner_id: Option<Id>,
+    preparation_days: u16,
+    preparation_date: NaiveDate,
+    checklist: Checklist<'a>,
+    note: &'a str,
+    revision: String,
+}
+
+pub(crate) fn occurrence<'a>(
+    data: &Data,
+    e: Occurrence<'a>,
+    allow_free_text: bool,
+) -> EventView<'a> {
+    let event = e.event;
+    EventView {
+        id: e.id,
+        year: e.year,
+        title: &event.title,
+        description: if allow_free_text {
+            &event.description
+        } else {
+            ""
+        },
+        category: event.category,
+        date: e.date,
+        yearly: event.yearly,
+        owner_id: event.owner.map(|id| data.calendar.person_for(id)),
+        preparation_days: event.preparation_days,
+        preparation_date: e.preparation_date(),
+        checklist: Checklist(e),
+        note: if allow_free_text { e.note() } else { "" },
+        revision: format!("{}:{}", e.revision.sequence, e.revision.operation),
+    }
+}
+
+#[derive(Serialize)]
+struct Employee<'a> {
+    id: Id,
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CalendarView<'a> {
+    workspace_name: &'a str,
+    employee_id: Id,
+    employees: Vec<Employee<'a>>,
+    can_edit: bool,
+    allow_free_text: bool,
+    assigned_only: bool,
+    year: i32,
+    events: Vec<EventView<'a>>,
+    tasks: Vec<EventView<'a>>,
+}
+
+pub fn state<'a>(
+    data: &'a Data,
+    acl: &'a Access,
+    year: i32,
+    employee: Id,
+    can_edit: bool,
+) -> CalendarView<'a> {
     let allow_free_text = acl.protection().settings.free_text_allowed();
     let assigned_only = acl.assigned_only.contains(&employee);
     let active = acl
@@ -34,12 +115,29 @@ pub fn state(data: &Data, acl: &Access, year: i32, employee: Id, can_edit: bool)
         .employees
         .iter()
         .filter(|(id, _)| active.contains(id) && (!assigned_only || **id == employee))
-        .map(|(id, name)| json!({"id":id,"name":name}))
-        .collect::<Vec<_>>();
-    let tasks = personal_events(&data.calendar, Local::now().date_naive(), employee);
-    json!({"workspaceName":acl.name,"employeeId":employee,"employees":employees,"canEdit":can_edit,"allowFreeText":allow_free_text,"assignedOnly":assigned_only,"year":year,
-        "events":data.calendar.year(year).into_iter().filter(|e| !assigned_only || assigned_to(data, *e, employee)).map(|e|occurrence(data,e,allow_free_text)).collect::<Vec<_>>(),
-        "tasks":tasks.into_iter().map(|e|occurrence(data,e,allow_free_text)).collect::<Vec<_>>()})
+        .map(|(&id, name)| Employee { id, name })
+        .collect();
+    let visible = |e| occurrence(data, e, allow_free_text);
+    let mut events: Vec<_> = data
+        .calendar
+        .occurrences(year)
+        .filter(|e| !assigned_only || assigned_to(data, *e, employee))
+        .collect();
+    events.sort_unstable_by_key(|e| (e.date, e.id));
+    CalendarView {
+        workspace_name: &acl.name,
+        employee_id: employee,
+        employees,
+        can_edit,
+        allow_free_text,
+        assigned_only,
+        year,
+        events: events.into_iter().map(visible).collect(),
+        tasks: personal_events(&data.calendar, Local::now().date_naive(), employee)
+            .into_iter()
+            .map(visible)
+            .collect(),
+    }
 }
 
 #[derive(Deserialize)]

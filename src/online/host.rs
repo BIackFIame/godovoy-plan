@@ -1,7 +1,10 @@
+#[path = "admission.rs"]
+mod admission;
 #[path = "mcp.rs"]
 mod mcp;
 #[path = "standby.rs"]
 mod standby;
+use admission::{Admission, Discovery, credential_hint};
 use standby::Mode;
 
 use super::actions::{self, Command};
@@ -26,7 +29,11 @@ use hyper_util::{
 };
 use serde::Deserialize;
 use serde_json::json;
-use std::{net::Ipv4Addr, sync::Arc, time::Duration};
+use std::{
+    net::Ipv4Addr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 use tokio::{net::TcpListener, sync::Semaphore};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -43,6 +50,8 @@ pub struct Host {
     entry: EntryPoint,
     mode: Mode,
     operations: Arc<Semaphore>,
+    discovery: Arc<Mutex<Discovery>>,
+    new_checks: Arc<Semaphore>,
 }
 impl Host {
     pub fn new(vault: OnlineVault, origin: &str, entry: Option<EntryPoint>) -> Fallible<Self> {
@@ -79,6 +88,8 @@ impl Host {
             entry,
             mode: Mode::Primary,
             operations: Arc::new(Semaphore::new(16)),
+            discovery: Arc::new(Mutex::new(Discovery::new(Instant::now()))),
+            new_checks: Arc::new(Semaphore::new(4)),
         })
     }
     fn enable_standby(&mut self) -> Fallible<()> {
@@ -101,6 +112,16 @@ fn standby_unavailable() -> Response {
 }
 fn problem(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
+}
+fn discovery_limited() -> Response {
+    let mut response = problem(
+        StatusCode::TOO_MANY_REQUESTS,
+        "Проверка новых ключей занята. Повторите запрос через секунду.",
+    );
+    response
+        .headers_mut()
+        .insert(header::RETRY_AFTER, HeaderValue::from_static("1"));
+    response
 }
 fn protection_denied(message: &str, code: &'static str) -> Response {
     let mut response = problem(StatusCode::FORBIDDEN, message);
@@ -169,17 +190,32 @@ async fn with_auth<F>(
 where
     F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
 {
-    let Some(token) = headers
+    let Some((token, presented_id, hint)) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
         .filter(|v| v.len() == 80)
-        .map(|value| zeroize::Zeroizing::new(value.to_owned()))
+        .and_then(|value| {
+            let (id, hint) = credential_hint(value, purpose)?;
+            Some((zeroize::Zeroizing::new(value.to_owned()), id, hint))
+        })
     else {
         return problem(
             StatusCode::UNAUTHORIZED,
             "Для доступа нужен действующий ключ.",
         );
+    };
+    let admission = match host.discovery.lock() {
+        Ok(mut gate) => gate.admit(&hint, Instant::now()),
+        Err(_) => return unavailable(),
+    };
+    let new_check = match admission {
+        Admission::Known => None,
+        Admission::New => match host.new_checks.clone().try_acquire_owned() {
+            Ok(permit) => Some(permit),
+            Err(_) => return discovery_limited(),
+        },
+        Admission::Limited => return discovery_limited(),
     };
     let Ok(slot) = host.operations.clone().try_acquire_owned() else {
         return problem(
@@ -196,16 +232,17 @@ where
             return unavailable();
         };
         let Some((id, grant)) = acl.authorize_for(&token, purpose) else {
-            if let Some((prefix, secret)) = token.split_once('.')
-                && let Ok(id) = Id::parse_str(prefix)
-                && secret.len() == 43
-                && secret
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+            let record_denial = match host.discovery.lock() {
+                Ok(mut gate) => gate.reject(&hint, Instant::now()),
+                Err(_) => return unavailable(),
+            };
+            if record_denial
                 && lock
                     .audit_security(
                         "authorization_denied",
-                        acl.grants.contains_key(&id).then_some(id),
+                        acl.grants
+                            .contains_key(&presented_id)
+                            .then_some(presented_id),
                         None,
                         None,
                     )
@@ -276,6 +313,11 @@ where
             }
             return problem(StatusCode::FORBIDDEN, "Разрешено только чтение.");
         };
+        match host.discovery.lock() {
+            Ok(mut gate) => gate.remember(hint),
+            Err(_) => return unavailable(),
+        }
+        drop(new_check);
         let mut response = action(&lock, &acl, id, employee, !read_only, &host.mode);
         if response.status().is_success() {
             let scope = if acl.assigned_only.contains(&employee) {
@@ -637,6 +679,47 @@ mod tests {
             "date":"2028-02-29","yearly":true,"preparationDays":30,"checklist":[{"title":"Список","daysBefore":10}]})
         }
     }
+    #[tokio::test]
+    async fn known_employee_can_work_and_be_revoked_while_new_checks_are_busy() {
+        let mut f = Fixture::new();
+        let (_, _, second) = f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        let host = Host::new(
+            f.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Office),
+        )
+        .unwrap();
+        let checks = host.new_checks.clone();
+        f.app = router(host);
+        let path = "/v1/session";
+        assert_eq!(
+            f.request(path, &f.key, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        let busy = checks
+            .acquire_many(checks.available_permits() as u32)
+            .await
+            .unwrap();
+        assert_eq!(
+            f.request(path, &second, None).await.0,
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(
+            f.request(path, &f.key, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        f.vault.lock().unwrap().revoke(f.credential).unwrap();
+        assert_eq!(
+            f.request(path, &f.key, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        drop(busy);
+        assert_eq!(
+            f.request(path, &second, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
     #[tokio::test]
     async fn protection_applies_to_existing_sessions_grants_and_minimizes_both_event_lists() {
         use chrono::Datelike;

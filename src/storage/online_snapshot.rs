@@ -19,6 +19,7 @@ use tempfile::{Builder, TempDir};
 
 const MANIFEST: &str = "backup-manifest-v1.json";
 const MANIFEST_LIMIT: usize = 512 * 1024;
+const MAX_PINNED_JOURNALS: usize = 64;
 const STANDBY: &str = "online-standby-v1.json";
 const PROTECTION: &str = "online-protection-required-v1.json";
 
@@ -111,11 +112,15 @@ fn create_file(path: &Path) -> io::Result<File> {
 }
 
 fn copy_file(src: &Path, dest: &Path, limit: u64) -> Fallible<Fingerprint> {
-    let mut input = private_file(src)?;
+    let input = private_file(src)?;
     let size = input.metadata()?.len();
     if size > limit {
         return Err("Превышен размер файла резервной копии.".into());
     }
+    copy_reader(input, dest, size)
+}
+
+fn copy_reader(mut input: impl Read, dest: &Path, size: u64) -> Fallible<Fingerprint> {
     let mut output = create_file(dest)?;
     let mut hash = Blake2s256::new();
     let mut bytes = 0u64;
@@ -313,41 +318,90 @@ fn reconstruct(backup: &Path, out: &Path) -> Fallible<Manifest> {
     Ok(manifest)
 }
 
+struct CapturedBackup {
+    manifest: Manifest,
+    payloads: Vec<(String, Vec<u8>)>,
+    journals: Vec<(String, io::Take<File>)>,
+}
+
+impl CapturedBackup {
+    fn capture(vault: &OnlineVault, staging: &Path) -> Fallible<Self> {
+        let lock = vault.lock()?;
+        validate_evidence_directory(lock.directory)?;
+        lock.access()?;
+        lock.standby_window()?;
+        lock.audit_security("backup_requested", None, None, None)?;
+
+        let mut captured = Self {
+            manifest: Manifest {
+                version: 1,
+                created_at: Utc::now(),
+                standby_pin: lock._lock.metadata()?.len() == 1,
+                files: BTreeMap::new(),
+            },
+            payloads: Vec::new(),
+            journals: Vec::new(),
+        };
+        for entry in fs::read_dir(lock.directory)? {
+            let entry = entry?;
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let Some(limit) = file_limit(name) else {
+                continue;
+            };
+            let file = private_file(&entry.path())?;
+            let size = file.metadata()?.len();
+            if size > limit {
+                return Err("Превышен размер файла резервной копии.".into());
+            }
+            if evidence::audit_month(name).is_some() {
+                if captured.journals.len() < MAX_PINNED_JOURNALS {
+                    // Writers only append complete records under the same vault lock. Keep
+                    // this file identity and stop exactly at the last captured record.
+                    captured.journals.push((name.to_owned(), file.take(size)));
+                } else {
+                    // Retain support for long histories even on systems with few file handles.
+                    let digest = copy_reader(file, &staging.join(format!("part-{name}")), size)?;
+                    captured.manifest.files.insert(name.to_owned(), digest);
+                }
+            } else {
+                // Release handles to atomically replaced Windows files before unlocking.
+                let mut bytes = Vec::with_capacity(usize::try_from(size)?);
+                file.take(size + 1).read_to_end(&mut bytes)?;
+                if bytes.len() as u64 != size {
+                    return Err("Файл изменился во время копирования.".into());
+                }
+                captured.payloads.push((name.to_owned(), bytes));
+            }
+        }
+        Ok(captured)
+    }
+
+    fn write_to(mut self, staging: &Path) -> Fallible<()> {
+        for (name, bytes) in self.payloads {
+            let digest = copy_reader(
+                bytes.as_slice(),
+                &staging.join(format!("part-{name}")),
+                bytes.len() as u64,
+            )?;
+            self.manifest.files.insert(name, digest);
+        }
+        for (name, prefix) in self.journals {
+            let size = prefix.limit();
+            let digest = copy_reader(prefix, &staging.join(format!("part-{name}")), size)?;
+            self.manifest.files.insert(name, digest);
+        }
+        save(&staging.join(MANIFEST), &self.manifest, MANIFEST_LIMIT)?;
+        Ok(())
+    }
+}
+
 impl OnlineVault {
     pub fn create_verified_backup(&self, destination: &Path) -> Fallible<Value> {
         let dest = parent_for_new(destination, &self.0)?;
         let parent = dest.parent().ok_or("Отсутствует родительская папка.")?;
         let snapshot = staging(parent)?;
-        {
-            let lock = self.lock()?;
-            validate_evidence_directory(lock.directory)?;
-            lock.access()?;
-            lock.standby_window()?;
-            lock.audit_security("backup_requested", None, None, None)?;
-            let mut files = BTreeMap::new();
-            for entry in fs::read_dir(lock.directory)? {
-                let entry = entry?;
-                let name = entry.file_name();
-                let Some(name) = name.to_str() else {
-                    continue;
-                };
-                if let Some(limit) = file_limit(name) {
-                    let digest = copy_file(
-                        &entry.path(),
-                        &snapshot.path().join(format!("part-{name}")),
-                        limit,
-                    )?;
-                    files.insert(name.to_owned(), digest);
-                }
-            }
-            let manifest = Manifest {
-                version: 1,
-                created_at: Utc::now(),
-                standby_pin: lock._lock.metadata()?.len() == 1,
-                files,
-            };
-            save(&snapshot.path().join(MANIFEST), &manifest, MANIFEST_LIMIT)?;
-        }
+        CapturedBackup::capture(self, snapshot.path())?.write_to(snapshot.path())?;
         let out = staging(parent)?;
         let verified = reconstruct(snapshot.path(), out.path())?;
         drop(out);

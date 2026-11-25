@@ -259,7 +259,10 @@ impl Context<'_, '_> {
                 if !self.audit("mcp_get_my_event_requested", Some(event_id)) {
                     return unavailable();
                 }
-                return self.read_result(id, actions::occurrence(&data, event, free_text));
+                return match serde_json::to_value(actions::occurrence(&data, event, free_text)) {
+                    Ok(detail) => self.read_result(id, detail),
+                    Err(_) => unavailable(),
+                };
             }
             Call::SetMyTaskDone { task_id, done, .. } => actions::Command::Check {
                 event_id,

@@ -444,15 +444,24 @@ impl Event {
                 "Превышены ограничения события: год, описание, срок подготовки или число пунктов.",
             );
         }
-        let mut ids = std::collections::BTreeSet::new();
-        for task in &self.tasks {
+        if self.tasks.is_empty() {
+            return Ok(());
+        }
+        const INVALID_TASK: &str = "Проверьте названия, сроки и идентификаторы пунктов чек-листа.";
+        let mut ids = [Id::nil(); MAX_TASKS];
+        let used = &mut ids[..self.tasks.len()];
+        for (id, task) in used.iter_mut().zip(&self.tasks) {
             if task.title.trim().is_empty()
                 || task.title.chars().count() > 160
                 || task.days_before > self.preparation_days
-                || !ids.insert(task.id)
             {
-                return Err("Проверьте названия, сроки и идентификаторы пунктов чек-листа.");
+                return Err(INVALID_TASK);
             }
+            *id = task.id;
+        }
+        used.sort_unstable();
+        if used.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(INVALID_TASK);
         }
         Ok(())
     }

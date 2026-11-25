@@ -5,6 +5,8 @@ actor CalendarClient {
     static let shared = CalendarClient()
     private var handle: UnsafeMutableRawPointer?
     private var root: URL?
+    private let documentIO = DispatchQueue(label: "local.godovoyplan.documents", qos: .utility)
+    private var transferring = false
     private struct Envelope<T: Decodable>: Decodable { let ok: Bool; let data: T?; let error: String? }
 
     private func profile() throws -> URL {
@@ -70,12 +72,31 @@ actor CalendarClient {
         return dir
     }
 
-    func importFile(_ external: URL) throws {
+    private func beginTransfer() throws {
+        guard !transferring else { throw GPError("Дождитесь завершения обмена файлом.") }
+        transferring = true
+    }
+
+    private func documentWork<T: Sendable>(_ operation: @escaping @Sendable () throws -> T) async throws -> T {
+        try await withCheckedThrowingContinuation { continuation in
+            documentIO.async { continuation.resume(with: Result { try operation() }) }
+        }
+    }
+
+    func importFile(_ external: URL) async throws {
+        try beginTransfer()
+        defer { transferring = false }
         _ = try open()
-        let scoped = external.startAccessingSecurityScopedResource()
-        defer { if scoped { external.stopAccessingSecurityScopedResource() } }
         let temporary = try exchangeDirectory().appendingPathComponent(UUID().uuidString + ".yrplan")
         defer { try? FileManager.default.removeItem(at: temporary) }
+        try await documentWork { try Self.copyDocument(external, to: temporary) }
+        try Task.checkCancellation()
+        try run(["op": .string("import"), "path": .string(temporary.path)])
+    }
+
+    private static func copyDocument(_ external: URL, to temporary: URL) throws {
+        let scoped = external.startAccessingSecurityScopedResource()
+        defer { if scoped { external.stopAccessingSecurityScopedResource() } }
         var coordinatorError: NSError?
         var copied: Result<Void, Error>?
         NSFileCoordinator().coordinate(readingItemAt: external, options: [], error: &coordinatorError) { readable in
@@ -84,10 +105,15 @@ actor CalendarClient {
         if let coordinatorError { throw coordinatorError }
         guard let copied else { throw GPError("Не удалось прочитать выбранный файл.") }
         try copied.get()
-        try run(["op": .string("import"), "path": .string(temporary.path)])
     }
 
     func exportURL() throws -> URL {
+        try beginTransfer()
+        defer { transferring = false }
+        return try prepareExport()
+    }
+
+    private func prepareExport() throws -> URL {
         let path = try value(["op": .string("export")], as: String.self)
         let source = URL(fileURLWithPath: path).standardizedFileURL
         let directory = try exchangeDirectory().resolvingSymlinksInPath()
@@ -109,10 +135,14 @@ actor CalendarClient {
         return source
     }
 
-    func exportFile() throws -> Data {
-        let source = try exportURL()
+    func exportFile() async throws -> Data {
+        try beginTransfer()
+        defer { transferring = false }
+        let source = try prepareExport()
         defer { try? FileManager.default.removeItem(at: source) }
-        return try Data(contentsOf: source)
+        let contents = try await documentWork { try Data(contentsOf: source) }
+        try Task.checkCancellation()
+        return contents
     }
 
     private static func copyBounded(_ input: URL, to output: URL) throws {
