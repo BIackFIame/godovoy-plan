@@ -288,6 +288,10 @@ public final class MainActivity extends Activity {
         refresh(force, true);
     }
     private void refresh(boolean force, boolean conditional) {
+        refresh(force, conditional, null);
+    }
+
+    private void refresh(boolean force, boolean conditional, ChecklistUpdate pending) {
         final long version = ++refreshVersion;
         final int expected = year;
         final JSONObject prior = state;
@@ -297,8 +301,11 @@ public final class MainActivity extends Activity {
         JSONObject request = !hasBase ? message("state", "year", expected) :
                 acceptsStamp ? message("state", "year", expected, "ifToken", token, "acceptSyncStamp", true) :
                 message("state", "year", expected, "ifToken", token);
+        final ChecklistUpdate update = hasBase && pending != null && pending.matches(prior, expected, stateKey)
+                ? pending : null;
+        if (update != null) addField(request, "acceptCheckPatch", true);
         loading = true;
-        app.call(request, (data, error) -> {
+        app.readState(request, update, (data, error) -> {
             if (!alive() || !active || version != refreshVersion)
                 return;
             loading = false;
@@ -309,6 +316,10 @@ public final class MainActivity extends Activity {
             if (expected != year) return;
             if (error != null) {
                 if (outstanding == 0) showError(error);
+                return;
+            }
+            if (update != null && !update.matches(state, year, stateKey)) {
+                refresh(force, false);
                 return;
             }
             if (data instanceof JSONObject) {
@@ -381,10 +392,15 @@ public final class MainActivity extends Activity {
         }
     }
     void action(JSONObject command, CalendarApplication.Reply result) {
+        action(command, result, null);
+    }
+
+    private void action(JSONObject command, CalendarApplication.Reply result, ChecklistUpdate update) {
         if (outstanding != 0) {
             feedback("Дождитесь завершения операции.");
             return;
         }
+        if (update != null) addField(command, "baseToken", update.token);
         outstanding++;
         app.call(command, (data, error) -> {
             outstanding--;
@@ -394,8 +410,16 @@ public final class MainActivity extends Activity {
                 result.accept(data, error);
             else if (error != null)
                 feedback(error);
-            refresh(true);
+            refresh(true, true, error == null ? update : null);
         });
+    }
+
+    private static void addField(JSONObject message, String name, Object value) {
+        try {
+            message.put(name, value);
+        } catch (org.json.JSONException invalid) {
+            throw new IllegalArgumentException(invalid);
+        }
     }
 
     void showError(String error) {
@@ -741,6 +765,8 @@ public final class MainActivity extends Activity {
                         + (e.optBoolean("yearly") ? "  ·  Ежегодно" : ""));
         if (!str(e, "description").isEmpty())
             hint(form, str(e, "description"));
+        final JSONArray displayedEvents = state.optJSONArray("events");
+        final int displayedYear = year;
         List<JSONObject> tasks = items(array(e, "checklist"));
         if (!tasks.isEmpty()) {
             label(form, "Чек-лист", 19);
@@ -755,16 +781,23 @@ public final class MainActivity extends Activity {
                         check.setChecked(task.optBoolean("done"));
                         return;
                     }
+                    if (displayedYear != year || displayedEvents != state.optJSONArray("events")) {
+                        check.setChecked(task.optBoolean("done"));
+                        renderPending = true;
+                        refresh(true);
+                        return;
+                    }
                     check.setEnabled(false);
-                    action(message("check", "eventId", str(e, "id"), "year", e.optInt("year"), "taskId",
-                                   str(task, "id"), "done", check.isChecked()),
-                            (data, error) -> {
-                                if (error != null) {
-                                    check.setChecked(task.optBoolean("done"));
-                                    check.setEnabled(true);
-                                    feedback(error);
-                                }
-                            });
+                    JSONObject command = message("check", "eventId", str(e, "id"), "year", e.optInt("year"), "taskId",
+                                   str(task, "id"), "done", check.isChecked());
+                    ChecklistUpdate update = ChecklistUpdate.forCommand(state, command);
+                    action(command, (data, error) -> {
+                        if (error != null) {
+                            check.setChecked(task.optBoolean("done"));
+                            check.setEnabled(true);
+                            feedback(error);
+                        }
+                    }, update);
                 });
             }
         }

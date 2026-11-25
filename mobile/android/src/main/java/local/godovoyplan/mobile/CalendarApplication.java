@@ -105,6 +105,16 @@ public final class CalendarApplication extends Application {
         }, reply);
     }
 
+    void readState(JSONObject command, ChecklistUpdate update, Reply reply) {
+        queue(worker, () -> {
+            Object data = invoke(command);
+            if (!(data instanceof JSONObject)) return data;
+            JSONObject state = (JSONObject) data;
+            if (!state.has("checkPatch")) return state;
+            return update == null ? null : update.merge(state);
+        }, reply);
+    }
+
     void call(JSONObject command, Reply reply) {
         queue(worker, () -> invoke(command), reply);
     }

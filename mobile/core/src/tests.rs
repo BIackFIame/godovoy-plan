@@ -356,3 +356,168 @@ fn fresh_profile_waits_for_an_explicit_local_choice() {
     let session = phone.session.as_ref().unwrap();
     assert!(session.network.is_some());
 }
+
+#[test]
+fn partial_check_requires_exact_view_and_falls_back_after_an_intervening_edit() {
+    let tmp = TempDir::new().unwrap();
+    let phone = Phone::open(&tmp.path().join("profile"));
+    phone.ok(json!({"op":"createWorkspace","employee":"Мария","name":"Офис"}));
+    let device = phone.state(2027)["deviceId"].clone();
+    phone.ok(event(&device));
+    phone.ok(event(&device));
+    let base = phone.state(2027);
+    let row = base["events"][0].clone();
+    let other = base["events"][1].clone();
+    let command = |base: &Value, done| json!({"op":"check","year":2027,"eventId":row["id"],"taskId":row["checklist"][0]["id"],"done":done,"baseToken":base["stateToken"]});
+    let read = |base: &Value| json!({"op":"state","year":2027,"ifToken":base["stateToken"],"acceptCheckPatch":true});
+    phone.ok(command(&base, true));
+    let mut patch = phone.ok(read(&base));
+    assert_eq!(patch["checkPatch"], true);
+    assert_eq!(patch["baseToken"], base["stateToken"]);
+    assert_eq!(patch["events"].as_array().unwrap().len(), 1);
+    patch.as_object_mut().unwrap().remove("checkPatch");
+    patch.as_object_mut().unwrap().remove("baseToken");
+    let mut events = base["events"].clone();
+    events[0] = patch["events"][0].clone();
+    patch["events"] = events;
+    for (field, positions, count, key) in [
+        ("tasks", "taskPositions", "taskCount", "id"),
+        ("reminders", "reminderPositions", "reminderCount", "eventId"),
+    ] {
+        let object = patch.as_object_mut().unwrap();
+        let positions = object.remove(positions).unwrap();
+        let updates = object.remove(field).unwrap();
+        let updated: std::collections::BTreeMap<_, _> = positions
+            .as_array()
+            .unwrap()
+            .iter()
+            .zip(updates.as_array().unwrap())
+            .map(|(i, v)| (i.as_u64().unwrap(), v.clone()))
+            .collect();
+        let count = object.remove(count).unwrap().as_u64().unwrap();
+        let mut other_rows = base[field]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e[key] != row["id"]);
+        object.insert(
+            field.to_owned(),
+            Value::Array(
+                (0..count)
+                    .map(|i| {
+                        updated
+                            .get(&i)
+                            .unwrap_or_else(|| other_rows.next().unwrap())
+                            .clone()
+                    })
+                    .collect(),
+            ),
+        );
+        assert!(other_rows.next().is_none());
+    }
+    assert_eq!(patch, phone.state(2027));
+    phone.ok(command(&patch, false));
+    phone.ok(json!({"op":"note","year":2027,"eventId":other["id"],"text":"Коллега изменил дневник","base":""}));
+    let full = phone.ok(read(&patch));
+    assert!(full.get("checkPatch").is_none());
+    assert_eq!(full["events"][1]["note"], "Коллега изменил дневник");
+    phone.reject(command(&patch, true));
+    assert_eq!(
+        phone.state(2027)["events"][0]["checklist"][0]["done"],
+        false
+    );
+    phone.ok(command(&full, false));
+    assert_eq!(phone.ok(read(&full)), json!({"unchanged":true}));
+    let mobile = unsafe { &*phone.0.cast::<std::sync::Mutex<super::Mobile>>() };
+    let store = mobile
+        .lock()
+        .unwrap()
+        .session
+        .as_ref()
+        .unwrap()
+        .store
+        .clone();
+    let member: Id = serde_json::from_value(device).unwrap();
+    store
+        .lock()
+        .unwrap()
+        .transaction(|s| {
+            s.workspace_mut()?.calendar.members.remove(&member);
+            Ok(())
+        })
+        .unwrap();
+    phone.reject(command(&full, true));
+    phone.reject(read(&full));
+}
+
+#[test]
+fn previous_generation_check_cannot_change_the_replacement_profile() {
+    let tmp = TempDir::new().unwrap();
+    let phone = Phone::open(&tmp.path().join("office"));
+    phone.ok(json!({"op":"createWorkspace","name":"Группа","employee":"Наталья"}));
+    let device = phone.state(2027)["deviceId"].clone();
+    phone.ok(event(&device));
+    let before = phone.state(2027);
+    let e = &before["events"][0];
+    let command = json!({"op":"check","eventId":e["id"],"year":2027,"taskId":e["checklist"][0]["id"],"done":true,"baseToken":before["stateToken"]});
+    let m = unsafe { &*phone.0.cast::<std::sync::Mutex<super::Mobile>>() };
+    let store = m.lock().unwrap().session.as_ref().unwrap().store.clone();
+    let network = Network::start(
+        store.clone(),
+        Config {
+            listen: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            discovery_port: None,
+        },
+    )
+    .unwrap();
+    network
+        .renew_access_async()
+        .recv_timeout(Duration::from_secs(8))
+        .unwrap()
+        .unwrap();
+    assert!(store.lock().unwrap().successor_directory().is_some());
+    drop(network);
+    phone.reject(command);
+    let after = phone.ok(
+        json!({"op":"state","year":2027,"ifToken":before["stateToken"],"acceptCheckPatch":true}),
+    );
+    assert!(after.get("checkPatch").is_none());
+    assert_ne!(before["stateToken"], after["stateToken"]);
+    assert_eq!(after["events"][0]["checklist"][0]["done"], false);
+}
+
+#[test]
+fn compact_check_is_bound_to_the_requested_year_token_and_client_capability() {
+    let tmp = TempDir::new().unwrap();
+    let phone = Phone::open(&tmp.path().join("profile"));
+    phone.ok(json!({"op":"createWorkspace","employee":"Ольга","name":"Офис"}));
+    let device = phone.state(2027)["deviceId"].clone();
+    phone.ok(event(&device));
+    phone.ok(event(&device));
+
+    for (index, (read_year, supported, correct_token)) in
+        [(2028, true, true), (2027, false, true), (2027, true, false)]
+            .into_iter()
+            .enumerate()
+    {
+        let prior = phone.state(2027);
+        let source = &prior["events"][0];
+        let token = &prior["stateToken"];
+        let mut check = json!({"op":"check","eventId":source["id"],"year":2028,
+            "taskId":source["checklist"][0]["id"],"done":index % 2 == 0,"baseToken":token});
+        phone.reject(check.clone());
+        check["year"] = json!(2027);
+        phone.ok(check);
+        let supplied = if correct_token {
+            token.clone()
+        } else {
+            json!(Id::new_v4())
+        };
+        let result = phone.ok(json!({"op":"state","year":read_year,"ifToken":supplied,
+            "acceptCheckPatch":supported}));
+        assert!(result.get("checkPatch").is_none());
+        assert_eq!(result["year"], read_year);
+        assert_eq!(result["events"].as_array().unwrap().len(), 2);
+        assert_eq!(result, phone.state(read_year));
+    }
+}

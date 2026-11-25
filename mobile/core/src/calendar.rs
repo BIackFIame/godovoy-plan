@@ -5,7 +5,7 @@ use godovoy_plan::{
     Fallible,
     model::{Event, Id, Record},
     planning::{Milestone, Reminder, due_reminders, personal_events},
-    storage::{LocalState, SharedStore},
+    storage::{LocalState, SharedStore, Store},
 };
 use serde_json::{Value, json};
 use std::{
@@ -29,6 +29,7 @@ pub(super) struct LastState {
     context: ViewContext,
     last_sync: Option<i64>,
     token: Id,
+    check_result: Option<(Weak<LocalState>, Id)>,
 }
 
 #[derive(serde::Serialize)]
@@ -44,10 +45,19 @@ pub(super) fn state(
     year: i32,
     if_token: Option<Id>,
     accept_sync_stamp: bool,
+    accept_check_patch: bool,
 ) -> Fallible<String> {
     year_check(year)?;
     let (snapshot, receipts, paused) = {
-        let guard = session.store.lock().unwrap();
+        let guard = session.store.lock().map_err(|_| "Профиль недоступен.")?;
+        let state = guard.state();
+        if guard.successor_directory().is_some()
+            || state.workspace.as_ref().is_some_and(|w| {
+                w.is_revoked(state.device) || !w.calendar.members.contains_key(&state.device)
+            })
+        {
+            return Err("Доступ к этому профилю изменился. Откройте актуальный календарь.".into());
+        }
         (
             guard.snapshot(),
             guard.reminder_receipts(),
@@ -76,6 +86,16 @@ pub(super) fn state(
     // Weak identity survives address reuse, without retaining any retired keys or calendar data.
     let observed = Arc::downgrade(&snapshot);
     let acknowledged = Arc::downgrade(&receipts);
+    let changed = session.last_state.as_ref().and_then(|prior| {
+        let (after, id) = prior.check_result.as_ref()?;
+        (accept_check_patch
+            && Some(prior.token) == if_token
+            && after.ptr_eq(&observed)
+            && prior.receipts.ptr_eq(&acknowledged)
+            && prior.context == context
+            && prior.last_sync == last_sync)
+            .then_some((*id, prior.token))
+    });
     let previous = session.last_state.as_mut().filter(|item| {
         item.snapshot.ptr_eq(&observed)
             && item.receipts.ptr_eq(&acknowledged)
@@ -107,9 +127,10 @@ pub(super) fn state(
     let token = reusable.unwrap_or_else(Id::new_v4);
     let mut result = json!({"deviceId":snapshot.device,"employeeId":null,"employees":[],"workspaceName":null,"year":year,"members":[],"reminders":[],"notificationDates":[],
         "lanEnabled":snapshot.lan_enabled(), "address":context.address, "networkError":context.warning, "paused":context.paused, "stateToken":token,
-        "supportsSyncStamp":true,"lastSync":timestamp(),
+        "supportsSyncStamp":true,"supportsCheckPatch":true,"lastSync":timestamp(),
         "canManage":false,"accessManagerId":null});
     session.last_state = Some(LastState {
+        check_result: None,
         snapshot: observed,
         receipts: acknowledged,
         context,
@@ -117,11 +138,20 @@ pub(super) fn state(
         token,
     });
     if let Some(w) = &snapshot.workspace {
-        let personal = personal_events(&w.calendar, today, snapshot.device);
+        let changed_row =
+            changed.and_then(|(id, base)| w.calendar.event(id, year).map(|row| (row, base)));
+        let mut personal = personal_events(&w.calendar, today, snapshot.device);
+        let mut reminder_positions = Vec::new();
+        let mut reminder_count = 0;
         let reminders = due_reminders(&personal, today)
             .into_iter()
             .filter(|r| !receipts.contains(r))
             .filter_map(|r| {
+                if changed_row.is_some_and(|(row, _)| row.id != r.event) {
+                    // Each reminder was just derived from a visible live occurrence and its own task.
+                    reminder_count += 1;
+                    return None;
+                }
                 let e = w.calendar.event(r.event, r.year)?;
                 let title = match r.kind {
                     Milestone::Task(id) => e
@@ -132,6 +162,10 @@ pub(super) fn state(
                         .map(|t| format!("{} · {}", e.event.title, t.title))?,
                     _ => e.event.title.clone(),
                 };
+                if changed_row.is_some() {
+                    reminder_positions.push(reminder_count);
+                }
+                reminder_count += 1;
                 Some(json!({"eventId":r.event,"year":r.year,"title":title,"date":r.date}))
             })
             .collect::<Vec<_>>();
@@ -141,7 +175,7 @@ pub(super) fn state(
             w.employees()
                 .into_iter()
                 .map(|(id, name)| json!({"id":id,"name":name}))
-                .collect::<Vec<_>>()
+                .collect::<Vec<_>>(),
         );
         result["workspaceName"] = json!(w.name);
         result["accessManagerId"] = json!(w.access_manager);
@@ -154,11 +188,33 @@ pub(super) fn state(
                 .collect::<Vec<_>>()
         );
         result["reminders"] = Value::Array(reminders);
+        let events = if let Some((row, base)) = changed_row {
+            let mut task_positions = Vec::new();
+            let task_count = personal.len();
+            let mut position = 0;
+            personal.retain(|e| {
+                let keep = e.id == row.id;
+                if keep {
+                    task_positions.push(position);
+                }
+                position += 1;
+                keep
+            });
+            result["taskPositions"] = json!(task_positions);
+            result["taskCount"] = json!(task_count);
+            result["reminderPositions"] = json!(reminder_positions);
+            result["reminderCount"] = json!(reminder_count);
+            result["checkPatch"] = json!(true);
+            result["baseToken"] = json!(base);
+            vec![row]
+        } else {
+            w.calendar.year(year)
+        };
         return success(FullSnapshot {
             metadata: result,
             events: rows::Rows {
                 calendar: &w.calendar,
-                occurrences: w.calendar.year(year),
+                occurrences: events,
             },
             tasks: rows::Rows {
                 calendar: &w.calendar,
@@ -191,8 +247,45 @@ pub(super) fn create(store: &SharedStore, event: Event) -> Fallible<()> {
 }
 
 pub(super) fn check(store: &SharedStore, id: Id, year: i32, task: Id, done: bool) -> Fallible<()> {
+    let mut guard = store.lock().map_err(|_| "Профиль недоступен.")?;
+    checked(&mut guard, id, year, task, done)
+}
+
+pub(super) fn check_from_view(
+    session: &mut Session,
+    token: Id,
+    id: Id,
+    year: i32,
+    task: Id,
+    done: bool,
+) -> Fallible<()> {
+    let mut store = session.store.lock().map_err(|_| "Профиль недоступен.")?;
+    let before = store.snapshot();
+    let w = before.workspace.as_ref().ok_or("Профиль недоступен.")?;
+    if store.successor_directory().is_some()
+        || w.is_revoked(before.device)
+        || !w.calendar.members.contains_key(&before.device)
+    {
+        return Err("Доступ этого устройства к календарю закрыт.".into());
+    }
+    let prior = session
+        .last_state
+        .as_mut()
+        .filter(|view| {
+            view.token == token
+                && view.context.year == year
+                && view.context.today == Local::now().date_naive()
+                && view.snapshot.ptr_eq(&Arc::downgrade(&before))
+        })
+        .ok_or("Календарь изменился. Проверьте обновлённый пункт перед отметкой.")?;
+    checked(&mut store, id, year, task, done)?;
+    let after = store.snapshot();
+    prior.check_result = (!Arc::ptr_eq(&before, &after)).then(|| (Arc::downgrade(&after), id));
+    Ok(())
+}
+fn checked(store: &mut Store, id: Id, year: i32, task: Id, done: bool) -> Fallible<()> {
     year_check(year)?;
-    store.lock().unwrap().transaction(|s| {
+    store.transaction(|s| {
         let e = s.follow_event(id, year)?;
         if !e.event.tasks.iter().any(|t| t.id == task) {
             return Err("Пункт чек-листа изменился.".into());
@@ -256,7 +349,7 @@ mod tests {
     use super::*;
 
     fn snapshot(session: &mut Session, year: i32, token: Option<Id>, compact: bool) -> Value {
-        let response = state(session, year, token, compact).unwrap();
+        let response = state(session, year, token, compact, false).unwrap();
         let mut decoded: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(decoded["ok"], true);
         decoded["data"].take()

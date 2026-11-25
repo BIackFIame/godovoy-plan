@@ -50,6 +50,8 @@ enum Command {
         if_token: Option<Id>,
         #[serde(default)]
         accept_sync_stamp: bool,
+        #[serde(default)]
+        accept_check_patch: bool,
     },
     CreateWorkspace {
         name: String,
@@ -67,6 +69,7 @@ enum Command {
         description: String,
     },
     Check {
+        base_token: Option<Id>,
         event_id: Id,
         year: i32,
         task_id: Id,
@@ -292,7 +295,16 @@ impl Mobile {
                 year,
                 if_token,
                 accept_sync_stamp,
-            } => return calendar::state(session, year, if_token, accept_sync_stamp),
+                accept_check_patch,
+            } => {
+                return calendar::state(
+                    session,
+                    year,
+                    if_token,
+                    accept_sync_stamp,
+                    accept_check_patch,
+                );
+            }
             Command::CreateWorkspace { name, employee } => {
                 session.store.lock().unwrap().transaction(|s| {
                     s.create_workspace(short_name(name)?, short_name(employee)?)
@@ -332,11 +344,18 @@ impl Mobile {
                 )?;
             }
             Command::Check {
+                base_token,
                 event_id,
                 year,
                 task_id,
                 done,
-            } => calendar::check(&session.store, event_id, year, task_id, done)?,
+            } => {
+                if let Some(token) = base_token {
+                    calendar::check_from_view(session, token, event_id, year, task_id, done)?;
+                } else {
+                    calendar::check(&session.store, event_id, year, task_id, done)?;
+                }
+            }
             Command::Note {
                 event_id,
                 year,
