@@ -5,7 +5,7 @@ on:
       tag:
         description: Тег опубликованного выпуска
         required: true
-        default: v0.6.5
+        default: v0.6.6
       architecture:
         description: Архитектура пакета
         type: choice

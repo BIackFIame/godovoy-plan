@@ -3,30 +3,75 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Тег опубликованного выпуска
+        description: Тег выпуска
         required: true
-        default: v0.6.5
+        default: v0.6.6
+      draft_id:
+        description: Числовой ID черновика выпуска. Для опубликованного выпуска оставьте пустым.
+        required: false
+        type: string
+      xcode_sha256:
+        description: Требуемый SHA-256 комплекта Xcode для черновика
+        required: false
+        type: string
 permissions:
   contents: read
 jobs:
-  simulator:
+  input:
     runs-on: macos-15
-    timeout-minutes: 30
+    timeout-minutes: 5
+    # GitHub requires push access for draft releases. This job only reads a digest-pinned asset.
+    permissions:
+      contents: write
     steps:
-      - name: Проверить и распаковать комплект Xcode
+      - name: Получить проверенный комплект Xcode
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ inputs.tag }}
+          DRAFT_ID: ${{ inputs.draft_id }}
+          PIN: ${{ inputs.xcode_sha256 }}
         run: |
           set -euo pipefail
           [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          test "$(uname -m)" = arm64
+          api="repos/$GITHUB_REPOSITORY/releases"
+          if [[ -n "$DRAFT_ID" ]]; then
+            [[ "$DRAFT_ID" =~ ^[0-9]+$ && "$PIN" =~ ^[a-f0-9]{64}$ ]]
+            gh api "$api/$DRAFT_ID" > "$RUNNER_TEMP/release.json"
+            jq -e --arg tag "$TAG" --arg commit "$GITHUB_SHA" '.draft == true and .tag_name == $tag and .target_commitish == $commit' "$RUNNER_TEMP/release.json" >/dev/null
+          else
+            gh api "$api/tags/$TAG" > "$RUNNER_TEMP/release.json"
+          fi
           name="GodovoyPlan-${TAG#v}-iOS-Xcode.zip"
-          expected=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")
-          [[ "$expected" =~ ^sha256:[a-f0-9]{64}$ ]]
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name"
-          echo "${expected#sha256:}  $name" | shasum -a 256 -c -
-          ditto -x -k "$name" "$RUNNER_TEMP/package"
+          jq -ec --arg name "$name" '[.assets[] | select(.name == $name and .state == "uploaded")] | select(length == 1) | .[0]' "$RUNNER_TEMP/release.json" > "$RUNNER_TEMP/asset.json"
+          digest=$(jq -r .digest "$RUNNER_TEMP/asset.json")
+          [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+          if [[ -n "$PIN" ]]; then test "$digest" = "sha256:$PIN"; fi
+          id=$(jq -er '.id | numbers' "$RUNNER_TEMP/asset.json")
+          gh api "$api/assets/$id" -H 'Accept: application/octet-stream' > xcode.zip
+          echo "${digest#sha256:}  xcode.zip" | shasum -a 256 -c -
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: xcode-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: xcode.zip
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
+  simulator:
+    needs: input
+    runs-on: macos-15
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      actions: read
+    steps:
+      - name: Распаковать комплект из этого запуска
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = arm64
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "xcode-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --dir "$RUNNER_TEMP/input"
+          ditto -x -k "$RUNNER_TEMP/input/xcode.zip" "$RUNNER_TEMP/package"
       - name: Собрать приложение для устройства без ключа подписи
         run: |
           cd "$RUNNER_TEMP/package/GodovoyPlan-iOS"
@@ -35,8 +80,6 @@ jobs:
         run: |
           set -euo pipefail
           cd "$RUNNER_TEMP/package/GodovoyPlan-iOS"
-          # Drive the released app with the regression test from this workflow commit.
-          curl --fail --silent --show-error --retry 3 "https://raw.githubusercontent.com/$GITHUB_REPOSITORY/$GITHUB_SHA/mobile/ios/UITests/CalendarUITests.swift" -o UITests/CalendarUITests.swift
           xcrun simctl list -j devices available > "$RUNNER_TEMP/devices.json"
           phone=$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1]))["devices"]; print(next(d["udid"] for runtime,devices in reversed(list(data.items())) if ".iOS-" in runtime for d in devices if d["name"].startswith("iPhone") and d["isAvailable"]))' "$RUNNER_TEMP/devices.json")
           xcrun simctl bootstatus "$phone" -b
@@ -62,6 +105,8 @@ jobs:
           pack_app "$RUNNER_TEMP/device/Build/Products/Release-iphoneos" iphoneos iOS-Unsigned-Device
           cd "$RUNNER_TEMP/ios-artifacts"
           shasum -a 256 ./*.zip > SHA256SUMS.txt
+          hash=$(shasum -a 256 "$RUNNER_TEMP/input/xcode.zip" | cut -d' ' -f1)
+          jq -n --arg commit "$GITHUB_SHA" --arg tag "$TAG" --arg input "$hash" --arg run "$GITHUB_RUN_ID" --arg attempt "$GITHUB_RUN_ATTEMPT" '{commit:$commit,tag:$tag,inputSha256:$input,run:$run,attempt:$attempt}' > provenance.json
       - name: Сохранить собранные приложения
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
