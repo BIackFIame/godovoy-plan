@@ -46,6 +46,7 @@ pub fn legend_marker(ui: &mut Ui, category: Category) {
 
 pub fn year_wheel(
     ui: &mut Ui,
+    max_height: f32,
     year: i32,
     today: NaiveDate,
     events: &[CalendarRow],
@@ -55,7 +56,7 @@ pub fn year_wheel(
     if width < 190.0 {
         return None;
     }
-    let height = width.min(308.0);
+    let height = width.min(max_height.max(190.0));
     let (response, painter) = ui.allocate_painter(vec2(width, height), egui::Sense::hover());
     let center = response.rect.center();
     let radius = (height - 59.0) * 0.5;
@@ -117,7 +118,7 @@ pub fn year_wheel(
             center - vec2(0.0, 7.0),
             Align2::CENTER_CENTER,
             MONTH_NAMES[month],
-            heading_font(if width < 235.0 { 20.0 } else { 26.0 }),
+            heading_font(if height < 235.0 { 20.0 } else { 26.0 }),
             INK,
         );
         painter.text(

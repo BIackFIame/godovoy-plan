@@ -687,7 +687,7 @@ impl App {
                             self.hosted_entry.show(ui);
                             let ui = &mut columns[1];
                             ui.add_space(10.0);
-                            year_wheel(ui, today.year(), today, &[], None);
+                            year_wheel(ui, 308.0, today.year(), today, &[], None);
                         });
                     });
             });
@@ -1012,28 +1012,35 @@ impl App {
 
     fn dial(&mut self, ui: &mut Ui, events: &[CalendarRow], today: NaiveDate) {
         ui.horizontal(|ui| title(ui, "Годовой круг", SECTION_TITLE_SIZE));
-        if let Some(id) = year_wheel(ui, self.year, today, events, self.selected) {
+        let columns = if ui.available_width() < 308.0 { 2 } else { 4 };
+        let legend_height = if columns == 2 { 43.0 } else { 24.0 };
+        let wheel_height = (ui.available_height() - legend_height).min(360.0);
+        if let Some(id) = year_wheel(ui, wheel_height, self.year, today, events, self.selected) {
             self.selected = Some(id);
             self.reveal_event = true;
             ui.ctx().request_repaint();
         }
-        let legend = |ui: &mut Ui, categories: &[Category]| {
-            ui.spacing_mut().item_spacing.x = 9.0;
-            for &category in categories {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    legend_marker(ui, category);
-                    ui.label(RichText::new(category.label()).size(11.5).color(MUTED));
+        ui.add_space(4.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            egui::Grid::new("calendar-category-legend")
+                .num_columns(columns)
+                .min_col_width(0.0)
+                .min_row_height(16.0)
+                .spacing(vec2(12.0, 3.0))
+                .show(ui, |ui| {
+                    for row in Category::ALL.chunks(columns) {
+                        for &category in row {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                legend_marker(ui, category);
+                                ui.label(RichText::new(category.label()).size(12.0).color(MUTED));
+                            });
+                        }
+                        ui.end_row();
+                    }
                 });
-            }
-        };
-        if ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH {
-            for pair in Category::ALL.chunks(2) {
-                ui.horizontal(|ui| legend(ui, pair));
-            }
-        } else {
-            ui.horizontal_wrapped(|ui| legend(ui, &Category::ALL));
-        }
+        });
     }
 
     fn calendar_controls(&mut self, ui: &mut Ui, today: NaiveDate) {
