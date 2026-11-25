@@ -58,6 +58,9 @@ pub(super) fn present<'de, D: Deserializer<'de>>(
     StoredProtection::deserialize(d).map(Some)
 }
 impl Access {
+    pub(super) fn has_pending_protection(&self) -> bool {
+        self.protection.as_ref().is_some_and(|p| p.pending_audit)
+    }
     pub fn protection(&self) -> ProtectionState {
         self.protection
             .as_ref()

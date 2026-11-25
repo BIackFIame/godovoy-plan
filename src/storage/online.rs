@@ -103,6 +103,9 @@ pub struct GrantPermissions {
     pub read_only: bool,
     pub allow_remote: bool,
 }
+/// One validated session document per host, used only while holding its vault lock.
+#[derive(Default)]
+pub struct SessionAcl(Option<(Option<Vec<u8>>, Access)>);
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Access {
@@ -327,18 +330,17 @@ impl LockedVault<'_> {
         let (file, _) = self.open_bounded(name, limit)?;
         read_bounded_json(file, limit)
     }
-    pub fn access(&self) -> Fallible<Access> {
-        // The ACL is small and read on each request under the vault lock.
-        // Parse the current file directly from a bounded contiguous buffer.
-        let mut acl: Access = {
-            let (mut file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
-            let mut bytes = vec![0; metadata.len() as usize];
-            file.read_exact(&mut bytes)?;
-            if file.read(&mut [0])? != 0 {
-                return Err("Размер файла прав изменился во время чтения.".into());
-            }
-            serde_json::from_slice(&bytes)?
-        };
+    fn access_bytes(&self) -> Fallible<Vec<u8>> {
+        let (mut file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
+        let mut bytes = vec![0; metadata.len() as usize];
+        file.read_exact(&mut bytes)?;
+        if file.read(&mut [0])? != 0 {
+            return Err("Размер файла прав изменился во время чтения.".into());
+        }
+        Ok(bytes)
+    }
+    fn decode_access(bytes: &[u8]) -> Fallible<Access> {
+        let acl: Access = serde_json::from_slice(bytes)?;
         if acl
             .assigned_only
             .iter()
@@ -356,7 +358,28 @@ impl LockedVault<'_> {
         }) {
             return Err("Повреждена привязка ключа к сотруднику.".into());
         }
+        Ok(acl)
+    }
+    pub fn access(&self) -> Fallible<Access> {
+        let mut acl = Self::decode_access(&self.access_bytes()?)?;
         self.finish_protection(&mut acl)?;
+        Ok(acl)
+    }
+    pub fn session_access<'a>(&self, cache: &'a mut SessionAcl) -> Fallible<&'a Access> {
+        let bytes = self.access_bytes()?;
+        let hit = cache
+            .0
+            .as_ref()
+            .is_some_and(|(known, _)| known.as_deref() == Some(&bytes[..]));
+        if !hit {
+            cache.0 = None;
+            let acl = Self::decode_access(&bytes)?;
+            // A journal recovery rewrites ACCESS. Its original bytes must always replay recovery.
+            let cacheable = !acl.has_pending_protection();
+            cache.0 = Some((cacheable.then_some(bytes), acl));
+        }
+        let (_, acl) = cache.0.as_mut().ok_or("Не удалось прочитать права.")?;
+        self.finish_protection(acl)?;
         Ok(acl)
     }
     pub fn set_employee_scope(&self, employee: Id, assigned_only: bool) -> Fallible<()> {

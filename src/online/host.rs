@@ -23,7 +23,7 @@ use blake2::Digest;
 use godovoy_plan::{
     Fallible,
     model::Id,
-    storage::online::{Access, Data, GrantPurpose, LockedVault, OnlineVault, record},
+    storage::online::{Access, Data, GrantPurpose, LockedVault, OnlineVault, SessionAcl, record},
 };
 use hyper::server::conn::http1;
 use hyper_util::{
@@ -48,6 +48,7 @@ pub enum EntryPoint {
 #[derive(Clone)]
 pub struct Host {
     vault: OnlineVault,
+    session_acl: Arc<Mutex<SessionAcl>>,
     origin: String,
     authority: String,
     entry: EntryPoint,
@@ -87,6 +88,7 @@ impl Host {
         let origin = format!("{}://{}", uri.scheme_str().unwrap_or_default(), authority);
         Ok(Self {
             vault,
+            session_acl: Arc::default(),
             origin,
             authority: authority.as_str().into(),
             entry,
@@ -185,16 +187,41 @@ async fn headers(State(host): State<Host>, req: Request, next: Next) -> Response
     );
     response
 }
+#[derive(Clone, Copy)]
+enum AuthOperation {
+    View,
+    Session,
+    Command,
+    Mcp { write: bool },
+}
+
+enum RequestAcl<'a> {
+    Current(&'a mut Access),
+    Session(&'a Access),
+}
+impl std::ops::Deref for RequestAcl<'_> {
+    type Target = Access;
+    fn deref(&self) -> &Access {
+        match self {
+            Self::Current(acl) => acl,
+            Self::Session(acl) => acl,
+        }
+    }
+}
 async fn with_auth<F>(
     host: Host,
     headers: HeaderMap,
-    purpose: GrantPurpose,
-    write: bool,
+    operation: AuthOperation,
     action: F,
 ) -> Response
 where
     F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
 {
+    let (purpose, write) = match operation {
+        AuthOperation::Session | AuthOperation::View => (GrantPurpose::Employee, false),
+        AuthOperation::Command => (GrantPurpose::Employee, true),
+        AuthOperation::Mcp { write } => (GrantPurpose::Mcp, write),
+    };
     let Some((token, presented_id, hint)) = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
@@ -233,8 +260,23 @@ where
         let Ok(lock) = host.vault.lock() else {
             return unavailable();
         };
-        let Ok(mut acl) = lock.access() else {
-            return unavailable();
+        let mut fresh;
+        let mut cached;
+        let mut acl = if matches!(operation, AuthOperation::Session) {
+            let Ok(guard) = host.session_acl.lock() else {
+                return unavailable();
+            };
+            cached = guard;
+            let Ok(acl) = lock.session_access(&mut cached) else {
+                return unavailable();
+            };
+            RequestAcl::Session(acl)
+        } else {
+            let Ok(acl) = lock.access() else {
+                return unavailable();
+            };
+            fresh = acl;
+            RequestAcl::Current(&mut fresh)
         };
         let Some((id, grant)) = acl.authorize_for(&token, purpose) else {
             let record_denial = match host.discovery.lock() {
@@ -272,7 +314,10 @@ where
         };
         if purpose == GrantPurpose::Mcp {
             // Only the authorization view of this request is narrowed. Persistent employee rights stay separate.
-            acl.assigned_only.insert(employee);
+            let RequestAcl::Current(ref mut private) = acl else {
+                return unavailable();
+            };
+            private.assigned_only.insert(employee);
         }
         let Ok(deadline) = host.mode.check(&lock) else {
             if lock
@@ -377,8 +422,7 @@ async fn state(
     with_auth(
         host,
         headers,
-        GrantPurpose::Employee,
-        false,
+        AuthOperation::View,
         move |lock, acl, id, employee, edit, mode| {
             let context = actions::ViewContext::new(acl, query.year, employee, edit);
             let Ok(data) = lock.open_data() else {
@@ -417,13 +461,9 @@ async fn state(
     .await
 }
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
-    with_auth(
-        host,
-        headers,
-        GrantPurpose::Employee,
-        false,
-        |_, _, _, _, _, _| StatusCode::NO_CONTENT.into_response(),
-    )
+    with_auth(host, headers, AuthOperation::Session, |_, _, _, _, _, _| {
+        StatusCode::NO_CONTENT.into_response()
+    })
     .await
 }
 async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> Response {
@@ -457,8 +497,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
     with_auth(
         host,
         headers,
-        GrantPurpose::Employee,
-        true,
+        AuthOperation::Command,
         move |lock, acl, credential, employee, can_edit, mode| {
             let Ok(cmd) = serde_json::from_slice::<Command>(&body) else {
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
@@ -536,7 +575,7 @@ async fn with_mcp_auth<F>(host: Host, headers: HeaderMap, write: bool, action: F
 where
     F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
 {
-    with_auth(host, headers, GrantPurpose::Mcp, write, action).await
+    with_auth(host, headers, AuthOperation::Mcp { write }, action).await
 }
 
 fn prepare_command(

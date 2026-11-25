@@ -771,3 +771,66 @@ fn valid_backup_checks_the_parent_without_migrating_sibling_files() {
         0o644
     );
 }
+
+#[test]
+fn session_rechecks_same_length_acl_witness_and_repeated_journal_recovery() {
+    use godovoy_plan::storage::online::{ProtectionSettings, SessionAcl};
+    use serde_json::{Value, json};
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("session");
+    let vault =
+        OnlineVault::init(&dir, "QA".into(), Default::default(), Default::default()).unwrap();
+    let lock = vault.lock().unwrap();
+    let applied = lock
+        .set_protection(
+            0,
+            ProtectionSettings {
+                belarus: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let mut cache = SessionAcl::default();
+    let acl = dir.join("online-access-v1.json");
+    let pin = dir.join("online-protection-required-v1.json");
+    let valid = fs::read(&acl).unwrap();
+    assert_eq!(
+        lock.session_access(&mut cache).unwrap().protection(),
+        applied
+    );
+    fs::write(&pin, b"0").unwrap();
+    assert!(lock.session_access(&mut cache).is_err());
+    fs::write(&pin, b"1").unwrap();
+    assert_eq!(
+        lock.session_access(&mut cache).unwrap().protection(),
+        applied
+    );
+
+    let mut invalid = valid.clone();
+    *invalid.first_mut().unwrap() = b'!';
+    fs::write(&acl, invalid).unwrap();
+    assert!(lock.session_access(&mut cache).is_err());
+    let mut pending: Value = serde_json::from_slice(&valid).unwrap();
+    pending["protection"]["pendingAudit"] = json!(true);
+    let bytes = serde_json::to_vec(&pending).unwrap();
+    let journal = fs::read_dir(&dir)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let valid_log = fs::read(&journal).unwrap();
+    fs::write(&acl, &bytes).unwrap();
+    fs::write(&journal, b"partial").unwrap();
+    assert!(lock.session_access(&mut cache).is_err());
+    fs::write(&journal, valid_log).unwrap();
+    // The same pre-recovery bytes can be replayed after a volume restore.
+    for _ in 0..2 {
+        fs::write(&acl, &bytes).unwrap();
+        assert_eq!(
+            lock.session_access(&mut cache).unwrap().protection(),
+            applied
+        );
+        assert_eq!(fs::read(&acl).unwrap(), valid);
+    }
+}
