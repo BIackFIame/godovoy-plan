@@ -98,6 +98,8 @@ def main():
             extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
                             [online.name], standalone)
             server_flow(standalone / online.name, standalone)
+        for dll in ("opengl32.dll", "libgallium_wgl.dll"):
+            shutil.copyfile(Path(os.environ["GP_TEST_RENDERER"]) / dll, directory / dll)
         subprocess.run(["pwsh", "-NoProfile", "-File", Path(__file__).with_name("window-smoke.ps1"),
                         desktop, directory / "desktop-profile"], check=True, timeout=75)
 

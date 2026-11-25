@@ -20,7 +20,7 @@ jobs:
           - runner: windows-11-arm
             arch: ARM64
     runs-on: ${{ matrix.runner }}
-    timeout-minutes: 12
+    timeout-minutes: 40
     steps:
       - name: Скачать скрипт проверки на текущем коммите
         shell: pwsh
@@ -32,6 +32,11 @@ jobs:
       - name: Создать отдельный закрытый том NTFS для тестового профиля
         shell: pwsh
         run: ./packaging/windows/test-volume.ps1
+      - name: Собрать графический драйвер для виртуальной машины без GPU
+        shell: pwsh
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH
       - name: Проверить опубликованный пакет на Windows
         shell: pwsh
         env:
