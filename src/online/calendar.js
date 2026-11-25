@@ -233,6 +233,13 @@
         return state?.employees.find((person) => person.id === id)?.name || "";
     }
     function visibleEvents() { return mode === "all" ? state.events : state.tasks; }
+    function showProgress(counter, checklist) {
+        const done = checklist.reduce((count, task) => count + Number(task.done), 0);
+        const label = done + "/" + checklist.length;
+        if (counter.textContent === label) return;
+        counter.textContent = label;
+        counter.setAttribute("aria-label", "Выполнено " + done + " из " + checklist.length);
+    }
     function renderList() {
         if (!state) return;
         el("all").setAttribute("aria-pressed", String(mode === "all"));
@@ -274,9 +281,9 @@
                     [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
                 open.append(summary);
                 if (event.checklist.length) {
-                    const done = event.checklist.filter((task) => task.done).length;
-                    const counter = element("span", done + "/" + event.checklist.length, "count");
-                    counter.setAttribute("aria-label", "Выполнено " + done + " из " + event.checklist.length);
+                    const counter = element("span", "", "count");
+                    counter.id = "progress-" + i;
+                    showProgress(counter, event.checklist);
                     open.append(counter);
                 }
                 item.append(open);
@@ -487,14 +494,20 @@
         });
     }
 
-    function sameSummary(before, after) {
-        return before === after || (before.id === after.id && before.year === after.year &&
-            before.date === after.date && before.title === after.title && before.category === after.category &&
-            before.ownerId === after.ownerId && before.checklist.length === after.checklist.length &&
-            before.checklist.filter(task => task.done).length === after.checklist.filter(task => task.done).length);
+    function refreshChangedRows(previous, next) {
+        if (previous.length !== next.length) return renderList();
+        for (let i = 0; i < next.length; i++) {
+            const before = previous[i], after = next[i];
+            if (before === after) continue;
+            if (before.id !== after.id || before.year !== after.year || before.date !== after.date ||
+                before.title !== after.title || before.category !== after.category || before.ownerId !== after.ownerId ||
+                before.checklist.length !== after.checklist.length) return renderList();
+            const counter = document.getElementById("progress-" + i);
+            if (counter) showProgress(counter, after.checklist);
+        }
     }
 
-    function applyReceipt(reply, id, year, op) {
+    function applyReceipt(reply, id, year) {
         const receipt = reply?.value;
         if (!receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
         function replaceRows(previous, changes) {
@@ -516,9 +529,7 @@
         state = {...state, events, tasks};
         stateTag = reply.tag;
         lastLoaded = performance.now();
-        const next = visibleEvents();
-        if (op !== "note" || previous.length !== next.length ||
-            !previous.every((row, index) => sameSummary(row, next[index]))) renderList();
+        refreshChangedRows(previous, visibleEvents());
         return true;
     }
 
@@ -537,7 +548,7 @@
             const reply = await api("/v1/command", {body: command, receipt});
             if (epoch !== generation || document.hidden) return;
             writing = false;
-            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year, command.op)) {
+            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year)) {
                 await load(year);
             }
             if (epoch !== generation) return;
