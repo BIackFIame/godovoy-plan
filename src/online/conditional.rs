@@ -31,12 +31,20 @@ struct PublicRows {
 pub(super) struct OriginalSource {
     bytes: Vec<u8>,
     public_rows: Option<PublicRows>,
+    overview_digest: Option<OverviewDigest>,
 }
 
 struct DecodedSource {
     bytes: Vec<u8>,
     calendar: Data,
     public_rows: Option<PublicRows>,
+    overview_digest: Option<OverviewDigest>,
+}
+
+#[derive(Copy, Clone)]
+struct OverviewDigest {
+    key: PublicYear,
+    annual: InputDigest,
 }
 
 impl DecodedSource {
@@ -53,6 +61,7 @@ impl DecodedSource {
                 bytes,
                 calendar,
                 public_rows: None,
+                overview_digest: None,
             });
         }
         slot.as_mut().ok_or_else(|| "Не удалось прочитать календарь.".into())
@@ -211,15 +220,41 @@ impl Views {
         view: &CalendarView<'_>,
         today: NaiveDate,
     ) -> Fallible<HeaderValue> {
+        self.view_tag_with_source(credential, view, today, &mut None)
+    }
+
+    fn view_tag_with_source(
+        &self,
+        credential: Id,
+        view: &CalendarView<'_>,
+        today: NaiveDate,
+        memo: &mut Option<OverviewDigest>,
+    ) -> Fallible<HeaderValue> {
         let mut digest = self.tag_hasher(credential);
-        if view.is_overview() {
-            // A compact index and its details share an opaque snapshot tag.
-            // Bind it to authorized detail content while separating it from full JSON.
-            digest.update(b"overview-v1\0");
+        if let Some(key) = view.annual_digest_key() {
+            // Share only a digest of the authorized annual rows. Personal rows,
+            // credential, local date and policy still participate in every tag.
+            let annual = match memo {
+                Some(entry) if entry.key == key => entry.annual,
+                _ => {
+                    let mut hasher = InputHasher::new();
+                    let mut writer = BufWriter::new(&mut hasher);
+                    serde_json::to_writer(&mut writer, view.annual_rows())?;
+                    writer.flush()?;
+                    drop(writer);
+                    let annual = hasher.finalize().into();
+                    *memo = Some(OverviewDigest { key, annual });
+                    annual
+                }
+            };
+            digest.update(b"overview-v1-annual\0");
             digest.update(today.num_days_from_ce().to_be_bytes());
             digest.update(view.policy_revision().to_be_bytes());
-        }
-        {
+            digest.update(annual);
+            let mut writer = BufWriter::new(&mut digest);
+            serde_json::to_writer(&mut writer, &view.personal_view())?;
+            writer.flush()?;
+        } else {
             let mut writer = BufWriter::new(&mut digest);
             serde_json::to_writer(&mut writer, view)?;
             writer.flush()?;
@@ -230,17 +265,22 @@ impl Views {
     fn with_source<T>(
         &self,
         bytes: Vec<u8>,
-        read: impl FnOnce(&Data) -> Fallible<T>,
+        read: impl FnOnce(&mut DecodedSource) -> Fallible<T>,
     ) -> Fallible<T> {
         let mut cached = self.source.lock().map_err(|_| "Ошибка чтения календаря.")?;
         if (MIN_SHARED_SOURCE..=MAX_SHARED_SOURCE).contains(&bytes.len()) {
-            return read(&DecodedSource::load(&mut cached, bytes)?.calendar);
+            return read(DecodedSource::load(&mut cached, bytes)?);
         }
         *cached = None;
         drop(cached);
         let data = serde_json::from_slice(&bytes)?;
         drop(bytes);
-        read(&data)
+        read(&mut DecodedSource {
+            bytes: Vec::new(),
+            calendar: data,
+            public_rows: None,
+            overview_digest: None,
+        })
     }
 
     pub(super) fn detail(
@@ -264,10 +304,16 @@ impl Views {
         if known.as_ref().is_some_and(|tag| *tag != base) {
             return Ok(StatusCode::PRECONDITION_FAILED.into_response());
         }
-        self.with_source(bytes, |data| {
-            let view = context.render(data, today);
+        self.with_source(bytes, |source| {
+            let view = context.render(&source.calendar, today);
             if !view.is_overview()
-                || (known.is_none() && self.view_tag(credential, &view, today)? != base)
+                || (known.is_none()
+                    && self.view_tag_with_source(
+                        credential,
+                        &view,
+                        today,
+                        &mut source.overview_digest,
+                    )? != base)
             {
                 return Ok(StatusCode::PRECONDITION_FAILED.into_response());
             }
@@ -293,6 +339,7 @@ impl Views {
             let original = OriginalSource {
                 bytes: source.bytes,
                 public_rows: source.public_rows,
+                overview_digest: source.overview_digest,
             };
             return Ok((source.calendar, Some(original)));
         }
@@ -302,7 +349,11 @@ impl Views {
     pub(super) fn restore_after_failure(&self, original: Option<OriginalSource>) {
         // A rejected command can already have changed its in-memory Data.
         // Only the original, verified source can repopulate the read cache.
-        if let Some(OriginalSource { bytes, public_rows }) = original
+        if let Some(OriginalSource {
+            bytes,
+            public_rows,
+            overview_digest,
+        }) = original
             && let Ok(calendar) = serde_json::from_slice(&bytes)
             && let Ok(mut slot) = self.source.lock()
         {
@@ -310,6 +361,7 @@ impl Views {
                 bytes,
                 calendar,
                 public_rows,
+                overview_digest,
             });
         }
     }
@@ -411,11 +463,16 @@ impl Views {
                 && let Some(previous) = self.lookup(&Self::source_key(&scope, change.before))?
                 && previous == *base
             {
-                return self.with_source(data, |calendar| {
-                    let view = context.render(calendar, today);
+                return self.with_source(data, |source| {
+                    let view = context.render(&source.calendar, today);
                     let tag = match &known {
                         Some(view) => view.tag.clone(),
-                        None => self.view_tag(credential, &view, today)?,
+                        None => self.view_tag_with_source(
+                            credential,
+                            &view,
+                            today,
+                            &mut source.overview_digest,
+                        )?,
                     };
                     self.remember(key, tag.clone())?;
                     if tag == previous {
@@ -444,8 +501,8 @@ impl Views {
             }
         }
         if context.offer_overview {
-            return self.with_source(data, |calendar| {
-                let view = context.render(calendar, today);
+            return self.with_source(data, |source| {
+                let view = context.render(&source.calendar, today);
                 let body = if view.is_overview() {
                     None
                 } else {
@@ -459,7 +516,12 @@ impl Views {
                 let tag = match (known, &body) {
                     (Some(view), _) => view.tag,
                     (None, Some(body)) => Self::tag(self.tag_hasher(credential).chain_update(body))?,
-                    (None, None) => self.view_tag(credential, &view, today)?,
+                    (None, None) => self.view_tag_with_source(
+                        credential,
+                        &view,
+                        today,
+                        &mut source.overview_digest,
+                    )?,
                 };
                 self.store(
                     key,

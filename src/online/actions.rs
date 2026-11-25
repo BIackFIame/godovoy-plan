@@ -250,6 +250,18 @@ impl<'a> CalendarView<'a> {
         self.context.policy_revision
     }
 
+    pub(crate) fn annual_digest_key(&self) -> Option<PublicYear> {
+        self.context.public_rows_key().filter(|_| self.is_overview())
+    }
+
+    pub(crate) fn annual_rows(&self) -> &[EventView<'a>] {
+        &self.events
+    }
+
+    pub(crate) fn personal_view(&self) -> (&ViewContext<'a>, &[EventView<'a>]) {
+        (&self.context, &self.tasks)
+    }
+
     pub(crate) fn event(&self, id: Id, year: i32) -> Option<&EventView<'a>> {
         self.events
             .iter()

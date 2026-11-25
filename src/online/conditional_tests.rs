@@ -196,6 +196,8 @@ mod conditional_tests {
             lock.save_data(&data).unwrap();
             id
         };
+        // Exercise the shared digest path on bytes inside its retention limit.
+        shared_source(&f);
         let (_, _, other) = f
             .vault
             .lock()
