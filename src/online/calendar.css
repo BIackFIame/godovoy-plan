@@ -86,3 +86,14 @@ input[type=checkbox] { width: 1.15rem; height: 1.15rem; accent-color: var(--acce
   dialog { padding: 1rem; }
   .edit-task { grid-template-columns: minmax(0,1fr) 4.4rem auto; }
 }
+.month.overdue h2, .month.overdue .date { color: var(--error); }
+.task.current-task { background: var(--selected); border-radius: .45rem; padding-inline: .55rem; }
+.segments button:focus-visible { outline-offset: -3px; }
+.task .late { color: var(--error); }
+@media (max-width: 37rem) {
+  .heading { gap: .6rem; margin-bottom: 1rem; }
+  .tools button { padding-inline: .6rem; }
+}
+
+.event.personal { grid-template-columns: 4.6rem minmax(0, 1fr); }
+.personal .date { white-space: nowrap; }

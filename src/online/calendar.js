@@ -57,10 +57,14 @@
             : "";
     }
     function closeSheet() {
-        if (el("sheet").open) el("sheet").close();
+        const dialog = el("sheet");
+        const origin = dialog.dataset.origin;
+        delete dialog.dataset.origin;
+        if (dialog.open) dialog.close();
         el("sheet-body").replaceChildren();
         el("sheet-error").textContent = "";
         el("sheet-title").textContent = "";
+        if (origin && state) (document.getElementById(origin) || el("mine")).focus();
     }
     function sheet(title) {
         el("sheet-title").textContent = title;
@@ -225,7 +229,6 @@
         el("account").textContent = (ownerName(state.employeeId) || "Сотрудник") +
             (state.assignedOnly ? " · Только назначенные события" : "") +
             (state.canEdit ? "" : " · Только чтение");
-        el("calendar-name").textContent = state.workspaceName;
         el("create").hidden = !state.canEdit || state.assignedOnly === true;
         renderList();
     }
@@ -240,6 +243,20 @@
         counter.textContent = label;
         counter.setAttribute("aria-label", "Выполнено " + done + " из " + checklist.length);
     }
+    function localDay() {
+        const now = new Date();
+        return [now.getFullYear(), String(now.getMonth() + 1).padStart(2, "0"),
+            String(now.getDate()).padStart(2, "0")].join("-");
+    }
+    function personalRows(events) {
+        return events.map(event => {
+            let next = null;
+            for (const task of event.checklist) {
+                if (!task.done && (!next || task.dueDate < next.dueDate)) next = task;
+            }
+            return {event, next, due: next?.dueDate || event.date};
+        }).sort((a, b) => a.due < b.due ? -1 : a.due > b.due ? 1 : 0);
+    }
     function renderList() {
         if (!state) return;
         el("all").setAttribute("aria-pressed", String(mode === "all"));
@@ -248,24 +265,31 @@
         el("year").textContent = String(currentYear);
         el("previous").disabled = currentYear <= 1900;
         el("next").disabled = currentYear >= 9999;
+        el("calendar-name").textContent = mode === "mine" ? "Мои задачи" : state.workspaceName;
+        el("create").classList.toggle("primary", mode === "all");
         const list = el("list");
         list.replaceChildren();
         if (!visibleEvents().length) {
             list.append(element("p", mode === "mine" ? "Сейчас у вас нет задач, требующих внимания." : "В этом году событий пока нет.", "empty"));
             return;
         }
+        const personal = mode === "mine" ? personalRows(state.tasks) : null;
+        const today = localDay();
         let lastMonth = "";
         let rows;
         function appendPage(start) {
             let first;
             const events = visibleEvents();
             for (let i = start; i < Math.min(events.length, limit); i++) {
-                const event = events[i];
-                const month = event.date.slice(0, 7);
-                const date = isoDate(event.date);
+                const entry = personal?.[i];
+                const event = entry?.event || events[i];
+                const day = entry?.due || event.date;
+                const month = entry ? (day < today ? "Просрочено" : day === today ? "Сегодня" : "Предстоит") : day.slice(0, 7);
+                const date = isoDate(day);
                 if (month !== lastMonth) {
                     const group = element("section", undefined, "month");
-                    const label = monthLabel.format(date);
+                    const label = entry ? month : monthLabel.format(date);
+                    if (entry && day < today) group.classList.add("overdue");
                     group.append(element("h2", label[0].toLocaleUpperCase("ru") + label.slice(1)));
                     rows = element("ul", undefined, "items");
                     group.append(rows);
@@ -273,14 +297,23 @@
                     lastMonth = month;
                 }
                 const item = element("li");
-                const open = button("", () => detail(visibleEvents()[i]), "event");
+                const open = button("", () => {
+                    if (entry) el("sheet").dataset.origin = open.id;
+                    detail(entry ? event : visibleEvents()[i], entry?.next?.id);
+                }, entry ? "event personal" : "event");
+                if (entry) open.id = "personal-" + event.id + "-" + event.year;
                 open.append(element("span", dateLabel.format(date), "date"));
                 const summary = element("span");
                 const owner = ownerName(event.ownerId);
-                summary.append(element("strong", event.title), element("span",
-                    [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
+                if (entry) {
+                    summary.append(element("strong", entry.next?.title || event.title),
+                        element("span", entry.next ? event.title : "Дата события", "sub"));
+                } else {
+                    summary.append(element("strong", event.title), element("span",
+                        [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
+                }
                 open.append(summary);
-                if (event.checklist.length) {
+                if (!entry && event.checklist.length) {
                     const counter = element("span", "", "count");
                     counter.id = "progress-" + i;
                     showProgress(counter, event.checklist);
@@ -312,7 +345,8 @@
         return block;
     }
     function target(event) { return {eventId: event.id, year: event.year}; }
-    function detail(event) {
+    function detail(event, taskId) {
+        let focusTarget;
         const body = sheet(event.title);
         body.append(element("p", [fullDate.format(isoDate(event.date)), categories[event.category],
             event.yearly ? "Каждый год" : "", ownerName(event.ownerId)].filter(Boolean).join(" · "), "sub"));
@@ -320,6 +354,7 @@
         const freeText = state.allowFreeText !== false;
         if (freeText && event.description) body.append(element("p", event.description, "description"));
         const tasks = section("Чек-лист");
+        const today = localDay();
         if (!event.checklist.length) tasks.append(element("p", "Пунктов пока нет.", "sub"));
         for (const task of event.checklist) {
             const row = element("label", undefined, "task");
@@ -327,13 +362,23 @@
             box.type = "checkbox";
             box.checked = task.done;
             box.disabled = !state.canEdit;
+            if (task.id === taskId) {
+                row.classList.add("current-task");
+                if (box.disabled) row.tabIndex = -1;
+                focusTarget = box.disabled ? row : box;
+            }
             box.addEventListener("change", () => {
                 const done = box.checked;
                 box.checked = task.done;
                 save({op: "check", ...target(event), taskId: task.id, done}, event);
             });
             const label = element("span", task.title);
-            label.append(element("small", "До " + fullDate.format(isoDate(task.dueDate)), "sub"));
+            const due = dateLabel.format(isoDate(task.dueDate));
+            const overdue = !task.done && task.dueDate < today;
+            const caption = overdue ? "Просрочено · " + fullDate.format(isoDate(task.dueDate))
+                : !task.done && task.dueDate === today ? "Сегодня · " + due
+                : "До " + fullDate.format(isoDate(task.dueDate));
+            label.append(element("small", caption, overdue ? "sub late" : "sub"));
             row.append(box, label);
             tasks.append(row);
         }
@@ -350,6 +395,10 @@
             if (freeText) actions.append(button("Запись в дневнике", () => noteEditor(event)));
             if (!state.assignedOnly) actions.append(button("Изменить событие", () => editor(event)));
             body.append(actions);
+        }
+        if (focusTarget) {
+            focusTarget.focus({preventScroll: true});
+            focusTarget.scrollIntoView({block: "nearest"});
         }
     }
     function control(parent, label, input) {
@@ -495,7 +544,7 @@
     }
 
     function refreshChangedRows(previous, next) {
-        if (previous.length !== next.length) return renderList();
+        if (mode === "mine" || previous.length !== next.length) return renderList();
         for (let i = 0; i < next.length; i++) {
             const before = previous[i], after = next[i];
             if (before === after) continue;
@@ -554,7 +603,10 @@
             if (epoch !== generation) return;
             const fresh = reopen && (state.events.find(e => e.id === reopen.id && e.year === reopen.year) ||
                 state.tasks.find(e => e.id === reopen.id && e.year === reopen.year));
-            if (fresh) detail(fresh);
+            if (fresh) {
+                el("sheet-body").inert = false;
+                detail(fresh, command.op === "check" ? command.taskId : undefined);
+            }
             else closeSheet();
             notice("Изменение сохранено на компьютере компании.");
         } catch (error) {
