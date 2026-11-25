@@ -15,15 +15,13 @@ pub use operator::{OperatorDetails, OperatorInput, OperatorRecord};
 mod standby;
 pub use standby::StandbyWindow;
 
-use super::{
-    CALENDAR_MESSAGE_LIMIT, access, random_bytes, save, validate_profile_access,
-};
+use super::{CALENDAR_MESSAGE_LIMIT, access, random_bytes, save, validate_profile_access};
 use crate::{
     Fallible,
     model::{Calendar, Id},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use blake2::{Blake2s256, Digest};
+use blake2::{Blake2b, Blake2s256, Digest, digest::consts::U32};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -362,8 +360,20 @@ impl LockedVault<'_> {
         Ok(bytes)
     }
     pub fn save_data(&self, data: &Data) -> Fallible<()> {
+        self.persist_data(data, |_| {})
+    }
+
+    /// Extend the caller's fingerprint with the exact bytes committed to disk.
+    pub fn save_data_hashed(&self, data: &Data, mut hash: Blake2b<U32>) -> Fallible<[u8; 32]> {
+        self.persist_data(data, |bytes| hash.update(bytes))?;
+        Ok(hash.finalize().into())
+    }
+
+    fn persist_data(&self, data: &Data, observe: impl FnMut(&[u8])) -> Fallible<()> {
         data.calendar.validate()?;
-        save(&self.directory.join(DATA), data, DATA_LIMIT)?;
+        let path = self.directory.join(DATA);
+        let (staging, _) = super::stage_observed(&path, data, DATA_LIMIT, observe)?;
+        staging.persist(&path)?;
         sync_directory(self.directory)
     }
     pub fn grant(
@@ -530,7 +540,10 @@ mod file_guards {
         file.write_all(b"42  ").unwrap();
         file.rewind().unwrap();
         let metadata_len = file.metadata().unwrap().len() as usize;
-        assert_eq!(read_bounded_json::<u8>(file.try_clone().unwrap(), metadata_len).unwrap(), 42);
+        assert_eq!(
+            read_bounded_json::<u8>(file.try_clone().unwrap(), metadata_len).unwrap(),
+            42
+        );
         file.seek(std::io::SeekFrom::End(0)).unwrap();
         file.write_all(b" ").unwrap();
         file.rewind().unwrap();

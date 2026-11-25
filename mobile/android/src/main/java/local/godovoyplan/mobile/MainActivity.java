@@ -74,13 +74,20 @@ public final class MainActivity extends Activity {
     }
     private String observedZone;
     private boolean zoneCheckPending;
+    private boolean zoneCheckDeferred;
     private final Runnable checkZone = () -> {
+        if (!active) return;
+        if (loading) {
+            zoneCheckDeferred = true;
+            return;
+        }
         zoneCheckPending = false;
-        if (active) refresh(false);
+        refresh(false);
     };
     private void zoneChanged() {
         observedZone = TimeZone.getDefault().getID();
         zoneCheckPending = true;
+        zoneCheckDeferred = false;
         clock.removeCallbacks(checkZone);
         // Chrono can reuse the previous zone for one second on its worker thread.
         clock.postDelayed(checkZone, 1200);
@@ -296,6 +303,10 @@ public final class MainActivity extends Activity {
             if (!alive() || !active || version != refreshVersion)
                 return;
             loading = false;
+            if (zoneCheckDeferred) {
+                zoneCheckDeferred = false;
+                clock.post(checkZone);
+            }
             if (expected != year) return;
             if (error != null) {
                 if (outstanding == 0) showError(error);

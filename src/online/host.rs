@@ -19,6 +19,7 @@ use axum::{
     response::{Html, IntoResponse, Response},
     routing::{get, post},
 };
+use blake2::Digest;
 use godovoy_plan::{
     Fallible,
     model::Id,
@@ -463,7 +464,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
             };
             let today = chrono::Local::now().date_naive();
-            let mut receipt = receipt.and_then(|(base, year)| match &cmd {
+            let receipt = receipt.and_then(|(base, year)| match &cmd {
                 Command::Check { event_id, .. } | Command::Note { event_id, .. } => {
                     Some((base, year, *event_id))
                 }
@@ -475,30 +476,34 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             let Ok(mut data) = serde_json::from_slice(&raw) else {
                 return unavailable();
             };
-            if let Some((base, year, _)) = &receipt {
-                let context = actions::ViewContext::new(acl, *year, employee, can_edit);
-                let known = conditional::Views::input(credential, &context, today, &raw)
-                    .and_then(|key| views.lookup(&key))
-                    .ok()
-                    .flatten();
-                let tag = known.or_else(|| {
+            let receipt = receipt.and_then(|(base, year, event)| {
+                let context = actions::ViewContext::new(acl, year, employee, can_edit);
+                let source = conditional::Views::input_hasher(credential, &context, today).ok()?;
+                let original = source.clone().chain_update(&raw).finalize().into();
+                let tag = views.lookup(&original).ok().flatten().or_else(|| {
                     views
                         .view_tag(credential, &context.render(&data, today))
                         .ok()
-                });
-                if tag.is_none_or(|tag| tag.as_bytes() != base.as_bytes()) {
-                    receipt = None;
-                }
-            }
+                })?;
+                (tag.as_bytes() == base.as_bytes()).then_some((year, source, event))
+            });
             drop(raw);
-            let saved = commit_command(lock, acl, credential, employee, mode, cmd, &mut data);
-            let Some((_, year, event)) = receipt else {
-                return saved;
-            };
-            if saved.status() != StatusCode::NO_CONTENT
-                || chrono::Local::now().date_naive() != today
+            if let Some(response) =
+                prepare_command(lock, acl, credential, employee, mode, cmd, &mut data)
             {
-                return saved;
+                return response;
+            }
+            let Some((year, source, event)) = receipt else {
+                return match lock.save_data(&data) {
+                    Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                    Err(_) => unavailable(),
+                };
+            };
+            let Ok(key) = lock.save_data_hashed(&data, source) else {
+                return unavailable();
+            };
+            if chrono::Local::now().date_naive() != today {
+                return StatusCode::NO_CONTENT.into_response();
             }
             if lock
                 .audit_security("state_requested", Some(credential), Some(employee), None)
@@ -507,12 +512,6 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                 return unavailable();
             }
             let context = actions::ViewContext::new(acl, year, employee, can_edit);
-            let Ok(key) = lock
-                .data_bytes()
-                .and_then(|raw| conditional::Views::input(credential, &context, today, &raw))
-            else {
-                return unavailable();
-            };
             let view = context.render(&data, today);
             let Ok(tag) = views.view_tag(credential, &view) else {
                 return unavailable();
@@ -525,7 +524,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                 return standby_unavailable();
             }
             if chrono::Local::now().date_naive() != today {
-                return saved;
+                return StatusCode::NO_CONTENT.into_response();
             }
             reply.headers_mut().insert("x-godovoy-state-tag", tag);
             reply
@@ -540,7 +539,7 @@ where
     with_auth(host, headers, GrantPurpose::Mcp, write, action).await
 }
 
-fn commit_command(
+fn prepare_command(
     lock: &LockedVault<'_>,
     acl: &Access,
     credential: Id,
@@ -548,7 +547,7 @@ fn commit_command(
     mode: &Mode,
     cmd: Command,
     data: &mut Data,
-) -> Response {
+) -> Option<Response> {
     if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
         if lock
             .audit_security(
@@ -559,12 +558,12 @@ fn commit_command(
             )
             .is_err()
         {
-            return unavailable();
+            return Some(unavailable());
         }
-        return protection_denied(
+        return Some(protection_denied(
             "Описания и заметки отключены администратором.",
             "free-text-disabled",
-        );
+        ));
     }
     if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(data, employee) {
         if lock
@@ -576,25 +575,25 @@ fn commit_command(
             )
             .is_err()
         {
-            return unavailable();
+            return Some(unavailable());
         }
-        return protection_denied(
+        return Some(protection_denied(
             "Действие недоступно в персональном календаре.",
             "assigned-only",
-        );
+        ));
     }
     match actions::apply(cmd, data, acl) {
-        Err(e) => problem(
+        Err(e) => Some(problem(
             if e.conflict {
                 StatusCode::CONFLICT
             } else {
                 StatusCode::UNPROCESSABLE_ENTITY
             },
             e.message,
-        ),
+        )),
         Ok((kind, event)) => {
             if let Err(e) = data.calendar.validate() {
-                return problem(StatusCode::UNPROCESSABLE_ENTITY, e);
+                return Some(problem(StatusCode::UNPROCESSABLE_ENTITY, e));
             }
             let audit_kind = match kind {
                 "create" => "create_requested",
@@ -602,22 +601,19 @@ fn commit_command(
                 "delete" => "delete_requested",
                 "check" => "check_requested",
                 "note" => "note_requested",
-                _ => return unavailable(),
+                _ => return Some(unavailable()),
             };
             if lock
                 .audit_security(audit_kind, Some(credential), Some(employee), Some(event))
                 .is_err()
             {
-                return unavailable();
+                return Some(unavailable());
             }
             record(&mut data.audit, kind, credential, employee, Some(event));
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
-                return standby_unavailable();
+                return Some(standby_unavailable());
             }
-            match lock.save_data(data) {
-                Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                Err(_) => unavailable(),
-            }
+            None
         }
     }
 }

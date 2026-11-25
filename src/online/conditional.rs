@@ -7,7 +7,11 @@ use axum::{
 use blake2::{Blake2b, Digest, digest::consts::U32};
 use chrono::{Datelike, NaiveDate};
 use godovoy_plan::{Fallible, model::Id};
-use std::{collections::VecDeque, sync::Mutex};
+use std::{
+    collections::VecDeque,
+    io::{BufWriter, Write},
+    sync::Mutex,
+};
 
 const MAX_VIEWS: usize = 128;
 type InputDigest = [u8; 32];
@@ -33,12 +37,21 @@ impl Views {
         today: NaiveDate,
         data: &[u8],
     ) -> Fallible<InputDigest> {
+        let mut source = Self::input_hasher(credential, context, today)?;
+        source.update(data);
+        Ok(source.finalize().into())
+    }
+
+    pub(super) fn input_hasher(
+        credential: Id,
+        context: &ViewContext<'_>,
+        today: NaiveDate,
+    ) -> Fallible<Blake2b<U32>> {
         let mut source = Blake2b::<U32>::new();
         source.update(credential.as_bytes());
         source.update(today.num_days_from_ce().to_be_bytes());
         serde_json::to_writer(&mut source, context)?;
-        source.update(data);
-        Ok(source.finalize().into())
+        Ok(source)
     }
 
     pub(super) fn lookup(&self, key: &InputDigest) -> Fallible<Option<HeaderValue>> {
@@ -64,12 +77,14 @@ impl Views {
         Ok(())
     }
 
-    fn tag_bytes(&self, credential: Id, body: &[u8]) -> Fallible<HeaderValue> {
-        let digest = Blake2b::<U32>::new()
+    fn tag_hasher(&self, credential: Id) -> Blake2b<U32> {
+        Blake2b::new()
             .chain_update(self.nonce.as_bytes())
             .chain_update(credential.as_bytes())
-            .chain_update(body)
-            .finalize();
+    }
+
+    fn tag(digest: Blake2b<U32>) -> Fallible<HeaderValue> {
+        let digest = digest.finalize();
         Ok(HeaderValue::from_str(&format!("\"{digest:x}\""))?)
     }
 
@@ -78,7 +93,13 @@ impl Views {
         credential: Id,
         view: &CalendarView<'_>,
     ) -> Fallible<HeaderValue> {
-        self.tag_bytes(credential, &serde_json::to_vec(view)?)
+        let mut digest = self.tag_hasher(credential);
+        {
+            let mut writer = BufWriter::new(&mut digest);
+            serde_json::to_writer(&mut writer, view)?;
+            writer.flush()?;
+        }
+        Self::tag(digest)
     }
 
     pub(super) fn response(
@@ -107,7 +128,7 @@ impl Views {
         let tag = if let Some(tag) = known {
             tag
         } else {
-            let tag = self.tag_bytes(credential, &body)?;
+            let tag = Self::tag(self.tag_hasher(credential).chain_update(&body))?;
             self.remember(key, tag.clone())?;
             tag
         };

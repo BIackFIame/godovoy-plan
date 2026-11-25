@@ -1,6 +1,8 @@
 //! Stateless MCP over Streamable HTTP. Authentication and the calendar transaction
 //! share the same vault lock; the client never selects the acting employee.
-use super::{Host, Mode, actions, commit_command, standby_unavailable, unavailable, with_mcp_auth};
+use super::{
+    Host, Mode, actions, prepare_command, standby_unavailable, unavailable, with_mcp_auth,
+};
 use axum::{
     Json,
     body::Bytes,
@@ -278,7 +280,7 @@ impl Context<'_, '_> {
             },
             Call::ListMyEvents { .. } => unreachable!(),
         };
-        let response = commit_command(
+        let rejection = prepare_command(
             self.lock,
             self.acl,
             self.credential,
@@ -287,6 +289,11 @@ impl Context<'_, '_> {
             command,
             &mut data,
         );
+        let response = match rejection {
+            None if self.lock.save_data(&data).is_ok() => StatusCode::NO_CONTENT.into_response(),
+            None => unavailable(),
+            Some(response) => response,
+        };
         match response.status() {
             StatusCode::NO_CONTENT => result(id, json!({"saved":true})),
             StatusCode::CONFLICT => {

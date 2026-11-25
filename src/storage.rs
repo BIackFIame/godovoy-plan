@@ -378,6 +378,7 @@ impl CalendarWake {
 }
 
 pub struct Store {
+    pub(crate) last_import_digest: Option<[u8; 32]>,
     calendar_wake: Weak<CalendarWake>,
     successor: Option<PathBuf>,
     state: Arc<LocalState>,
@@ -522,6 +523,7 @@ impl Store {
             _profile_lock: profile_lock,
         });
         Ok(Arc::new(Mutex::new(Self {
+            last_import_digest: None,
             calendar_wake: Weak::new(),
             successor: None,
             state,
@@ -724,6 +726,7 @@ impl Store {
     }
 
     fn publish_calendar(&mut self, next: LocalState, bytes: usize) {
+        self.last_import_digest = None;
         self.state = Arc::new(next);
         let mut view = self.reader.0.write().unwrap();
         view.usage = ProfileUsage::from_state(&self.state, bytes);
@@ -1046,12 +1049,25 @@ fn discard_interrupted_writes(directory: &Path) {
 }
 
 fn stage(path: &Path, state: &impl Serialize, limit: usize) -> Fallible<(NamedTempFile, usize)> {
+    stage_observed(path, state, limit, |_| {})
+}
+
+fn stage_observed(
+    path: &Path,
+    state: &impl Serialize,
+    limit: usize,
+    observe: impl FnMut(&[u8]),
+) -> Fallible<(NamedTempFile, usize)> {
     let mut staging = Builder::new()
         .prefix(STAGING_PREFIX)
         .rand_bytes(STAGING_SUFFIX_LEN)
         .tempfile_in(path.parent().ok_or("Не указана папка профиля")?)?;
     // Charge buffered chunks to the file limit instead of checking every JSON token.
-    let bounded = LimitedWriter::new(staging.as_file_mut(), limit);
+    let observed = ObservedFile {
+        file: staging.as_file_mut(),
+        observe,
+    };
+    let bounded = LimitedWriter::new(observed, limit);
     let mut writer = BufWriter::with_capacity(32 * 1024, bounded);
     let result = serde_json::to_writer(&mut writer, state);
     // Flush only after successful serialization; BufWriter must not retry a failed write.
@@ -1069,6 +1085,23 @@ fn stage(path: &Path, state: &impl Serialize, limit: usize) -> Fallible<(NamedTe
     let bytes = limit - bounded.remaining;
     staging.as_file().sync_all()?;
     Ok((staging, bytes))
+}
+
+struct ObservedFile<'a, F> {
+    file: &'a mut File,
+    observe: F,
+}
+
+impl<F: FnMut(&[u8])> Write for ObservedFile<'_, F> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        let count = self.file.write(data)?;
+        (self.observe)(&data[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.file.flush()
+    }
 }
 
 pub(crate) struct LimitedWriter<W> {

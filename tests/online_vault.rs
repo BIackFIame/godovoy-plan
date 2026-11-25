@@ -20,6 +20,43 @@ fn cli(action: &str, dir: &Path, more: &[&str]) -> Output {
 }
 
 #[test]
+fn write_fingerprint_matches_committed_bytes_across_chunks() {
+    use blake2::Digest;
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("write");
+    let vault = OnlineVault::init(
+        &dir,
+        "Календарь".into(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let lock = vault.lock().unwrap();
+    let mut data = lock.data().unwrap();
+    let id = Id::new_v4();
+    for _ in 0..1000 {
+        godovoy_plan::storage::online::record(&mut data.audit, "check", id, id, None);
+    }
+    let prefix = b"per-credential and view-specific prefix";
+    let hash = blake2::Blake2b::<blake2::digest::consts::U32>::new().chain_update(prefix);
+    let written = lock.save_data_hashed(&data, hash.clone()).unwrap();
+    let raw = lock.data_bytes().unwrap();
+    assert!(raw.len() > 32 * 1024);
+    assert_eq!(raw, serde_json::to_vec(&data).unwrap());
+    assert_eq!(
+        written.as_slice(),
+        hash.chain_update(&raw).finalize().as_slice()
+    );
+
+    data.audit[0].action = "x".repeat(9 * 1024 * 1024);
+    assert!(
+        lock.save_data_hashed(&data, blake2::Blake2b::new())
+            .is_err()
+    );
+    assert_eq!(raw, lock.data_bytes().unwrap());
+}
+
+#[test]
 fn acl_reads_accept_exact_limit_and_reject_trailing_or_oversized_documents() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("bounded");

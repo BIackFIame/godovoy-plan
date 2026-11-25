@@ -23,8 +23,8 @@ targets:
         CODE_SIGN_STYLE: Automatic
         CODE_SIGN_ENTITLEMENTS: App/Application.entitlements
         ENABLE_USER_SCRIPT_SANDBOXING: YES
-        MARKETING_VERSION: '0.6.1'
-        CURRENT_PROJECT_VERSION: 8
+        MARKETING_VERSION: '0.6.2'
+        CURRENT_PROJECT_VERSION: 9
         LIBRARY_SEARCH_PATHS: ['$(inherited)', '$(PROJECT_DIR)/RustLibs/$(PLATFORM_NAME)']
         OTHER_LDFLAGS: ['$(inherited)', '-lgodovoy_mobile_core', '-liconv', '-framework', CoreFoundation]
   GodovoyPlanUITests:

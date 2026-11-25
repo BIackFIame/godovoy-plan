@@ -234,6 +234,63 @@ fn divergent_calendars_converge_via_files_without_syncing_local_settings() {
 }
 
 #[test]
+fn importing_again_after_local_restore_reapplies_the_calendar() {
+    let profile = Profile::new();
+    profile.start_workspace("Офис");
+    let old = profile.store.lock().unwrap().create_backup().unwrap();
+    let id = Id::new_v4();
+    profile.edit(|state| {
+        let revision = state.revision()?;
+        state
+            .workspace_mut()?
+            .calendar
+            .plans
+            .entry(id)
+            .or_default()
+            .templates
+            .insert(YEAR, Record::new(revision, Some(event("Акция", vec![]))));
+        Ok(())
+    });
+    let first = profile.directory.path().join("first.yrplan");
+    let second = profile.directory.path().join("second.yrplan");
+    for path in [&first, &second] {
+        export_file(&profile.store, path).unwrap();
+        assert!(!import_file(&profile.store, path).unwrap());
+    }
+    profile
+        .store
+        .lock()
+        .unwrap()
+        .restore_open_backup(&old)
+        .unwrap();
+    assert!(
+        profile
+            .snapshot()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .calendar
+            .event(id, YEAR)
+            .is_none()
+    );
+    assert!(import_file(&profile.store, &second).unwrap());
+    assert!(!import_file(&profile.store, &first).unwrap());
+    assert_eq!(
+        profile
+            .snapshot()
+            .workspace
+            .as_ref()
+            .unwrap()
+            .calendar
+            .event(id, YEAR)
+            .unwrap()
+            .event
+            .title,
+        "Акция"
+    );
+}
+
+#[test]
 fn bad_or_foreign_files_and_duplicate_exports_preserve_previous_data() {
     let source = Profile::new();
     source.start_workspace("Первая команда");
@@ -257,6 +314,8 @@ fn bad_or_foreign_files_and_duplicate_exports_preserve_previous_data() {
         Ok(())
     });
 
+    // Authenticate even if the contents were successfully imported just before.
+    assert!(!import_file(&source.store, &original).unwrap());
     let bad_tag = files.path().join("tag-error.yrplan");
     let mut modified = original_bytes.clone();
     *modified.last_mut().unwrap() ^= 1;

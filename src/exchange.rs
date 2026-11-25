@@ -165,6 +165,16 @@ pub fn import_file(store: &SharedStore, path: &Path) -> Fallible<bool> {
     cipher(&workspace)
         .decrypt_in_place_detached(nonce, prefix, compressed, tag.into())
         .map_err(|_| "Файл повреждён или принадлежит другому календарю.")?;
+    // Hash the authenticated compressed contents so an independently encrypted copy
+    // of the same packet can also be recognized. A store update clears the receipt.
+    let digest: [u8; 32] = <blake2::Blake2s256 as blake2::Digest>::digest(&*compressed).into();
+    {
+        let store = store.lock().unwrap();
+        verify_exchange_key(&store, &workspace)?;
+        if store.last_import_digest == Some(digest) {
+            return Ok(false);
+        }
+    }
     let packet = decode(compressed)?;
     if packet.workspace != workspace.id {
         return Err("Файл принадлежит другому календарю.".into());
@@ -172,13 +182,15 @@ pub fn import_file(store: &SharedStore, path: &Path) -> Fallible<bool> {
     let mut store = store.lock().unwrap();
     verify_exchange_key(&store, &workspace)?;
     drop(workspace);
-    merge_calendar(
+    let changed = merge_calendar(
         &mut store,
         packet.workspace,
         packet.source,
         packet.calendar,
         None,
-    )
+    )?;
+    store.last_import_digest = Some(digest);
+    Ok(changed)
 }
 
 fn check_exchange_path(path: &Path) -> Fallible<()> {
@@ -278,6 +290,7 @@ mod tests {
             .unwrap();
         let old_file = directory.path().join("previous.yrplan");
         export_file(&prior, &old_file).unwrap();
+        assert!(!import_file(&prior, &old_file).unwrap());
         prior
             .lock()
             .unwrap()

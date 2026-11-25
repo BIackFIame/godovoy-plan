@@ -243,8 +243,7 @@
         el("next").disabled = currentYear >= 9999;
         const list = el("list");
         list.replaceChildren();
-        const events = visibleEvents();
-        if (!events.length) {
+        if (!visibleEvents().length) {
             list.append(element("p", mode === "mine" ? "Сейчас у вас нет задач, требующих внимания." : "В этом году событий пока нет.", "empty"));
             return;
         }
@@ -252,7 +251,9 @@
         let rows;
         function appendPage(start) {
             let first;
-            for (const event of events.slice(start, limit)) {
+            const events = visibleEvents();
+            for (let i = start; i < Math.min(events.length, limit); i++) {
+                const event = events[i];
                 const month = event.date.slice(0, 7);
                 const date = isoDate(event.date);
                 if (month !== lastMonth) {
@@ -265,7 +266,7 @@
                     lastMonth = month;
                 }
                 const item = element("li");
-                const open = button("", () => detail(event), "event");
+                const open = button("", () => detail(visibleEvents()[i]), "event");
                 open.append(element("span", dateLabel.format(date), "date"));
                 const summary = element("span");
                 const owner = ownerName(event.ownerId);
@@ -486,7 +487,14 @@
         });
     }
 
-    function applyReceipt(reply, id, year) {
+    function sameSummary(before, after) {
+        return before === after || (before.id === after.id && before.year === after.year &&
+            before.date === after.date && before.title === after.title && before.category === after.category &&
+            before.ownerId === after.ownerId && before.checklist.length === after.checklist.length &&
+            before.checklist.filter(task => task.done).length === after.checklist.filter(task => task.done).length);
+    }
+
+    function applyReceipt(reply, id, year, op) {
         const receipt = reply?.value;
         if (!receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
         function replaceRows(previous, changes) {
@@ -504,10 +512,13 @@
         const events = replaceRows(state.events, receipt.events);
         const tasks = replaceRows(state.tasks, receipt.tasks);
         if (!events || !tasks) return false;
+        const previous = visibleEvents();
         state = {...state, events, tasks};
         stateTag = reply.tag;
         lastLoaded = performance.now();
-        renderList();
+        const next = visibleEvents();
+        if (op !== "note" || previous.length !== next.length ||
+            !previous.every((row, index) => sameSummary(row, next[index]))) renderList();
         return true;
     }
 
@@ -526,11 +537,12 @@
             const reply = await api("/v1/command", {body: command, receipt});
             if (epoch !== generation || document.hidden) return;
             writing = false;
-            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year)) {
+            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year, command.op)) {
                 await load(year);
             }
             if (epoch !== generation) return;
-            const fresh = reopen && [...state.events, ...state.tasks].find((e) => e.id === reopen.id && e.year === reopen.year);
+            const fresh = reopen && (state.events.find(e => e.id === reopen.id && e.year === reopen.year) ||
+                state.tasks.find(e => e.id === reopen.id && e.year === reopen.year));
             if (fresh) detail(fresh);
             else closeSheet();
             notice("Изменение сохранено на компьютере компании.");
