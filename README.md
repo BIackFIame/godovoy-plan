@@ -12,7 +12,7 @@
 
 Начиная с версии 0.5.50 администратор открывает локальную панель командой `godovoy-online configure DIR`, выбирает «Россия» или «Беларусь» и нажимает «Сохранить настройки». С этого момента сервер закрывает внешний вход и скрывает описания и дневник. Офис продолжает работать по локальной сети. В панели также можно ограничить сотрудника его назначениями, отозвать все его ключи и скачать отчёт для внутренней проверки. [Как включить профили и что проверяет компания](DATA-PROTECTION.md)
 
-Сервер доступен для Linux, Windows и macOS. При перезагрузке основного сервера офис может продолжить работу на резервном узле с тем же актуальным томом в течение заданного ИТ срока. Клиенты открывают встроенный веб-календарь сервера. [Сервер для скачивания](https://github.com/BIackFIame/godovoy-plan/releases/tag/v0.6.3) · [Развёртывание, переключение и возврат](SERVER.md)
+Сервер доступен для Linux, Windows и macOS. При перезагрузке основного сервера офис может продолжить работу на резервном узле с тем же актуальным томом в течение заданного ИТ срока. Клиенты открывают встроенный веб-календарь сервера. [Сервер для скачивания](https://github.com/BIackFIame/godovoy-plan/releases/tag/v0.6.4) · [Развёртывание, переключение и возврат](SERVER.md)
 
 Сотрудник может подключить ИИ-помощника к своим назначениям по MCP. ИТ выдаёт персональный ключ в карточке сотрудника. По умолчанию помощник видит только свои события и чек-листы. Отдельно можно разрешить отметки выполнения и записи дневника. [Подключение помощника](MCP.md)
 
@@ -20,12 +20,12 @@
 
 | Устройство | Пакет и установка |
 |---|---|
-| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
-| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
-| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
-| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.3/GodovoyPlan-0.6.3-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
+| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
+| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
+| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
+| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.4/GodovoyPlan-0.6.4-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
 
-Сборки клиентских приложений и их контрольные суммы доступны в [выпуске 0.6.3](https://github.com/BIackFIame/godovoy-plan/releases/tag/v0.6.3).
+Сборки клиентских приложений и их контрольные суммы доступны в [выпуске 0.6.4](https://github.com/BIackFIame/godovoy-plan/releases/tag/v0.6.4).
 
 ## Первый календарь за несколько шагов
 
