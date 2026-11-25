@@ -1,0 +1,182 @@
+{
+  "0.5.13": [
+    {
+      "operation": "update",
+      "phase": "temp-created",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "serialized",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "file-synced",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "calendar-renamed",
+      "member": "После записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "origin-created",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "backup-staged",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "backup-published",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup-existing",
+      "phase": "backup-staged",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "restore",
+      "phase": "old-calendar-linked",
+      "member": "После записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 1,
+      "previous_bytes_saved_separately": true
+    },
+    {
+      "operation": "restore",
+      "phase": "restore-renamed",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": true
+    },
+    {
+      "operation": "restore-missing",
+      "phase": "restore-renamed",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    }
+  ],
+  "0.5.14": [
+    {
+      "operation": "update",
+      "phase": "temp-created",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "serialized",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "file-synced",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "update",
+      "phase": "calendar-renamed",
+      "member": "После записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "origin-created",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "backup-staged",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup",
+      "phase": "backup-published",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "backup-existing",
+      "phase": "backup-staged",
+      "member": "До записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    },
+    {
+      "operation": "restore",
+      "phase": "old-calendar-linked",
+      "member": "После записи",
+      "staged_at_interruption": 1,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": true
+    },
+    {
+      "operation": "restore",
+      "phase": "restore-renamed",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": true
+    },
+    {
+      "operation": "restore-missing",
+      "phase": "restore-renamed",
+      "member": "До записи",
+      "staged_at_interruption": 0,
+      "staged_after_restart": 0,
+      "previous_bytes_saved_separately": false
+    }
+  ]
+}

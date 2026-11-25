@@ -1,0 +1,249 @@
+openapi: 3.1.0
+info:
+  title: Godovoy Plan Local API
+  version: 1.0.0
+  description: Schema reference for JSON operations inside a mutually authenticated Noise session. Invoke godovoy-bridge --request METHOD PATH. The local TCP listener does not accept plain HTTP.
+servers:
+  - url: godovoy+noise://127.0.0.1:43857
+x-godovoy-auth: main Noise PSK via GODOVOY_API_TOKEN
+paths:
+  /v1/health:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: API is running
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [version, status]
+                properties:
+                  version: { const: 1 }
+                  status: { const: ok }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/capacity:
+    get:
+      operationId: readCapacity
+      description: Last committed local profile usage. Plan count includes deletion history. Available since desktop 0.5.2.
+      responses:
+        '200':
+          description: Profile usage and hard limits
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [plans, planLimit, bytes, byteLimit]
+                properties:
+                  plans: { type: integer, minimum: 0 }
+                  planLimit: { type: integer, minimum: 1 }
+                  bytes: { type: integer, minimum: 0 }
+                  byteLimit: { type: integer, minimum: 1 }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+  /v1/members:
+    get:
+      operationId: listMembers
+      responses:
+        '200':
+          description: Workspace members
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Member' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Error' }
+  /v1/events:
+    get:
+      operationId: listEvents
+      parameters:
+        - $ref: '#/components/parameters/Year'
+        - name: offset
+          in: query
+          schema: { type: integer, minimum: 0, default: 0 }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 200, default: 100 }
+      responses:
+        '200':
+          description: Calendar occurrences sorted by date
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '409': { $ref: '#/components/responses/Error' }
+    post:
+      operationId: createEvent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/EventInput' }
+      responses:
+        '201':
+          description: Event created
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+  /v1/events/{id}:
+    get:
+      operationId: getEvent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: { type: string, format: uuid }
+        - $ref: '#/components/parameters/Year'
+      responses:
+        '200':
+          description: Calendar occurrence for the requested year
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Event' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '404': { $ref: '#/components/responses/Error' }
+  /v1/imports/{source}:
+    put:
+      operationId: importEvents
+      x-godovoy-auth: main or import Noise PSK; use --import-key with an import key
+      parameters:
+        - name: source
+          in: path
+          required: true
+          schema: { type: string, pattern: '^[a-z0-9_-]{1,48}$' }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ImportBatch' }
+      responses:
+        '200':
+          description: Reconciled source items
+          content:
+            application/json:
+              schema:
+                type: array
+                items: { $ref: '#/components/schemas/ImportResult' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '413': { $ref: '#/components/responses/Error' }
+        '422': { $ref: '#/components/responses/Error' }
+components:
+  parameters:
+    Year:
+      name: year
+      in: query
+      description: Defaults to the current local year.
+      schema: { type: integer, minimum: 1900, maximum: 9999 }
+  responses:
+    Unauthorized:
+      description: Session key revoked or operation outside the authenticated scope
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Error:
+      description: Request or state error
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+  schemas:
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error: { type: string }
+    Member:
+      type: object
+      required: [id, name, revoked]
+      properties:
+        id: { type: string, format: uuid }
+        name: { type: string }
+        revoked: { type: boolean, description: True for a historical device whose access was revoked. New assignments require an active device. }
+    Category:
+      type: string
+      enum: [Campaign, Partners, Team, Operations]
+    EventInput:
+      type: object
+      additionalProperties: false
+      required: [title, date]
+      properties:
+        title: { type: string, minLength: 1, maxLength: 160 }
+        date: { type: string, format: date }
+        description: { type: string, maxLength: 4000 }
+        category: { $ref: '#/components/schemas/Category' }
+        yearly: { type: boolean }
+        ownerId: { type: [string, 'null'], format: uuid }
+        preparationDays: { type: integer, minimum: 0, maximum: 366 }
+        checklist:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/TaskInput' }
+    Event:
+      type: object
+      required: [id, year, title, description, date, category, yearly, ownerId, preparationDays, preparationDate, checklist, diary, source]
+      properties:
+        id: { type: string, format: uuid }
+        year: { type: integer }
+        title: { type: string }
+        date: { type: string, format: date }
+        description: { type: string }
+        category: { $ref: '#/components/schemas/Category' }
+        yearly: { type: boolean }
+        ownerId: { type: [string, 'null'], format: uuid }
+        preparationDays: { type: integer }
+        preparationDate: { type: string, format: date }
+        checklist:
+          type: array
+          items: { $ref: '#/components/schemas/Task' }
+        diary: { type: string }
+        source:
+          type: [object, 'null']
+          required: [name, externalId]
+          properties:
+            name: { type: string }
+            externalId: { type: string }
+    TaskInput:
+      type: object
+      additionalProperties: false
+      required: [key, title, daysBefore]
+      properties:
+        key: { type: string, minLength: 1, maxLength: 80 }
+        title: { type: string, minLength: 1, maxLength: 160 }
+        daysBefore: { type: integer, minimum: 0, maximum: 366 }
+    Task:
+      type: object
+      required: [id, title, dueDate, daysBefore, done]
+      properties:
+        id: { type: string, format: uuid }
+        title: { type: string }
+        dueDate: { type: string, format: date }
+        daysBefore: { type: integer }
+        done: { type: boolean }
+    ImportBatch:
+      type: object
+      additionalProperties: false
+      required: [events]
+      properties:
+        events:
+          type: array
+          maxItems: 100
+          items: { $ref: '#/components/schemas/ImportItem' }
+    ImportItem:
+      type: object
+      additionalProperties: false
+      required: [externalId, event]
+      properties:
+        externalId: { type: string, minLength: 1, maxLength: 160 }
+        event: { $ref: '#/components/schemas/EventInput' }
+    ImportResult:
+      type: object
+      required: [id, externalId, year, changed]
+      properties:
+        id: { type: string, format: uuid }
+        externalId: { type: string }
+        year: { type: integer }
+        changed: { type: boolean }

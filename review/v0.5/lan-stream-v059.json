@@ -1,0 +1,110 @@
+{
+  "elapsed": 65.47,
+  "plans": 1950,
+  "tasks": 23400,
+  "notes": 24,
+  "checks": 24,
+  "profile_start": 5247236,
+  "profile_end": 5255004,
+  "quiet_15s_bytes": [
+    1680,
+    1120
+  ],
+  "rounds": [
+    {
+      "round": 1,
+      "seconds": 0.767,
+      "tx_bytes": 2537844,
+      "restarted": false,
+      "size": 5247881
+    },
+    {
+      "round": 2,
+      "seconds": 3.308,
+      "tx_bytes": 2538323,
+      "restarted": false,
+      "size": 5248526
+    },
+    {
+      "round": 3,
+      "seconds": 3.258,
+      "tx_bytes": 2539704,
+      "restarted": false,
+      "size": 5249171
+    },
+    {
+      "round": 4,
+      "seconds": 0.611,
+      "tx_bytes": 2539775,
+      "restarted": true,
+      "size": 5249816
+    },
+    {
+      "round": 5,
+      "seconds": 3.257,
+      "tx_bytes": 2539300,
+      "restarted": false,
+      "size": 5250461
+    },
+    {
+      "round": 6,
+      "seconds": 3.281,
+      "tx_bytes": 2542582,
+      "restarted": false,
+      "size": 5251106
+    },
+    {
+      "round": 7,
+      "seconds": 3.306,
+      "tx_bytes": 2542409,
+      "restarted": false,
+      "size": 5251755
+    },
+    {
+      "round": 8,
+      "seconds": 0.614,
+      "tx_bytes": 2542589,
+      "restarted": true,
+      "size": 5252404
+    },
+    {
+      "round": 9,
+      "seconds": 3.296,
+      "tx_bytes": 2545167,
+      "restarted": false,
+      "size": 5253053
+    },
+    {
+      "round": 10,
+      "seconds": 3.3,
+      "tx_bytes": 2544490,
+      "restarted": false,
+      "size": 5253702
+    },
+    {
+      "round": 11,
+      "seconds": 3.294,
+      "tx_bytes": 2545808,
+      "restarted": false,
+      "size": 5254353
+    },
+    {
+      "round": 12,
+      "seconds": 0.618,
+      "tx_bytes": 2546776,
+      "restarted": true,
+      "size": 5255004
+    }
+  ],
+  "rss_kib": {
+    "A": {
+      "peak": 155088,
+      "tail_median": 124256.0
+    },
+    "B": {
+      "peak": 66944,
+      "tail_median": 43808
+    }
+  },
+  "rss_samples": 782
+}

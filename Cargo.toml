@@ -1,0 +1,58 @@
+[package]
+name = "godovoy-plan"
+version = "0.5.41"
+edition = "2024"
+default-run = "godovoy-plan"
+rust-version = "1.94"
+description = "Локальный годовой календарь команды"
+
+[[bin]]
+name = "godovoy-plan"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[[bin]]
+name = "godovoy-bridge"
+path = "src/bin/godovoy-bridge.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:axum", "dep:tower", "dep:tokio", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+
+[dependencies]
+curve25519-dalek = { version = "4", default-features = false }
+axum = { optional = true, version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+tower = { optional = true, version = "0.5", features = ["util"] }
+subtle = "2"
+tokio = { optional = true, version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+ureq = { optional = true, version = "3", default-features = false, features = ["native-tls", "json"] }
+base64 = "0.22"
+blake2 = "0.10"
+chacha20poly1305 = { version = "0.10", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = { version = "6", optional = true }
+eframe = { optional = true, version = "0.34", default-features = false, features = ["accesskit", "default_fonts", "glow", "x11", "wayland"] }
+getrandom = "0.4"
+notify-rust = { version = "4", optional = true }
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+snow = { version = "0.10", default-features = false, features = ["use-blake2", "use-chacha20poly1305", "use-curve25519", "use-getrandom"] }
+socket2 = { version = "0.6", features = ["all"] }
+tempfile = "3"
+uuid = { version = "1", features = ["serde", "v4", "v5"] }
+zeroize = "1"
+
+[target.'cfg(windows)'.dependencies]
+winreg = "0.56"
+
+[target.'cfg(any(windows, target_os = "macos"))'.dependencies]
+rfd = { optional = true, version = "0.17.2", default-features = false }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+rustix = { version = "1", features = ["process", "fs"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+notify-rust = { optional = true, version = "4", features = ["preview-macos-un"] }

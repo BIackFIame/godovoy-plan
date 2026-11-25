@@ -1,0 +1,47 @@
+name: GodovoyPlan
+options:
+  deploymentTarget:
+    iOS: '16.0'
+  developmentLanguage: ru
+  createIntermediateGroups: true
+targets:
+  GodovoyPlan:
+    type: application
+    platform: iOS
+    sources:
+      - path: App
+        excludes: [Info.plist, Application.entitlements]
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.godovoyplan.mobile
+        PRODUCT_NAME: GodovoyPlan
+        SWIFT_VERSION: '5.0'
+        SWIFT_OBJC_BRIDGING_HEADER: App/CoreBridge.h
+        INFOPLIST_FILE: App/Info.plist
+        TARGETED_DEVICE_FAMILY: '1,2'
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGN_STYLE: Automatic
+        CODE_SIGN_ENTITLEMENTS: App/Application.entitlements
+        ENABLE_USER_SCRIPT_SANDBOXING: YES
+        MARKETING_VERSION: '0.5.41'
+        CURRENT_PROJECT_VERSION: 1
+        LIBRARY_SEARCH_PATHS: ['$(inherited)', '$(PROJECT_DIR)/RustLibs/$(PLATFORM_NAME)']
+        OTHER_LDFLAGS: ['$(inherited)', '-lgodovoy_mobile_core', '-liconv', '-framework', CoreFoundation]
+  GodovoyPlanUITests:
+    type: bundle.ui-testing
+    platform: iOS
+    sources: [UITests]
+    dependencies:
+      - target: GodovoyPlan
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.godovoyplan.mobile.uitests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_TARGET_NAME: GodovoyPlan
+schemes:
+  GodovoyPlan:
+    build:
+      targets:
+        GodovoyPlan: all
+    test:
+      targets: [GodovoyPlanUITests]
