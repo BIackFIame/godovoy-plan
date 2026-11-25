@@ -54,6 +54,7 @@ extension CalendarUITests {
         func waitFor(_ message: String, _ predicate: @escaping () -> Bool) throws {
             let expectation = XCTNSPredicateExpectation(predicate: NSPredicate { _, _ in predicate() }, object: nil)
             if XCTWaiter.wait(for: [expectation], timeout: 12) != .completed {
+                print(app.debugDescription)
                 let screenshot = XCTAttachment(screenshot: app.screenshot())
                 screenshot.name = message
                 screenshot.lifetime = .keepAlways
@@ -118,7 +119,9 @@ extension CalendarUITests {
         // Reading the saved item is the only step that deliberately scrolls.
         for _ in 0..<12 {
             if visible(row35) { break }
-            app.swipeUp()
+            let bottom = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.72))
+            let middle = app.coordinate(withNormalizedOffset: CGVector(dx: 0.5, dy: 0.40))
+            bottom.press(forDuration: 0.1, thenDragTo: middle, withVelocity: .slow, thenHoldForDuration: 0.15)
         }
         try waitFor("После перезапуска у пункта 35 сохранена отметка") {
             visible(row35) && row35.value as? String == "Выполнено"

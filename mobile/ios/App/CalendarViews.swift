@@ -34,6 +34,9 @@ struct CalendarView: View {
             }
         }
         .navigationTitle("Календарь")
+        .navigationDestination(for: EventRoute.self) { route in
+            DetailView(id: route.id, year: route.year, targetTask: route.targetTask)
+        }
         .searchable(text: $search, prompt: "Найти событие")
         .refreshable { await model.refresh() }
         .toolbar { Button { creating = true } label: { Image(systemName: "plus") }.accessibilityLabel("Новое событие").accessibilityIdentifier("newEvent") }
@@ -44,14 +47,18 @@ struct CalendarView: View {
         Button { month = nil; model.year += delta } label: { Image(systemName: delta < 0 ? "chevron.left" : "chevron.right").frame(minWidth: 44, minHeight: 44) }.buttonStyle(.borderless).disabled(!(1900...9999).contains(model.year + delta)).accessibilityLabel(delta < 0 ? "Предыдущий год" : "Следующий год")
     }
 }
+private struct EventRoute: Hashable {
+    let id: String
+    let year: Int
+    let targetTask: String?
+}
+
 struct EventLink: View {
     let event: GPEvent
     var showsPreparation = false
 
     var body: some View {
-        NavigationLink {
-            DetailView(id: event.id, year: event.year, targetTask: showsPreparation ? event.nextOpenTask?.id : nil)
-        } label: {
+        NavigationLink(value: EventRoute(id: event.id, year: event.year, targetTask: showsPreparation ? event.nextOpenTask?.id : nil)) {
             VStack(alignment: .leading, spacing: 4) {
                 if showsPreparation, let task = event.nextOpenTask {
                     Text(task.title).font(.headline)
@@ -76,7 +83,7 @@ struct TasksView: View {
                     if state.reminders.isEmpty { Text("Напоминаний пока нет").foregroundStyle(.secondary) }
                     ForEach(state.reminders.indices, id: \.self) { index in
                         let reminder = state.reminders[index]
-                        NavigationLink { DetailView(id: reminder.eventId, year: reminder.year, targetTask: reminder.taskId) } label: {
+                        NavigationLink(value: EventRoute(id: reminder.eventId, year: reminder.year, targetTask: reminder.taskId)) {
                             VStack(alignment: .leading) {
                                 Text(reminder.title)
                                 Text(GPDate.label(reminder.date)).foregroundStyle(.secondary).font(.subheadline)
@@ -86,6 +93,9 @@ struct TasksView: View {
                 }
             }
         }.navigationTitle("Мои задачи").refreshable { await model.refresh() }
+        .navigationDestination(for: EventRoute.self) { route in
+            DetailView(id: route.id, year: route.year, targetTask: route.targetTask)
+        }
     }
 }
 extension GPEvent { var selfKey: String { "\(id):\(year)" } }
