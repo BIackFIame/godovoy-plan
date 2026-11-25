@@ -23,9 +23,16 @@ struct ReadHint {
     modified: std::time::SystemTime,
 }
 
+#[derive(Clone)]
+struct CachedView {
+    tag: HeaderValue,
+    // A write receipt can establish a tag before any complete response is sent.
+    body_len: Option<usize>,
+}
+
 struct Entry {
     digest: InputDigest,
-    tag: HeaderValue,
+    view: CachedView,
     hint: Option<ReadHint>,
 }
 
@@ -68,14 +75,14 @@ impl Views {
     }
 
     pub(super) fn lookup(&self, key: &InputDigest) -> Fallible<Option<HeaderValue>> {
-        self.lookup_and_refresh(key, None)
+        Ok(self.lookup_and_refresh(key, None)?.map(|view| view.tag))
     }
 
     fn lookup_and_refresh(
         &self,
         key: &InputDigest,
         hint: Option<ReadHint>,
-    ) -> Fallible<Option<HeaderValue>> {
+    ) -> Fallible<Option<CachedView>> {
         let mut entries = self
             .entries
             .lock()
@@ -87,25 +94,39 @@ impl Views {
                 if hint.is_some() {
                     entry.hint = hint;
                 }
-                entry.tag.clone()
+                entry.view.clone()
             }))
     }
 
     pub(super) fn remember(&self, key: InputDigest, tag: HeaderValue) -> Fallible<()> {
-        self.store(key, tag, None)
+        self.store(
+            key,
+            CachedView {
+                tag,
+                body_len: None,
+            },
+            None,
+        )
     }
 
-    fn store(&self, key: InputDigest, tag: HeaderValue, hint: Option<ReadHint>) -> Fallible<()> {
+    fn store(&self, key: InputDigest, view: CachedView, hint: Option<ReadHint>) -> Fallible<()> {
         let mut entries = self
             .entries
             .lock()
             .map_err(|_| "Ошибка проверки версии календаря.")?;
+        if let Some(entry) = entries.iter_mut().find(|entry| entry.digest == key) {
+            if view.body_len.is_some() {
+                entry.view = view;
+                entry.hint = hint;
+            }
+            return Ok(());
+        }
         if entries.len() == MAX_VIEWS {
             entries.pop_front();
         }
         entries.push_back(Entry {
             digest: key,
-            tag,
+            view,
             hint,
         });
         Ok(())
@@ -160,7 +181,7 @@ impl Views {
                 .map_err(|_| "Ошибка проверки версии календаря.")?
                 .iter()
                 .rev()
-                .find(|entry| entry.hint == Some(hint) && entry.tag == condition)
+                .find(|entry| entry.hint == Some(hint) && entry.view.tag == condition)
                 .map(|entry| entry.digest);
             if let Some(expected) = candidate {
                 let source = Self::input_hasher(credential, &context, today)?;
@@ -175,23 +196,40 @@ impl Views {
         let data = file.into_bytes()?;
         let key = Self::input(credential, &context, today, &data)?;
         let known = self.lookup_and_refresh(&key, hint)?;
-        if let Some(tag) = &known
-            && matches_tag(condition, tag)
+        if let Some(view) = &known
+            && matches_tag(condition, &view.tag)
         {
             return Ok(tagged(
                 StatusCode::NOT_MODIFIED.into_response(),
-                tag.clone(),
+                view.tag.clone(),
             ));
         }
         let calendar = serde_json::from_slice(&data)?;
         drop(data);
-        let body = serde_json::to_vec(&context.render(&calendar, today))?;
-        let tag = if let Some(tag) = known {
-            tag
+        let view = context.render(&calendar, today);
+        let (body, tag) = if let Some(CachedView {
+            tag,
+            body_len: Some(len),
+        }) = &known
+        {
+            let mut body = Vec::with_capacity(*len);
+            serde_json::to_writer(&mut body, &view)?;
+            (body, tag.clone())
         } else {
-            let tag = Self::tag(self.tag_hasher(credential).chain_update(&body))?;
-            self.store(key, tag.clone(), hint)?;
-            tag
+            let body = serde_json::to_vec(&view)?;
+            let tag = match known {
+                Some(cached) => cached.tag,
+                None => Self::tag(self.tag_hasher(credential).chain_update(&body))?,
+            };
+            self.store(
+                key,
+                CachedView {
+                    tag: tag.clone(),
+                    body_len: Some(body.len()),
+                },
+                hint,
+            )?;
+            (body, tag)
         };
         let response = if matches_tag(condition, &tag) {
             StatusCode::NOT_MODIFIED.into_response()
@@ -242,4 +280,43 @@ fn matches_tag(condition: &[HeaderValue], current: &HeaderValue) -> bool {
         }
     }
     matched
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn response_size_survives_a_duplicate_receipt_and_expires_with_its_digest() {
+        let views = Views::default();
+        let digest = [0; 32];
+        let tag = HeaderValue::from_static("\"year\"");
+        let body_len = |key| {
+            views
+                .lookup_and_refresh(&key, None)
+                .unwrap()
+                .unwrap()
+                .body_len
+        };
+        views.remember(digest, tag.clone()).unwrap();
+        assert_eq!(body_len(digest), None);
+        views
+            .store(
+                digest,
+                CachedView {
+                    tag: tag.clone(),
+                    body_len: Some(780),
+                },
+                None,
+            )
+            .unwrap();
+        views.remember(digest, tag.clone()).unwrap();
+        for i in 1..MAX_VIEWS {
+            views.remember([i as u8; 32], tag.clone()).unwrap();
+        }
+        assert_eq!(body_len(digest), Some(780));
+        assert_eq!(body_len([1; 32]), None);
+        views.remember([255; 32], tag).unwrap();
+        assert!(views.lookup(&digest).unwrap().is_none());
+    }
 }
