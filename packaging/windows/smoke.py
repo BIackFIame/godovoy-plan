@@ -73,7 +73,7 @@ def main():
         release = json.load(response)
     assert release["tag_name"] == tag and not release["draft"]
     version = tag[1:]
-    with tempfile.TemporaryDirectory(dir=os.environ["LOCALAPPDATA"], prefix="GodovoyQA-") as work:
+    with tempfile.TemporaryDirectory(dir=os.environ["GP_TEST_VOLUME"], prefix="GodovoyQA-") as work:
         directory = Path(work)
         extract_release(release, f"GodovoyPlan-{version}-Windows-{arch}.zip",
                         ["godovoy-plan.exe", "godovoy-online.exe"], directory)

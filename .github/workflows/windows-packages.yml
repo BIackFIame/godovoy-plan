@@ -29,6 +29,9 @@ jobs:
           git fetch --quiet --no-tags --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           git checkout --quiet --detach FETCH_HEAD
+      - name: Создать отдельный закрытый том NTFS для тестового профиля
+        shell: pwsh
+        run: ./packaging/windows/test-volume.ps1
       - name: Проверить опубликованный пакет на Windows
         shell: pwsh
         env:
