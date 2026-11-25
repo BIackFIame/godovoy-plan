@@ -19,6 +19,14 @@ on:
         description: Полный хеш исходного коммита выбранного черновика
         type: string
         required: false
+      renderer_run:
+        description: Необязательный ID успешной проверки уже собранных драйверов
+        type: string
+        required: false
+      renderer_commit:
+        description: Точный хеш проверенной сборки драйверов
+        type: string
+        required: false
 permissions: {}
 jobs:
   draft:
@@ -83,7 +91,17 @@ jobs:
       - name: Создать отдельный закрытый том NTFS для тестового профиля
         shell: pwsh
         run: ./packaging/windows/test-volume.ps1
+      - name: Получить ранее проверенный драйвер нужной архитектуры
+        if: inputs.renderer_run != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RENDERER_RUN: ${{ inputs.renderer_run }}
+          RENDERER_COMMIT: ${{ inputs.renderer_commit }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: ./packaging/windows/reuse-renderer.ps1
       - name: Собрать графический драйвер для виртуальной машины без GPU
+        if: inputs.renderer_run == ''
         shell: pwsh
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
@@ -105,6 +123,7 @@ jobs:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: python packaging/windows/smoke.py
       - name: Сохранить проверенный дополнительный рендерер
+        if: inputs.renderer_run == ''
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: software-opengl-${{ matrix.arch }}
