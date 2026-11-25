@@ -163,6 +163,10 @@ impl Inbound {
     pub(super) fn warning(&self) -> Option<String> {
         self.ports.lock().unwrap().warning.clone()
     }
+    #[cfg(test)]
+    pub(super) fn discovery_bound(&self) -> bool {
+        self.ports.lock().unwrap().udp.is_some()
+    }
     pub(super) fn retry_at(&self) -> Option<Instant> {
         self.ports.lock().unwrap().retry
     }

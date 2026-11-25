@@ -127,8 +127,8 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
         )
         .unwrap()
     };
-    let wait = |stage: &str, f: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    let wait = |stage: &str, timeout: Duration, f: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + timeout;
         while !f() {
             assert!(
                 Instant::now() < deadline,
@@ -149,7 +149,8 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     // A group beacon alone cannot complete enrollment.
     sender.send_to(&beacon(&group_key), address).unwrap();
     let join = peer.join_async(fields.join("."), "Борис".into(), None);
-    wait("pending invitation", &|| {
+    let discovery_timeout = Duration::from_secs(2);
+    wait("pending invitation", discovery_timeout, &|| {
         peer.core.pending_discovery.lock().unwrap().is_some()
     });
     sender.send_to(&beacon(&group_key), address).unwrap();
@@ -162,10 +163,26 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     assert!(peer.core.pending_discovery.lock().unwrap().is_none());
     peer.core.discovered.lock().unwrap().clear();
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait("group beacon after enrollment", &seen);
+    wait("group beacon after enrollment", discovery_timeout, &seen);
+    let inbound = peer.core.inbound.get().unwrap();
+    assert!(inbound.discovery_bound());
     peer.set_paused(true);
+    assert!(peer.paused());
+    assert!(!inbound.discovery_bound());
+    assert!(!peer.can_sync_automatically());
     peer.core.discovered.lock().unwrap().clear();
-    let monitor = UdpSocket::bind(address).unwrap();
+    // A concurrent process launch on macOS can retain a closed socket until exec.
+    // The application must drop its own socket synchronously regardless.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let monitor = loop {
+        match UdpSocket::bind(address) {
+            Ok(socket) => break socket,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("Could not bind the released UDP port {udp}: {error}"),
+        }
+    };
     monitor
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
@@ -176,8 +193,11 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     assert!(!seen());
     drop(monitor);
     peer.set_paused(false);
+    wait("UDP socket after resume", Duration::from_secs(5), &|| {
+        inbound.discovery_bound()
+    });
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait("group beacon after resume", &seen);
+    wait("group beacon after resume", discovery_timeout, &seen);
 }
 
 #[test]
