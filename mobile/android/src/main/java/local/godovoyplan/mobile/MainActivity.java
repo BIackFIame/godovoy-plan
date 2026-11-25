@@ -265,14 +265,23 @@ public final class MainActivity extends Activity {
         }
         state = next;
     }
-    String employeeLabel(JSONObject person) {
-        String name = str(person, "name");
-        String id = str(person, "id");
-        for (JSONObject other : items(array(state, "employees"))) {
-            if (name.equals(str(other, "name")) && !id.equals(str(other, "id")))
-                return name + " · " + id.substring(0, 8);
+    void appendEmployeeChoices(List<String> ids, List<String> labels, String excludedId) {
+        List<JSONObject> employees = items(array(state, "employees"));
+        Map<String, String> firstIds = new HashMap<>();
+        Set<String> sharedNames = new HashSet<>();
+        for (JSONObject person : employees) {
+            String name = str(person, "name");
+            String id = str(person, "id");
+            String first = firstIds.putIfAbsent(name, id);
+            if (first != null && !first.equals(id)) sharedNames.add(name);
         }
-        return name;
+        for (JSONObject person : employees) {
+            String id = str(person, "id");
+            if (id.equals(excludedId)) continue;
+            String name = str(person, "name");
+            ids.add(id);
+            labels.add(sharedNames.contains(name) ? name + " · " + id.substring(0, Math.min(8, id.length())) : name);
+        }
     }
     static List<JSONObject> items(JSONArray a) {
         List<JSONObject> out = new ArrayList<>();
@@ -539,10 +548,15 @@ public final class MainActivity extends Activity {
     private JSONObject selectedEvent() {
         if (selectedId.isEmpty())
             return null;
-        for (String col : new String[] {"events", "tasks"})
-            for (JSONObject e : items(array(state, col)))
-                if (selectedId.equals(str(e, "id")) && year == e.optInt("year"))
-                    return e;
+        JSONObject event = findSelected(state.optJSONArray("events"));
+        return event != null ? event : findSelected(state.optJSONArray("tasks"));
+    }
+    private JSONObject findSelected(JSONArray rows) {
+        for (int i = 0; rows != null && i < rows.length(); i++) {
+            JSONObject event = rows.optJSONObject(i);
+            if (event != null && selectedId.equals(str(event, "id")) && year == event.optInt("year"))
+                return event;
+        }
         return null;
     }
     void open(String id, int yr) {
@@ -988,11 +1002,7 @@ public final class MainActivity extends Activity {
         List<String> labels = new ArrayList<>();
         ids.add(id);
         labels.add("Устройство отдельно");
-        for (JSONObject person : items(array(state, "employees"))) {
-            if (id.equals(str(person, "id"))) continue;
-            ids.add(str(person, "id"));
-            labels.add(employeeLabel(person));
-        }
+        appendEmployeeChoices(ids, labels, id);
         chooser("Чьи задачи показывать?", labels.toArray(new String[0]), ids.indexOf(current), n -> {
             String employee = ids.get(n);
             if (employee.equals(current)) return;

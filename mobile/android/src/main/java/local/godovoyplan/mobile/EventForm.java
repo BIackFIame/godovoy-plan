@@ -61,10 +61,7 @@ final class EventForm {
         names.add("Без ответственного");
         employeeIds.add("");
         String initialOwner = previous == null ? str(activity.state, "employeeId") : str(previous, "employeeId");
-        for (JSONObject person : items(array(activity.state, "employees"))) {
-            employeeIds.add(str(person, "id"));
-            names.add(activity.employeeLabel(person));
-        }
+        activity.appendEmployeeChoices(employeeIds, names, null);
         if (!initialOwner.isEmpty() && !employeeIds.contains(initialOwner)) {
             employeeIds.add(initialOwner);
             names.add(activity.owner(initialOwner) + " · нет активных устройств");
