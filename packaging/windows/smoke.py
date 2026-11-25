@@ -13,8 +13,10 @@ import urllib.request
 import zipfile
 
 def cli(exe, *args):
-    return subprocess.run([exe, *args], check=True, capture_output=True, encoding="utf-8",
-                          timeout=30).stdout.strip()
+    result = subprocess.run([exe, *args], capture_output=True, encoding="utf-8", timeout=30)
+    if result.returncode:
+        raise RuntimeError(f"{exe.name} {args[0]} failed ({result.returncode}): {result.stderr.strip()}")
+    return result.stdout.strip()
 
 def extract_release(release, name, programs, directory):
     matches = [a for a in release["assets"] if a["name"] == name]
@@ -71,7 +73,7 @@ def main():
         release = json.load(response)
     assert release["tag_name"] == tag and not release["draft"]
     version = tag[1:]
-    with tempfile.TemporaryDirectory() as work:
+    with tempfile.TemporaryDirectory(dir=os.environ["LOCALAPPDATA"], prefix="GodovoyQA-") as work:
         directory = Path(work)
         extract_release(release, f"GodovoyPlan-{version}-Windows-{arch}.zip",
                         ["godovoy-plan.exe", "godovoy-online.exe"], directory)
