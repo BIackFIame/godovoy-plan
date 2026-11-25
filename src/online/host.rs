@@ -48,7 +48,7 @@ pub enum EntryPoint {
 #[derive(Clone)]
 pub struct Host {
     vault: OnlineVault,
-    session_acl: Arc<Mutex<SessionAcl>>,
+    employee_acl: Arc<Mutex<SessionAcl>>,
     origin: String,
     authority: String,
     entry: EntryPoint,
@@ -88,7 +88,7 @@ impl Host {
         let origin = format!("{}://{}", uri.scheme_str().unwrap_or_default(), authority);
         Ok(Self {
             vault,
-            session_acl: Arc::default(),
+            employee_acl: Arc::default(),
             origin,
             authority: authority.as_str().into(),
             entry,
@@ -197,14 +197,14 @@ enum AuthOperation {
 
 enum RequestAcl<'a> {
     Current(&'a mut Access),
-    Session(&'a Access),
+    Verified(&'a Access),
 }
 impl std::ops::Deref for RequestAcl<'_> {
     type Target = Access;
     fn deref(&self) -> &Access {
         match self {
             Self::Current(acl) => acl,
-            Self::Session(acl) => acl,
+            Self::Verified(acl) => acl,
         }
     }
 }
@@ -262,15 +262,15 @@ where
         };
         let mut fresh;
         let mut cached;
-        let mut acl = if matches!(operation, AuthOperation::Session) {
-            let Ok(guard) = host.session_acl.lock() else {
+        let mut acl = if purpose == GrantPurpose::Employee {
+            let Ok(guard) = host.employee_acl.lock() else {
                 return unavailable();
             };
             cached = guard;
             let Ok(acl) = lock.session_access(&mut cached) else {
                 return unavailable();
             };
-            RequestAcl::Session(acl)
+            RequestAcl::Verified(acl)
         } else {
             let Ok(acl) = lock.access() else {
                 return unavailable();
@@ -1604,6 +1604,37 @@ mod tests {
                 .contains(f.key.split_once('.').unwrap().1)
         );
     }
+    #[tokio::test]
+    async fn employee_calendar_and_commands_recheck_the_required_policy_after_a_warm_read() {
+        use godovoy_plan::storage::online::ProtectionSettings;
+
+        let f = Fixture::new();
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    belarus: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = f.state().await;
+        let witness = f
+            ._tmp
+            .path()
+            .join("host/online-protection-required-v1.json");
+        std::fs::write(&witness, b"0").unwrap();
+        assert_eq!(
+            f.request("/v1/state?year=2028", &f.key, None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(f.cmd(f.create()).await, StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::write(&witness, b"1").unwrap();
+        assert_eq!(f.state().await, before);
+    }
+
     #[tokio::test]
     async fn serialized_updates_preserve_checklists_and_detect_stale_notes_and_edits() {
         let f = Fixture::new();
