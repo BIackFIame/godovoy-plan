@@ -64,7 +64,7 @@
         el("sheet-body").replaceChildren();
         el("sheet-error").textContent = "";
         el("sheet-title").textContent = "";
-        if (origin && state) (document.getElementById(origin) || el("mine")).focus();
+        if (origin && state) (document.getElementById(origin) || el(mode)).focus();
     }
     function sheet(title) {
         el("sheet-title").textContent = title;
@@ -287,9 +287,11 @@
         el("calendar-name").textContent = mode === "mine" ? "Мои задачи" : state.workspaceName;
         el("create").classList.toggle("primary", mode === "all");
         const list = el("list");
+        const focusedId = list.contains(document.activeElement) ? document.activeElement.id : "";
         list.replaceChildren();
         if (!visibleEvents().length) {
             list.append(element("p", mode === "mine" ? "Сейчас у вас нет задач, требующих внимания." : "В этом году событий пока нет.", "empty"));
+            if (focusedId) el(mode).focus();
             return;
         }
         const personal = mode === "mine" ? personalRows(state.tasks) : null;
@@ -320,10 +322,10 @@
                 }
                 const item = element("li");
                 const open = button("", () => {
-                    if (entry) el("sheet").dataset.origin = open.id;
+                    el("sheet").dataset.origin = open.id;
                     detail(entry ? event : visibleEvents()[i], entry?.next?.id);
                 }, entry ? "event personal" : "event");
-                if (entry) open.id = "personal-" + event.id + "-" + event.year;
+                open.id = (entry ? "personal-" : "annual-") + event.id + "-" + event.year;
                 const stamp = element("time", dateLabel.format(date), "date");
                 stamp.dateTime = day;
                 if (entry && day.slice(0, 4) !== today.slice(0, 4)) {
@@ -358,11 +360,13 @@
                     const added = appendPage(start);
                     if (focused && added) added.focus({preventScroll: true});
                 }, "more");
+                more.id = "agenda-more";
                 list.append(more);
             }
             return first;
         }
         appendPage(0);
+        if (focusedId) (document.getElementById(focusedId) || el(mode)).focus();
     }
 
     function section(title) {
