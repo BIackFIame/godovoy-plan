@@ -24,6 +24,10 @@ on:
         description: Полный хеш исходного коммита выбранного черновика
         type: string
         required: false
+      draft_renderer_pair:
+        description: Использовать два закреплённых QA-архива Mesa из выбранного черновика для полного теста всех архитектур
+        type: boolean
+        default: false
       renderer_run:
         description: Необязательный ID успешной проверки уже собранных драйверов
         type: string
@@ -32,10 +36,13 @@ on:
         description: Точный хеш проверенной сборки драйверов
         type: string
         required: false
+env:
+  MESA_X86_SHA256: b99a5301076b85c6ddd1f7902d0829d6c18db310f2943640199fd91571acf455
+  MESA_X64_SHA256: 6052db4fcde9cdcc6baf70d6ab81255264b8b6180398214652d5b91fbb0147c7
 permissions: {}
 jobs:
   draft:
-    if: inputs.draft_id != ''
+    if: inputs.draft_id != '' || inputs.draft_renderer_pair
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -48,9 +55,20 @@ jobs:
           DRAFT_ID: ${{ inputs.draft_id }}
           TAG: ${{ inputs.tag }}
           SOURCE_SHA: ${{ inputs.source_sha }}
+          RENDERER_PAIR: ${{ inputs.draft_renderer_pair }}
+          ARCHITECTURE: ${{ inputs.architecture }}
+          SCOPE: ${{ inputs.scope }}
+          RENDERER_RUN: ${{ inputs.renderer_run }}
+          RENDERER_COMMIT: ${{ inputs.renderer_commit }}
         run: |
           set -euo pipefail
-          [[ "$DRAFT_ID" =~ ^[0-9]+$ && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          [[ "$DRAFT_ID" =~ ^[0-9]+$ && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]] || exit 1
+          if [[ "$RENDERER_PAIR" == true ]]; then
+            [[ "$ARCHITECTURE" == all && "$SCOPE" == full ]] || exit 1
+            if [[ -n "$RENDERER_RUN" || -n "$RENDERER_COMMIT" ]]; then
+              [[ "$RENDERER_RUN" =~ ^[0-9]+$ && "$RENDERER_COMMIT" =~ ^[a-f0-9]{40}$ ]] || exit 1
+            fi
+          fi
           api="repos/$GITHUB_REPOSITORY/releases"
           gh api "$api/$DRAFT_ID" > "$RUNNER_TEMP/metadata.json"
           jq -e --arg tag "$TAG" --arg sha "$SOURCE_SHA" '.draft == true and .tag_name == $tag and .target_commitish == $sha' "$RUNNER_TEMP/metadata.json" >/dev/null
@@ -58,16 +76,25 @@ jobs:
           mkdir "$destination"
           cd "$destination"
           jq '{tag_name,draft,assets:[.assets[]|{name,size,digest,id,state}]}' "$RUNNER_TEMP/metadata.json" > release.json
-          for suffix in Plan-Windows-x64 Plan-Windows-x86 Plan-Windows-ARM64 Server-Windows-x64; do
-            product="${suffix%%-*}"
-            name="Godovoy$product-${TAG#v}-${suffix#*-}.zip"
+          download_asset() {
+            local name="$1" expected="${2:-}" row digest id actual
             row=$(jq -ec --arg name "$name" '[.assets[]|select(.name==$name and .state=="uploaded")]|select(length==1)|.[0]' release.json)
             digest=$(jq -er '.digest' <<< "$row")
             id=$(jq -er '.id|numbers' <<< "$row")
-            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]] || exit 1
+            if [[ -n "$expected" && "$digest" != "sha256:$expected" ]]; then exit 1; fi
             gh api "$api/assets/$id" -H 'Accept: application/octet-stream' > "$name"
-            echo "${digest#sha256:}  $name" | sha256sum --check --status
+            actual=$(sha256sum "$name")
+            [[ "${actual%% *}" == "${digest#sha256:}" ]] || exit 1
+          }
+          for suffix in Plan-Windows-x64 Plan-Windows-x86 Plan-Windows-ARM64 Server-Windows-x64; do
+            product="${suffix%%-*}"
+            download_asset "Godovoy$product-${TAG#v}-${suffix#*-}.zip"
           done
+          if [[ "$RENDERER_PAIR" == true ]]; then
+            download_asset Mesa-26.3.1-Softpipe-Windows-x86-local-QA.zip "$MESA_X86_SHA256"
+            download_asset Mesa-26.3.1-Softpipe-Windows-x64-local-QA.zip "$MESA_X64_SHA256"
+          fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: windows-input-${{ github.run_id }}-${{ github.run_attempt }}
@@ -119,7 +146,7 @@ jobs:
         shell: pwsh
         run: ./packaging/windows/test-volume.ps1
       - name: Получить ранее проверенный драйвер нужной архитектуры
-        if: inputs.scope != 'profile' && inputs.renderer_run != ''
+        if: inputs.scope != 'profile' && inputs.renderer_run != '' && (!inputs.draft_renderer_pair || matrix.arch == 'ARM64')
         shell: pwsh
         env:
           GH_TOKEN: ${{ github.token }}
@@ -128,7 +155,7 @@ jobs:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: ./packaging/windows/reuse-renderer.ps1
       - name: Собрать графический драйвер для виртуальной машины без GPU
-        if: inputs.scope != 'profile' && inputs.renderer_run == ''
+        if: inputs.scope != 'profile' && inputs.renderer_run == '' && (!inputs.draft_renderer_pair || matrix.arch == 'ARM64')
         shell: pwsh
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
@@ -148,6 +175,12 @@ jobs:
           gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name "windows-input-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --dir $dir
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           "GP_PACKAGE_INPUT=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Проверить и извлечь локальные Softpipe DLL для этой машины
+        if: inputs.draft_renderer_pair && matrix.arch != 'ARM64'
+        shell: pwsh
+        env:
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: python packaging/windows/draft-renderer.py
       - name: Проверить пакет на Windows
         shell: pwsh
         env:
@@ -156,7 +189,7 @@ jobs:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: python packaging/windows/smoke.py
       - name: Сохранить проверенный дополнительный рендерер
-        if: inputs.scope != 'profile' && inputs.renderer_run == ''
+        if: inputs.scope != 'profile' && inputs.renderer_run == '' && (!inputs.draft_renderer_pair || matrix.arch == 'ARM64')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: software-opengl-${{ matrix.arch }}
