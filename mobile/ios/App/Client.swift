@@ -54,6 +54,29 @@ actor CalendarClient {
         return data
     }
 
+    // The actor serializes write, read, decoding and merge. No suspension between the two ABI calls.
+    func check(_ prior: GPState, context: GPCheckContext) throws -> GPState {
+        try run(["op": .string("check"), "year": .integer(context.year), "eventId": .string(context.eventID),
+                 "taskId": .string(context.taskID), "done": .flag(context.done), "baseToken": .string(context.token)])
+        let full: GPCommand = ["op": .string("state"), "year": .integer(context.year)]
+        var request = full
+        request["ifToken"] = .string(context.token)
+        request["acceptCheckPatch"] = .flag(true)
+        do {
+            switch try value(request, as: GPSnapshot.self) {
+            case .check(let patch):
+                if let next = patch.applying(to: prior, for: context) { return next }
+            case .state(let next) where next.year == context.year: return next
+            default: break
+            }
+        } catch is DecodingError {
+            // Only retry the read. Mutations have already reached durable storage.
+        }
+        guard case .state(let next) = try value(full, as: GPSnapshot.self), next.year == context.year
+        else { throw GPError("Не удалось обновить календарь.") }
+        return next
+    }
+
     func run(_ command: GPCommand) throws {
         let result = try JSONDecoder().decode(Envelope<JSONValue>.self, from: call(command))
         if !result.ok { throw GPError(result.error ?? "Не удалось сохранить изменения.") }

@@ -33,10 +33,10 @@ struct GPError: LocalizedError {
     init(_ message: String) { self.message = message }
 }
 
-struct GPMember: Decodable, Identifiable { let id, name, employeeId: String; let revoked: Bool }
-struct GPEmployee: Decodable, Identifiable { let id, name: String }
-struct GPTask: Decodable, Identifiable { let id, title, dueDate: String; let done: Bool; let daysBefore: Int }
-struct GPEvent: Decodable, Identifiable {
+struct GPMember: Equatable, Decodable, Identifiable { let id, name, employeeId: String; let revoked: Bool }
+struct GPEmployee: Equatable, Decodable, Identifiable { let id, name: String }
+struct GPTask: Equatable, Decodable, Identifiable { let id, title, dueDate: String; let done: Bool; let daysBefore: Int }
+struct GPEvent: Equatable, Decodable, Identifiable {
     let id, title, date, category, preparationDate, note, description: String
     let year, preparationDays: Int
     let yearly: Bool
@@ -70,20 +70,22 @@ struct GPYearSections {
     }
 }
 
-struct GPReminder: Decodable { let eventId, title, date: String; let year: Int }
-struct GPState: Decodable {
+struct GPReminder: Equatable, Decodable { let eventId, title, date: String; let year: Int }
+struct GPState: Equatable, Decodable {
     let deviceId: String
     let workspaceName, address, networkError, accessManagerId: String?
     var lastSync, stateToken: String?
-    let supportsSyncStamp: Bool?
+    let supportsSyncStamp, supportsCheckPatch: Bool?
+    let employeeId: String?
     let year: Int
     let lanEnabled: Bool?
     let canManage, paused: Bool
     let employees: [GPEmployee]
     let members: [GPMember]
-    let events, tasks: [GPEvent]
-    let reminders: [GPReminder]
+    var events, tasks: [GPEvent]
+    var reminders: [GPReminder]
     let notificationDates: [String]
+    var canUseCheckPatch: Bool { supportsCheckPatch == true && events.count >= 600 }
     func employeeLabel(_ person: GPEmployee) -> String {
         if employees.contains(where: { $0.name == person.name && $0.id != person.id }) {
             return "\(person.name) · \(person.id.prefix(8))"
@@ -120,16 +122,112 @@ struct GPSyncStamp: Decodable {
     }
 }
 
+struct GPCheckContext {
+    let token, eventID, taskID: String
+    let year: Int
+    let done: Bool
+
+    init?(prior: GPState, displayed: GPEvent, task: GPTask) {
+        guard prior.canUseCheckPatch,
+              prior.year == displayed.year, prior.workspaceName != nil, prior.employeeId != nil,
+              let token = prior.stateToken, UUID(uuidString: token)?.uuidString.lowercased() == token,
+              let row = prior.events.first(where: { $0.id == displayed.id }),
+              row == displayed, row.checklist.contains(task) else { return nil }
+        self.token = token
+        self.eventID = displayed.id
+        self.taskID = task.id
+        self.year = displayed.year
+        self.done = !task.done
+    }
+}
+
+struct GPCheckPatch: Decodable {
+    let updated: GPState
+    let baseToken: String
+    let taskPositions, reminderPositions: [Int]
+    let taskCount, reminderCount: Int
+    private enum CodingKeys: String, CodingKey { case baseToken, taskPositions, reminderPositions, taskCount, reminderCount }
+
+    init(from decoder: Decoder) throws {
+        updated = try GPState(from: decoder)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        baseToken = try c.decode(String.self, forKey: .baseToken)
+        taskPositions = try c.decode([Int].self, forKey: .taskPositions)
+        reminderPositions = try c.decode([Int].self, forKey: .reminderPositions)
+        taskCount = try c.decode(Int.self, forKey: .taskCount)
+        reminderCount = try c.decode(Int.self, forKey: .reminderCount)
+    }
+
+    func applying(to prior: GPState, for check: GPCheckContext) -> GPState? {
+        guard check.token == prior.stateToken, baseToken == check.token,
+              updated.year == check.year, prior.year == check.year,
+              let token = updated.stateToken, token != baseToken,
+              UUID(uuidString: token)?.uuidString.lowercased() == token,
+              updated.supportsCheckPatch == true, prior.supportsCheckPatch == true,
+              prior.deviceId == updated.deviceId, prior.employeeId == updated.employeeId,
+              prior.workspaceName == updated.workspaceName, prior.members == updated.members,
+              prior.employees == updated.employees, prior.accessManagerId == updated.accessManagerId,
+              prior.canManage == updated.canManage, prior.lanEnabled == updated.lanEnabled,
+              prior.paused == updated.paused, prior.address == updated.address,
+              prior.networkError == updated.networkError, prior.lastSync == updated.lastSync,
+              updated.events.count == 1, let row = updated.events.first,
+              row.id == check.eventID, row.year == check.year,
+              let taskIndex = row.checklist.firstIndex(where: { $0.id == check.taskID }),
+              row.checklist[taskIndex].done == check.done,
+              !row.checklist.dropFirst(taskIndex + 1).contains(where: { $0.id == check.taskID }),
+              let index = prior.events.firstIndex(where: { $0.id == row.id }),
+              prior.events[index].date == row.date, prior.events[index].year == row.year,
+              !prior.events.dropFirst(index + 1).contains(where: { $0.id == row.id }),
+              let tasks = merge(prior.tasks, updated.tasks, at: taskPositions, count: taskCount, matching: { $0.id == row.id }),
+              let reminders = merge(prior.reminders, updated.reminders, at: reminderPositions, count: reminderCount, matching: { $0.eventId == row.id })
+        else { return nil }
+        var result = updated
+        result.events = prior.events
+        result.events[index] = row
+        result.tasks = tasks
+        result.reminders = reminders
+        return result
+    }
+
+    private func merge<T>(_ original: [T], _ changes: [T], at positions: [Int], count: Int, matching: (T) -> Bool) -> [T]? {
+        guard positions.count == changes.count, count >= 0, count - changes.count <= original.count,
+              changes.allSatisfy(matching) else { return nil }
+        var result: [T] = []
+        result.reserveCapacity(count)
+        var old = 0
+        var change = 0
+        for position in 0..<count {
+            if change < positions.count, position == positions[change] {
+                result.append(changes[change])
+                change += 1
+            } else {
+                while old < original.count && matching(original[old]) { old += 1 }
+                guard old < original.count else { return nil }
+                result.append(original[old])
+                old += 1
+            }
+        }
+        while old < original.count && matching(original[old]) { old += 1 }
+        return old == original.count && change == changes.count ? result : nil
+    }
+}
+
 enum GPSnapshot: Decodable {
+    case check(GPCheckPatch)
     case unchanged
     case stamp(GPSyncStamp)
     case state(GPState)
 
-    private enum CodingKeys: String, CodingKey { case unchanged, syncStamp }
+    private enum CodingKeys: String, CodingKey { case unchanged, syncStamp, checkPatch }
 
     init(from decoder: Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
-        if fields.contains(.syncStamp) {
+        if fields.contains(.checkPatch) {
+            guard try fields.decode(Bool.self, forKey: .checkPatch), !fields.contains(.syncStamp), !fields.contains(.unchanged) else {
+                throw DecodingError.dataCorruptedError(forKey: .checkPatch, in: fields, debugDescription: "Conflicting checklist markers")
+            }
+            self = .check(try GPCheckPatch(from: decoder))
+        } else if fields.contains(.syncStamp) {
             guard try fields.decode(Bool.self, forKey: .syncStamp), !fields.contains(.unchanged) else {
                 throw DecodingError.dataCorruptedError(forKey: .syncStamp, in: fields, debugDescription: "Conflicting snapshot markers")
             }

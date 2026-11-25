@@ -75,6 +75,43 @@ import UIKit
             if needsPeerPolling && !busy { await refresh(silent: true) }
         }
     }
+    func check(event: GPEvent, task: GPTask) async -> Bool {
+        guard !busy else { return false }
+        guard let prior = state else {
+            await refresh(silent: true)
+            return false
+        }
+        guard year == event.year, prior.year == year,
+              prior.canUseCheckPatch else {
+            return await run("check", ["eventId": .string(event.id), "year": .integer(event.year),
+                                       "taskId": .string(task.id), "done": .flag(!task.done)])
+        }
+        guard let context = GPCheckContext(prior: prior, displayed: event, task: task) else {
+            failure = "Карточка изменилась. Проверьте актуальный чек-лист."
+            await refresh(silent: true)
+            return false
+        }
+        busy = true
+        defer { busy = false }
+        refreshVersion &+= 1
+        let version = refreshVersion
+        do {
+            let next = try await core.check(prior, context: context)
+            guard !Task.isCancelled else { return false }
+            guard refreshVersion == version, year == context.year, state?.stateToken == context.token else {
+                await refresh(silent: true)
+                return true
+            }
+            state = next
+            GPReminderSchedule.refresh(dates: next.notificationDates)
+            return true
+        } catch {
+            failure = error.localizedDescription
+            await refresh(silent: true)
+            return false
+        }
+    }
+
     func run(_ op: String, _ fields: GPCommand = [:]) async -> Bool {
         guard !busy else { return false }
         busy = true

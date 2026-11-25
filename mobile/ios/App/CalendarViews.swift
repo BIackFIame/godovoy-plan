@@ -80,7 +80,7 @@ struct DetailView: View {
                 Section { LabeledContent("Дата", value: GPDate.label(event.date)); LabeledContent("Начало подготовки", value: GPDate.label(event.preparationDate)); if let owner = model.state?.ownerName(event.employeeId) { LabeledContent("Ответственный", value: owner) }; if event.yearly { Label("Ежегодно", systemImage: "repeat") }; if !event.description.isEmpty { Text(event.description) } }
                 if !event.checklist.isEmpty {
                     Section("Чек-лист") { ForEach(event.checklist) { t in
-                        Button { Task { if await model.run("check", ["eventId": .string(id), "year": .integer(year), "taskId": .string(t.id), "done": .flag(!t.done)]) { await reload() } } } label: {
+                        Button { Task { if await model.check(event: event, task: t), model.state?.year != year { await reload() } } } label: {
                             HStack { Image(systemName: t.done ? "checkmark.circle.fill" : "circle").foregroundStyle(Color.accentColor); VStack(alignment: .leading) { Text(t.title).foregroundStyle(.primary); Text(GPDate.label(t.dueDate)).font(.caption).foregroundStyle(.secondary) } }
                         }.disabled(model.busy).accessibilityValue(t.done ? "Выполнено" : "Открыто")
                     } }
@@ -99,7 +99,13 @@ struct DetailView: View {
         }
         .task(id: id) { await reload() }.refreshable { await reload() }
         .onReceive(model.$state) { state in
-            guard let state else { return }
+            guard let state else {
+                event = nil
+                note = ""
+                base = ""
+                loaded = true
+                return
+            }
             let matches: (GPEvent) -> Bool = { $0.id == id && $0.year == year }
             if let current = state.events.first(where: matches) ?? state.tasks.first(where: matches) {
                 update(current)
