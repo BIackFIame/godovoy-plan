@@ -6,20 +6,19 @@ on:
         description: Тег опубликованного выпуска
         required: true
         default: v0.6.5
+      architecture:
+        description: Архитектура пакета
+        type: choice
+        default: all
+        options: [all, x64, x86, ARM64]
 permissions: {}
 jobs:
   smoke:
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - runner: windows-2022
-            arch: x64
-          - runner: windows-2022
-            arch: x86
-          - runner: windows-11-arm
-            arch: ARM64
-    runs-on: ${{ matrix.runner }}
+        arch: ${{ fromJSON(inputs.architecture == 'all' && '["x64","x86","ARM64"]' || format('["{0}"]', inputs.architecture)) }}
+    runs-on: ${{ matrix.arch == 'ARM64' && 'windows-11-arm' || 'windows-2022' }}
     timeout-minutes: 40
     steps:
       - name: Скачать скрипт проверки на текущем коммите
