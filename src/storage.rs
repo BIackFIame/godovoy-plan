@@ -840,21 +840,14 @@ fn load_reminder_file(path: &Path) -> Result<BTreeSet<Reminder>, ReminderFileIss
         Err(_) => return Err(ReminderFileIssue::Unavailable),
     }
     let file = File::open(path).map_err(unavailable)?;
-    if file.metadata().map_err(unavailable)?.len() > REMINDER_LIMIT as u64 {
-        return Err(ReminderFileIssue::TooLarge);
-    }
-    let mut limited = file.take(REMINDER_LIMIT as u64 + 1);
-    let result = serde_json::from_reader(io::BufReader::new(&mut limited));
-    if limited.limit() == 0 {
-        return Err(ReminderFileIssue::TooLarge);
-    }
-    result.map_err(|error| {
-        if error.is_io() {
-            ReminderFileIssue::Unavailable
-        } else {
-            ReminderFileIssue::InvalidData
-        }
-    })
+    let size = file.metadata().map_err(unavailable)?.len();
+    read_profile_json(file, size, REMINDER_LIMIT)
+        .map(|(receipts, _)| receipts)
+        .map_err(|error| match error {
+            ProfileJsonError::Io(_) => ReminderFileIssue::Unavailable,
+            ProfileJsonError::Syntax => ReminderFileIssue::InvalidData,
+            ProfileJsonError::TooLarge => ReminderFileIssue::TooLarge,
+        })
 }
 
 struct ProfileLock(File);
@@ -902,18 +895,12 @@ fn read_calendar_file(path: &Path) -> Fallible<(LocalState, usize)> {
         }
         Err(error) => return Err(error.into()),
     };
-    if file.metadata()?.len() > PROFILE_LIMIT as u64 {
-        return Err(ProfileOpenIssue::CalendarTooLarge.into());
-    }
-    let mut limited = file.take(PROFILE_LIMIT as u64 + 1);
-    let parsed = serde_json::from_reader(io::BufReader::new(&mut limited));
-    if limited.limit() == 0 {
-        return Err(ProfileOpenIssue::CalendarTooLarge.into());
-    }
-    let state: LocalState = match parsed {
-        Ok(state) => state,
-        Err(error) if error.is_io() => return Err(error.into()),
-        Err(_) => return Err(ProfileOpenIssue::InvalidCalendar.into()),
+    let size = file.metadata()?.len();
+    let (state, bytes) = match read_profile_json::<LocalState>(file, size, PROFILE_LIMIT) {
+        Ok(decoded) => decoded,
+        Err(ProfileJsonError::Io(error)) => return Err(error.into()),
+        Err(ProfileJsonError::Syntax) => return Err(ProfileOpenIssue::InvalidCalendar.into()),
+        Err(ProfileJsonError::TooLarge) => return Err(ProfileOpenIssue::CalendarTooLarge.into()),
     };
     if let Some(workspace) = &state.workspace {
         if !workspace.valid_key_history() || workspace.is_revoked(state.device) {
@@ -924,7 +911,6 @@ fn read_calendar_file(path: &Path) -> Fallible<(LocalState, usize)> {
             .validate()
             .map_err(|_| ProfileOpenIssue::InvalidCalendar)?;
     }
-    let bytes = PROFILE_LIMIT + 1 - limited.limit() as usize;
     // Older JSON may omit defaulted fields. Measure the network form when
     // opening an existing calendar, even if the original file was compact.
     if let Some(workspace) = &state.workspace {
@@ -932,6 +918,54 @@ fn read_calendar_file(path: &Path) -> Fallible<(LocalState, usize)> {
             .map_err(|_| ProfileOpenIssue::CalendarTooLarge)?;
     }
     Ok((state, bytes))
+}
+
+#[derive(Debug)]
+enum ProfileJsonError {
+    Io(io::Error),
+    Syntax,
+    TooLarge,
+}
+
+fn read_profile_json<T: DeserializeOwned>(
+    reader: impl Read,
+    file_size: u64,
+    limit: usize,
+) -> Result<(T, usize), ProfileJsonError> {
+    if file_size > limit as u64 {
+        return Err(ProfileJsonError::TooLarge);
+    }
+    let mut limited = reader.take(limit as u64 + 1);
+    // Reuse serde's slice parser on small desktop profiles. The temporary
+    // buffer is released before the next file or the first frame is prepared.
+    const BUFFER_LIMIT: u64 = 2 * 1024 * 1024;
+    let parsed = if cfg!(feature = "desktop") && file_size <= BUFFER_LIMIT {
+        let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(file_size as usize + 1));
+        limited
+            .by_ref()
+            .take(file_size + 1)
+            .read_to_end(&mut bytes)
+            .map_err(ProfileJsonError::Io)?;
+        if bytes.len() as u64 <= file_size {
+            serde_json::from_slice(&bytes)
+        } else {
+            // A growing file must still reach EOF within the original hard limit.
+            serde_json::from_reader(bytes.as_slice().chain(io::BufReader::new(&mut limited)))
+        }
+    } else {
+        serde_json::from_reader(io::BufReader::new(&mut limited))
+    };
+    let bytes = limit + 1 - limited.limit() as usize;
+    if bytes > limit {
+        return Err(ProfileJsonError::TooLarge);
+    }
+    parsed.map(|value| (value, bytes)).map_err(|error| {
+        if error.is_io() {
+            ProfileJsonError::Io(error.into())
+        } else {
+            ProfileJsonError::Syntax
+        }
+    })
 }
 
 fn check_profile_file(path: &Path) -> Fallible<()> {
@@ -1139,6 +1173,29 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bounded_profile_json_uses_actual_input_length() {
+        let limit = 8;
+        for reported_size in [0, 3, limit as u64] {
+            assert_eq!(
+                read_profile_json::<u16>(&b"123"[..], reported_size, limit).unwrap(),
+                (123, 3)
+            );
+            assert!(matches!(
+                read_profile_json::<u16>(&b"123 4"[..], reported_size, limit),
+                Err(ProfileJsonError::Syntax)
+            ));
+            assert!(matches!(
+                read_profile_json::<u16>(&b"1        "[..], reported_size, limit),
+                Err(ProfileJsonError::TooLarge)
+            ));
+        }
+        assert!(matches!(
+            read_profile_json::<u16>(&b"1"[..], limit as u64 + 1, limit),
+            Err(ProfileJsonError::TooLarge)
+        ));
+    }
 
     #[test]
     fn calendar_subscription_wakes_only_for_committed_calendar_changes() {
