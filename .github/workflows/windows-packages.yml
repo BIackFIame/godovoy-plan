@@ -39,7 +39,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
-      contents: read
+      # GitHub requires push access to read a draft by ID. No project code runs here.
+      contents: write
     steps:
       - name: Получить четыре проверенных архива выбранного черновика
         env:
