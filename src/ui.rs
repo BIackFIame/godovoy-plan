@@ -3372,21 +3372,16 @@ impl App {
                     - OWNER_WIDTH
                     - 3.0 * ui.spacing().item_spacing.x)
                     .max(140.0);
-                ui.horizontal(|ui| {
-                    for (label, width) in [
+                let columns = ui.horizontal(|ui| {
+                    [
                         ("Неделя с", WEEK_WIDTH),
                         ("Дата", DATE_WIDTH),
                         ("Задача или событие", title_width),
                         ("Ответственный", OWNER_WIDTH),
-                    ] {
-                        agenda_cell(
-                            ui,
-                            width,
-                            18.0,
-                            RichText::new(label).size(12.0).color(MUTED),
-                        );
-                    }
-                });
+                    ].map(|(label, width)| {
+                        agenda_cell(ui, width, 18.0, RichText::new(label).size(12.0).color(MUTED))
+                    })
+                }).inner;
                 let snapshot = Arc::downgrade(workspace);
                 if !self.agenda.as_ref().is_some_and(|view| {
                     view.snapshot.ptr_eq(&snapshot)
@@ -3443,58 +3438,19 @@ impl App {
                             };
                             let week_start = row.date.week(chrono::Weekday::Mon).first_day();
                             let first = index == 0 || rows[index - 1].date < week_start;
-                            let band = ui
-                                .allocate_ui_with_layout(
-                                    vec2(table_width, LIST_ROW_HEIGHT),
-                                    Layout::left_to_right(Align::Center),
-                                    |ui| {
-                                        ui.set_min_size(vec2(table_width, LIST_ROW_HEIGHT));
-                                        agenda_cell(
-                                            ui,
-                                            WEEK_WIDTH,
-                                            36.0,
-                                            RichText::new(if first {
-                                                display_date(week_start)
-                                            } else {
-                                                String::new()
-                                            })
-                                            .size(12.0)
-                                            .color(MUTED),
-                                        );
-                                        agenda_cell(
-                                            ui,
-                                            DATE_WIDTH,
-                                            36.0,
-                                            RichText::new(display_date(row.date))
-                                                .size(13.0)
-                                                .color(item.date_color),
-                                        );
-                                        if item_button(
-                                            ui,
-                                            title_width,
-                                            item.headline,
-                                            &item.caption,
-                                        )
-                                        .clicked()
-                                        {
-                                            self.open_milestone(row);
-                                        }
-                                        agenda_cell(
-                                            ui,
-                                            OWNER_WIDTH,
-                                            36.0,
-                                            RichText::new(owner_name(
-                                                &workspace.calendar,
-                                                item.owner,
-                                            ))
-                                            .size(13.0)
-                                            .color(MUTED),
-                                        );
-                                    },
-                                )
-                                .response
-                                .rect;
-                            row_rule(ui, band);
+                            let owner = owner_name(&workspace.calendar, item.owner);
+                            let response = agenda_button(
+                                ui,
+                                &columns,
+                                row,
+                                &item,
+                                display_date(row.date),
+                                owner,
+                                first.then(|| display_date(week_start)),
+                            );
+                            if response.clicked() {
+                                self.open_milestone(row);
+                            }
                         }
                     });
             });
@@ -4134,7 +4090,7 @@ fn row_rule(ui: &Ui, rect: egui::Rect) {
     );
 }
 
-fn agenda_cell(ui: &mut Ui, width: f32, height: f32, text: RichText) {
+fn agenda_cell(ui: &mut Ui, width: f32, height: f32, text: RichText) -> egui::Rect {
     ui.allocate_ui_with_layout(
         vec2(width, height),
         Layout::left_to_right(Align::Center),
@@ -4143,7 +4099,67 @@ fn agenda_cell(ui: &mut Ui, width: f32, height: f32, text: RichText) {
             ui.add_space(8.0);
             ui.add(egui::Label::new(text).truncate());
         },
+    )
+    .response
+    .rect
+}
+
+fn agenda_button(
+    ui: &mut Ui,
+    columns: &[egui::Rect; 4],
+    row: AgendaItem,
+    item: &ItemLabel<'_>,
+    date: String,
+    owner: &str,
+    week: Option<String>,
+) -> egui::Response {
+    let width = columns[3].right() - columns[0].left();
+    let (_, band) = ui.allocate_space(vec2(width, LIST_ROW_HEIGHT));
+    let button = ui.interact(band, ui.id().with(row), egui::Sense::click());
+    let label = format!("{date}, {}, {}, {owner}", item.headline, item.caption);
+    button.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::WidgetType::Button, ui.is_enabled(), &label)
+    });
+    if button.hovered() {
+        ui.painter().rect_filled(band, 4, BACK);
+    }
+
+    let [week_cell, date_cell, title_cell, owner_cell] =
+        columns.map(|column| egui::Rect::from_x_y_ranges(column.x_range(), band.y_range()));
+    if let Some(week) = week {
+        paint_agenda_cell(ui, week_cell, RichText::new(week).size(12.0).color(MUTED));
+    }
+    paint_agenda_cell(
+        ui,
+        date_cell,
+        RichText::new(date).size(13.0).color(item.date_color),
     );
+    let text = egui::Rect::from_center_size(title_cell.center(), vec2(title_cell.width(), 44.0));
+    paint_item_text(ui, text, item.headline, &item.caption);
+    paint_agenda_cell(ui, owner_cell, RichText::new(owner).size(13.0).color(MUTED));
+    row_rule(ui, band);
+    if button.has_focus() {
+        ui.painter().rect_stroke(
+            band.shrink(1.0),
+            4,
+            Stroke::new(2.0, ACCENT),
+            egui::StrokeKind::Inside,
+        );
+    }
+    button
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+        .on_hover_text(label)
+}
+
+fn paint_agenda_cell(ui: &Ui, rect: egui::Rect, text: RichText) {
+    let galley = egui::WidgetText::from(text).into_galley(
+        ui,
+        Some(egui::TextWrapMode::Truncate),
+        (rect.width() - 8.0).max(0.0),
+        egui::TextStyle::Body,
+    );
+    let origin = rect.left_center() + vec2(8.0, -galley.size().y * 0.5);
+    ui.painter_at(rect).galley(origin, galley, INK);
 }
 
 fn item_button(ui: &mut Ui, width: f32, title: &str, caption: &str) -> egui::Response {
@@ -4158,6 +4174,12 @@ fn item_button(ui: &mut Ui, width: f32, title: &str, caption: &str) -> egui::Res
     if response.has_focus() {
         painter.rect_stroke(rect, 5, Stroke::new(2.0, ACCENT), egui::StrokeKind::Inside);
     }
+    paint_item_text(ui, rect, title, caption);
+    response.on_hover_text(full_label)
+}
+
+fn paint_item_text(ui: &Ui, rect: egui::Rect, title: &str, caption: &str) {
+    let painter = ui.painter_at(rect);
     for (text, font, color, y) in [
         (title, heading_font(14.0), INK, 3.0),
         (caption, egui::FontId::proportional(12.0), MUTED, 23.0),
@@ -4168,7 +4190,6 @@ fn item_button(ui: &mut Ui, width: f32, title: &str, caption: &str) -> egui::Res
         let galley = ui.fonts_mut(|fonts| fonts.layout_job(job));
         painter.galley(rect.min + vec2(8.0, y), galley, color);
     }
-    response.on_hover_text(full_label)
 }
 
 fn filter_name(calendar: &Calendar, filter: OwnerFilter) -> &str {

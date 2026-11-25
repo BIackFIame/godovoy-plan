@@ -784,3 +784,65 @@ fn a_task_deadline_reveals_its_checkbox_without_marking_it_complete() {
     assert!(app.reveal_task.is_none());
     assert!(Arc::ptr_eq(&before, &app.reader.snapshot().state));
 }
+
+#[test]
+fn agenda_exposes_one_button_across_the_task_row() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&directory.path().join("profile"));
+    let today = Local::now().date_naive();
+    let mut editor = Editor::new(today.year(), today);
+    editor.event.title = "Годовая выставка".into();
+    editor.event.owner = Some(app.reader.snapshot().state.device);
+    editor.event.tasks.push(Task {
+        id: Id::new_v4(),
+        title: "Согласовать поставку".into(),
+        days_before: 0,
+    });
+    app.save_event(&editor, false).unwrap();
+
+    app.page = Page::Agenda;
+    let ctx = egui::Context::default();
+    ctx.enable_accesskit();
+    crate::theme::setup(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut render = |events| {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(960.0, 600.0),
+            )),
+            events,
+            ..Default::default()
+        };
+        ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
+    };
+    render(Vec::new());
+    let tree = render(Vec::new()).platform_output.accesskit_update.unwrap();
+    let mut items = tree.nodes.iter().filter(|(_, node)| {
+        node.label()
+            .is_some_and(|label| label.contains("Согласовать поставку"))
+    });
+    let (_, button) = items.next().unwrap();
+    assert!(items.next().is_none());
+    assert_eq!(button.role(), egui::accesskit::Role::Button);
+    assert!(button.children().is_empty());
+    assert!(button.label().unwrap().contains("Анна"));
+    let rect = button.bounds().unwrap();
+    assert!(rect.width() > 800.0);
+    let point = egui::pos2((rect.x1 - 2.0) as f32, ((rect.y0 + rect.y1) * 0.5) as f32);
+    render(vec![egui::Event::PointerMoved(point)]);
+    for pressed in [true, false] {
+        render(vec![egui::Event::PointerButton {
+            pos: point,
+            button: egui::PointerButton::Primary,
+            pressed,
+            modifiers: egui::Modifiers::NONE,
+        }]);
+    }
+    assert!(app.page == Page::Calendar);
+    assert_eq!(app.selected, Some(editor.id));
+    assert_eq!(
+        app.reveal_task.unwrap().kind,
+        Milestone::Task(editor.event.tasks[0].id)
+    );
+}

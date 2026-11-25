@@ -5,14 +5,14 @@ use serde::{Deserialize, Serialize};
 
 use crate::model::{Calendar, Id, Occurrence, YearChange};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum Milestone {
     Preparation,
     Task(Id),
     Event,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 pub struct Reminder {
     pub date: NaiveDate,
     pub event: Id,
