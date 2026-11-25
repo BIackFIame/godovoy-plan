@@ -4,10 +4,24 @@ import SwiftUI
 struct GPYearWheel: View {
     let counts: [Int]
     @Binding var selected: Int?
+    @Environment(\.dynamicTypeSize) private var typeSize
     private let labels = ["янв", "фев", "мар", "апр", "май", "июн", "июл", "авг", "сен", "окт", "ноя", "дек"]
-    private let months = ["Январь", "Февраль", "Март", "Апрель", "Май", "Июнь", "Июль", "Август", "Сентябрь", "Октябрь", "Ноябрь", "Декабрь"]
     private func count(_ month: Int) -> Int { counts.indices.contains(month - 1) ? counts[month - 1] : 0 }
     var body: some View {
+        if typeSize.isAccessibilitySize {
+            Picker("Период", selection: $selected) {
+                Text("Весь год · \(counts.reduce(0, +))").tag(nil as Int?)
+                ForEach(1...12, id: \.self) { month in
+                    Text("\(GPDate.months[month - 1]) · \(count(month))").tag(Optional(month))
+                }
+            }
+            .pickerStyle(.menu)
+        } else {
+            wheel
+        }
+    }
+
+    private var wheel: some View {
         GeometryReader { frame in
             let side = min(frame.size.width, frame.size.height)
             let cx = frame.size.width / 2
@@ -32,12 +46,12 @@ struct GPYearWheel: View {
                     }
                     .buttonStyle(.plain).foregroundStyle(active ? Color.accentColor : Color.primary)
                     .position(x: cx + side * 0.407 * CGFloat(cos(angle)), y: cy + side * 0.407 * CGFloat(sin(angle)))
-                    .accessibilityLabel(months[month - 1]).accessibilityValue("Событий: \(total)")
+                    .accessibilityLabel(GPDate.months[month - 1]).accessibilityValue("Событий: \(total)")
                     .accessibilityAddTraits(active ? .isSelected : [])
                 }
                 Button { selected = nil } label: {
                     VStack(spacing: 2) {
-                        Text(selected.flatMap { months.indices.contains($0 - 1) ? months[$0 - 1] : nil } ?? "Весь год").font(.subheadline.weight(.medium))
+                        Text(selected.flatMap { GPDate.months.indices.contains($0 - 1) ? GPDate.months[$0 - 1] : nil } ?? "Весь год").font(.subheadline.weight(.medium))
                         Text(String(selected.map(count) ?? counts.reduce(0, +))).font(.title.bold().monospacedDigit())
                     }
                     .frame(minWidth: 54, minHeight: 54)

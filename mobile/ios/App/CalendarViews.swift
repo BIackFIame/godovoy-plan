@@ -14,12 +14,16 @@ struct CalendarView: View {
                 HStack { yearButton(-1); Spacer(); Text(String(model.year)).font(.title2.bold()).monospacedDigit(); Spacer(); yearButton(1) }
                 if let sections, search.isEmpty, sections.counts.contains(where: { $0 > 0 }) {
                     GPYearWheel(counts: sections.counts, selected: $month)
-                    if month != nil { Button("Показать весь год") { month = nil } }
+                }
+                if let month {
+                    if !search.isEmpty { Text("Поиск за месяц · \(GPDate.months[month - 1])").foregroundStyle(.secondary) }
+                    Button(search.isEmpty ? "Показать весь год" : "Искать во всём году") { self.month = nil }
+                        .accessibilityHint("Снять фильтр по месяцу")
                 }
             }
             if let sections {
                 if sections.rows.allSatisfy(\.isEmpty) {
-                    Text(search.isEmpty ? "Событий пока нет" : "Событий по этому запросу нет")
+                    Text(!search.isEmpty ? "Событий по этому запросу нет" : month == nil ? "В этом году пока нет событий" : "В выбранном месяце пока нет событий")
                         .foregroundStyle(.secondary)
                 }
                 ForEach(sections.rows.indices.filter { !sections.rows[$0].isEmpty }, id: \.self) { index in
@@ -37,7 +41,7 @@ struct CalendarView: View {
         .task(id: model.year) { await model.refresh() }
     }
     private func yearButton(_ delta: Int) -> some View {
-        Button { month = nil; model.year += delta } label: { Image(systemName: delta < 0 ? "chevron.left" : "chevron.right").frame(minWidth: 40, minHeight: 40) }.buttonStyle(.borderless).disabled(!(1900...9999).contains(model.year + delta)).accessibilityLabel(delta < 0 ? "Предыдущий год" : "Следующий год")
+        Button { month = nil; model.year += delta } label: { Image(systemName: delta < 0 ? "chevron.left" : "chevron.right").frame(minWidth: 44, minHeight: 44) }.buttonStyle(.borderless).disabled(!(1900...9999).contains(model.year + delta)).accessibilityLabel(delta < 0 ? "Предыдущий год" : "Следующий год")
     }
 }
 struct EventLink: View {
