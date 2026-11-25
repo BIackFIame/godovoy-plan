@@ -24,7 +24,10 @@ def extract_release(release, name, programs, directory):
     assert len(matches) == 1
     asset = matches[0]
     archive = directory / name
-    urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    if package_input := os.environ.get("GP_PACKAGE_INPUT"):
+        archive = Path(package_input) / name
+    else:
+        urllib.request.urlretrieve(asset["browser_download_url"], archive)
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     assert asset["digest"] == "sha256:" + digest and asset["size"] == archive.stat().st_size
     with zipfile.ZipFile(archive) as package:
@@ -77,9 +80,14 @@ def main():
     assert os.name == "nt" and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
     assert arch in ("x64", "x86", "ARM64")
     url = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tags/" + tag
-    with urllib.request.urlopen(url, timeout=30) as response:
-        release = json.load(response)
-    assert release["tag_name"] == tag and not release["draft"]
+    if package_input := os.environ.get("GP_PACKAGE_INPUT"):
+        release = json.loads((Path(package_input) / "release.json").read_bytes())
+        assert release["draft"] is True
+    else:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            release = json.load(response)
+        assert not release["draft"]
+    assert release["tag_name"] == tag
     version = tag[1:]
     # Inherit the dedicated NTFS volume ACL. TemporaryDirectory installs its own OWNER RIGHTS ACE.
     directory = Path(os.environ["GP_TEST_VOLUME"]) / ("GodovoyQA-" + uuid.uuid4().hex)

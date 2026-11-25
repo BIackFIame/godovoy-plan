@@ -11,9 +11,61 @@ on:
         type: choice
         default: all
         options: [all, x64, x86, ARM64]
+      draft_id:
+        description: Числовой ID черновика для проверки до выпуска
+        type: string
+        required: false
+      source_sha:
+        description: Полный хеш исходного коммита выбранного черновика
+        type: string
+        required: false
 permissions: {}
 jobs:
+  draft:
+    if: inputs.draft_id != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Получить четыре проверенных архива выбранного черновика
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DRAFT_ID: ${{ inputs.draft_id }}
+          TAG: ${{ inputs.tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          [[ "$DRAFT_ID" =~ ^[0-9]+$ && "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ && "$SOURCE_SHA" =~ ^[a-f0-9]{40}$ ]]
+          api="repos/$GITHUB_REPOSITORY/releases"
+          gh api "$api/$DRAFT_ID" > "$RUNNER_TEMP/metadata.json"
+          jq -e --arg tag "$TAG" --arg sha "$SOURCE_SHA" '.draft == true and .tag_name == $tag and .target_commitish == $sha' "$RUNNER_TEMP/metadata.json" >/dev/null
+          destination="$RUNNER_TEMP/windows-input"
+          mkdir "$destination"
+          cd "$destination"
+          jq '{tag_name,draft,assets:[.assets[]|{name,size,digest,id,state}]}' "$RUNNER_TEMP/metadata.json" > release.json
+          for suffix in Plan-Windows-x64 Plan-Windows-x86 Plan-Windows-ARM64 Server-Windows-x64; do
+            product="${suffix%%-*}"
+            name="Godovoy$product-${TAG#v}-${suffix#*-}.zip"
+            row=$(jq -ec --arg name "$name" '[.assets[]|select(.name==$name and .state=="uploaded")]|select(length==1)|.[0]' release.json)
+            digest=$(jq -er '.digest' <<< "$row")
+            id=$(jq -er '.id|numbers' <<< "$row")
+            [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
+            gh api "$api/assets/$id" -H 'Accept: application/octet-stream' > "$name"
+            echo "${digest#sha256:}  $name" | sha256sum --check --status
+          done
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: windows-input-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/windows-input/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
   smoke:
+    needs: draft
+    if: ${{ !cancelled() && (needs.draft.result == 'success' || needs.draft.result == 'skipped') }}
+    permissions:
+      actions: read
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +88,17 @@ jobs:
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH
-      - name: Проверить опубликованный пакет на Windows
+      - name: Получить проверенные архивы для этой машины
+        if: inputs.draft_id != ''
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $dir = Join-Path $env:RUNNER_TEMP 'windows-input'
+          gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name "windows-input-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --dir $dir
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "GP_PACKAGE_INPUT=$dir" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
+      - name: Проверить пакет на Windows
         shell: pwsh
         env:
           RELEASE_TAG: ${{ inputs.tag }}
