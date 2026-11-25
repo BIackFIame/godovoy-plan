@@ -14,7 +14,7 @@ pub(super) fn dates(calendar: &Calendar, member: Id, today: NaiveDate) -> Vec<Na
     let mut dates = BTreeSet::new();
     for event in (today.year()..=last_event.year()).flat_map(|year| calendar.occurrences(year)) {
         if event.event.owner.map(|id| calendar.person_for(id)) != Some(employee)
-            || (!event.event.tasks.is_empty() && event.completed() == event.event.tasks.len())
+            || (!event.event.tasks.is_empty() && !event.has_open_tasks())
         {
             continue;
         }

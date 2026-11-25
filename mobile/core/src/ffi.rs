@@ -1,6 +1,6 @@
 //! Ownership and thread contract at the Swift/JNI boundary.
 use crate::Mobile;
-use serde_json::{Value, json};
+use serde_json::json;
 use std::{
     cell::RefCell,
     ffi::{CStr, CString, c_char, c_void},
@@ -61,7 +61,7 @@ pub extern "C" fn gp_open_error() -> *mut c_char {
 /// command. Neither may be freed during this call. Free the result with gp_string_free.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gp_request(handle: *mut c_void, input: *const c_char) -> *mut c_char {
-    let result = catch_unwind(AssertUnwindSafe(|| -> godovoy_plan::Fallible<Value> {
+    let result = catch_unwind(AssertUnwindSafe(|| -> godovoy_plan::Fallible<String> {
         if input.is_null() || handle.is_null() {
             return Err("Профиль недоступен.".into());
         }
@@ -77,11 +77,13 @@ pub unsafe extern "C" fn gp_request(handle: *mut c_void, input: *const c_char) -
             .request(cmd)
     }));
     let response = match result {
-        Ok(Ok(data)) => json!({"ok":true,"data":data}),
-        Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}),
-        Err(_) => json!({"ok":false,"error":"Внутренняя ошибка. Откройте приложение заново."}),
+        Ok(Ok(data)) => data,
+        Ok(Err(error)) => json!({"ok":false,"error":error.to_string()}).to_string(),
+        Err(_) => {
+            json!({"ok":false,"error":"Внутренняя ошибка. Откройте приложение заново."}).to_string()
+        }
     };
-    CString::new(response.to_string()).map_or(ptr::null_mut(), CString::into_raw)
+    CString::new(response).map_or(ptr::null_mut(), CString::into_raw)
 }
 
 /// # Safety

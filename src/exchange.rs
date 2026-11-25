@@ -18,7 +18,7 @@ use crate::{
     Fallible,
     model::{Calendar, Id},
     network::merge_calendar,
-    storage::{CALENDAR_MESSAGE_LIMIT, LimitedWriter, SharedStore, Workspace, random_bytes},
+    storage::{CALENDAR_MESSAGE_LIMIT, LimitedWriter, SharedStore, Store, Workspace, random_bytes},
 };
 
 pub const EXCHANGE_EXTENSION: &str = "yrplan";
@@ -36,19 +36,37 @@ struct Packet<C = Calendar> {
     calendar: C,
 }
 
-pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
-    check_exchange_path(path)?;
-    let current = store.lock().unwrap().snapshot();
-    let workspace = current
+fn exchange_workspace(store: &Store) -> Fallible<&std::sync::Arc<Workspace>> {
+    store.ensure_current_generation()?;
+    let state = store.state();
+    let workspace = state
         .workspace
         .as_ref()
         .ok_or("Сначала подключитесь к календарю команды.")?;
-    if !workspace.calendar.members.contains_key(&current.device) {
+    workspace.require_device_access(state.device)?;
+    if !workspace.calendar.members.contains_key(&state.device) {
         return Err("Устройство отсутствует в списке участников календаря.".into());
     }
+    Ok(workspace)
+}
+
+fn verify_exchange_key(store: &Store, workspace: &Workspace) -> Fallible<()> {
+    let active = exchange_workspace(store)?;
+    if active.id != workspace.id || !bool::from(active.key.ct_eq(&workspace.key)) {
+        return Err("Календарь команды изменился. Повторите обмен.".into());
+    }
+    Ok(())
+}
+
+pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
+    check_exchange_path(path)?;
+    let (workspace, device) = {
+        let store = store.lock().unwrap();
+        (exchange_workspace(&store)?.clone(), store.state().device)
+    };
     let packet = Packet {
         workspace: workspace.id,
-        source: current.device,
+        source: device,
         calendar: &workspace.calendar,
     };
     let mut bytes = Zeroizing::new(Vec::new());
@@ -64,7 +82,7 @@ pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
     }
     encoder.finish()?;
     let nonce = random_bytes::<NONCE_SIZE>()?;
-    let tag = cipher(workspace)
+    let tag = cipher(&workspace)
         .encrypt_in_place_detached((&nonce).into(), MAGIC, &mut bytes)
         .map_err(|_| "Не удалось зашифровать файл обмена.")?;
 
@@ -79,10 +97,16 @@ pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
         writer.write_all(&tag)?;
         writer.sync_all()
     };
-    let mut output = tempfile::Builder::new()
-        .prefix(".godovoy-exchange-")
-        .tempfile_in(parent)?;
+    let mut output = {
+        let current = store.lock().unwrap();
+        verify_exchange_key(&current, &workspace)?;
+        tempfile::Builder::new()
+            .prefix(".godovoy-exchange-")
+            .tempfile_in(parent)?
+    };
     write_packet(output.as_file_mut())?;
+    let current = store.lock().unwrap();
+    verify_exchange_key(&current, &workspace)?;
     finish_export(output.persist_noclobber(path), path, write_packet)?;
     Ok(MAGIC.len() + NONCE_SIZE + bytes.len() + TAG_SIZE)
 }
@@ -128,32 +152,26 @@ fn export_error(error: io::Error) -> Box<dyn std::error::Error + Send + Sync> {
 
 pub fn import_file(store: &SharedStore, path: &Path) -> Fallible<bool> {
     check_exchange_path(path)?;
-    let current = store.lock().unwrap().snapshot();
-    let workspace = current
-        .workspace
-        .as_ref()
-        .ok_or("Сначала подключитесь к календарю команды.")?;
+    let workspace = {
+        let store = store.lock().unwrap();
+        exchange_workspace(&store)?.clone()
+    };
     let mut bytes = read_packet(path)?;
     let (prefix, rest) = bytes.split_at_mut(MAGIC.len());
     let (nonce, rest) = rest.split_at_mut(NONCE_SIZE);
     let (compressed, tag) = rest.split_at_mut(rest.len() - TAG_SIZE);
     let tag: &[u8; TAG_SIZE] = (&*tag).try_into()?;
     let nonce = XNonce::from_slice(nonce);
-    cipher(workspace)
+    cipher(&workspace)
         .decrypt_in_place_detached(nonce, prefix, compressed, tag.into())
         .map_err(|_| "Файл повреждён или принадлежит другому календарю.")?;
     let packet = decode(compressed)?;
     if packet.workspace != workspace.id {
         return Err("Файл принадлежит другому календарю.".into());
     }
-    let key = Zeroizing::new(workspace.key);
-    drop(current);
     let mut store = store.lock().unwrap();
-    if store.state().workspace.as_ref().is_none_or(|current| {
-        current.id != packet.workspace || !bool::from(current.key.ct_eq(&*key))
-    }) {
-        return Err("Календарь команды изменился. Откройте файл заново.".into());
-    }
+    verify_exchange_key(&store, &workspace)?;
+    drop(workspace);
     merge_calendar(
         &mut store,
         packet.workspace,
@@ -247,6 +265,32 @@ fn cipher(workspace: &Workspace) -> XChaCha20Poly1305 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_exchange_requires_the_active_key_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let profile = directory.path().join("profile");
+        let prior = Store::open(&profile).unwrap();
+        prior
+            .lock()
+            .unwrap()
+            .transaction(|state| state.create_workspace("Офис".into(), "Анна".into()))
+            .unwrap();
+        let old_file = directory.path().join("previous.yrplan");
+        export_file(&prior, &old_file).unwrap();
+        prior
+            .lock()
+            .unwrap()
+            .renew_workspace_key(&Default::default())
+            .unwrap();
+        let next_file = directory.path().join("next.yrplan");
+        assert!(export_file(&prior, &next_file).is_err());
+        assert!(!next_file.exists());
+        assert!(import_file(&prior, &old_file).is_err());
+        let active = Store::open_existing(&Store::active_directory(&profile).unwrap()).unwrap();
+        export_file(&active, &next_file).unwrap();
+        assert!(import_file(&active, &old_file).is_err());
+    }
 
     #[test]
     fn exclusive_fallback_releases_staging_and_preserves_existing_files() {

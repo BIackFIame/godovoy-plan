@@ -5,10 +5,12 @@ import static local.godovoyplan.mobile.CalendarApplication.message;
 import android.Manifest;
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.pm.PackageManager;
 import android.content.res.ColorStateList;
 import android.graphics.Typeface;
@@ -43,12 +45,15 @@ public final class MainActivity extends Activity {
     private CalendarApplication app;
     private LinearLayout root, body;
     JSONObject state = new JSONObject();
+    private final Map<String, String> memberNames = new HashMap<>();
     private boolean renderPending;
     private String section = "Год", selectedId = "", stateKey = "";
     int year = LocalDate.now().getYear();
     private int month, outstanding;
     private boolean active, loading;
+    private long refreshVersion;
     private AlertDialog dialog;
+    private boolean changingReminders;
     private TextView status;
     private ListView list;
     private int firstVisible, topOffset;
@@ -58,7 +63,33 @@ public final class MainActivity extends Activity {
                 return;
             if (!loading && outstanding == 0)
                 refresh(false);
-            clock.postDelayed(this, 12000);
+            schedulePoll();
+        }
+    };
+
+    private void schedulePoll() {
+        clock.removeCallbacks(poll);
+        if (active && !Boolean.FALSE.equals(state.opt("lanEnabled")))
+            clock.postDelayed(poll, 12000);
+    }
+    private String observedZone;
+    private boolean zoneCheckPending;
+    private final Runnable checkZone = () -> {
+        zoneCheckPending = false;
+        if (active) refresh(false);
+    };
+    private void zoneChanged() {
+        observedZone = TimeZone.getDefault().getID();
+        zoneCheckPending = true;
+        clock.removeCallbacks(checkZone);
+        // Chrono can reuse the previous zone for one second on its worker thread.
+        clock.postDelayed(checkZone, 1200);
+    }
+    private final BroadcastReceiver calendarClock = new BroadcastReceiver() {
+        @Override public void onReceive(Context context, Intent intent) {
+            if (!active) return;
+            if (Intent.ACTION_TIMEZONE_CHANGED.equals(intent.getAction())) zoneChanged();
+            refresh(true);
         }
     };
 
@@ -90,13 +121,26 @@ public final class MainActivity extends Activity {
     public void onStart() {
         super.onStart();
         active = true;
+        IntentFilter changes = new IntentFilter(Intent.ACTION_DATE_CHANGED);
+        changes.addAction(Intent.ACTION_TIME_CHANGED);
+        changes.addAction(Intent.ACTION_TIMEZONE_CHANGED);
+        if (Build.VERSION.SDK_INT >= 33)
+            registerReceiver(calendarClock, changes, Context.RECEIVER_NOT_EXPORTED);
+        else
+            registerReceiver(calendarClock, changes);
+        if (zoneCheckPending || !TimeZone.getDefault().getID().equals(observedZone))
+            zoneChanged();
         app.call(message("foreground"), null);
         refresh(true);
-        clock.postDelayed(poll, 12000);
+        schedulePoll();
     }
     @Override
     public void onStop() {
         active = false;
+        unregisterReceiver(calendarClock);
+        clock.removeCallbacks(checkZone);
+        refreshVersion++;
+        loading = false;
         clock.removeCallbacks(poll);
         app.call(message("background"), null);
         super.onStop();
@@ -202,10 +246,18 @@ public final class MainActivity extends Activity {
         return i < 0 ? code : CAT_NAMES[i];
     }
     String owner(String id) {
-        for (JSONObject m : items(array(state, "members")))
-            if (id.equals(str(m, "id")))
-                return str(m, "name");
-        return "";
+        return memberNames.getOrDefault(id, "");
+    }
+    private void replaceState(JSONObject next) {
+        if (state.optJSONArray("members") != next.optJSONArray("members")) {
+            memberNames.clear();
+            JSONArray members = next.optJSONArray("members");
+            for (int i = 0; members != null && i < members.length(); i++) {
+                JSONObject member = members.optJSONObject(i);
+                if (member != null) memberNames.put(str(member, "id"), str(member, "name"));
+            }
+        }
+        state = next;
     }
     String employeeLabel(JSONObject person) {
         String name = str(person, "name");
@@ -227,42 +279,96 @@ public final class MainActivity extends Activity {
     }
 
     private void refresh(boolean force) {
+        refresh(force, true);
+    }
+    private void refresh(boolean force, boolean conditional) {
+        final long version = ++refreshVersion;
         final int expected = year;
+        final JSONObject prior = state;
+        final String token = str(prior, "stateToken");
+        final boolean hasBase = conditional && !token.isEmpty() && prior.optInt("year") == expected;
+        final boolean acceptsStamp = hasBase && Boolean.TRUE.equals(prior.opt("supportsSyncStamp"));
+        JSONObject request = !hasBase ? message("state", "year", expected) :
+                acceptsStamp ? message("state", "year", expected, "ifToken", token, "acceptSyncStamp", true) :
+                message("state", "year", expected, "ifToken", token);
         loading = true;
-        String token = str(state, "stateToken");
-        JSONObject request = token.isEmpty() || state.optInt("year") != year
-                ? message("state", "year", year) : message("state", "year", year, "ifToken", token);
         app.call(request, (data, error) -> {
-            if (!alive())
+            if (!alive() || !active || version != refreshVersion)
                 return;
             loading = false;
+            if (expected != year) return;
             if (error != null) {
-                if (outstanding == 0)
-                    showError(error);
+                if (outstanding == 0) showError(error);
                 return;
             }
-            if (expected != year || !(data instanceof JSONObject))
-                return;
-            JSONObject next = (JSONObject) data;
-            if (next.optBoolean("unchanged")) {
-                if (force && token.equals(stateKey)) {
-                    ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
-                    if (renderPending && dialog == null)
-                        render();
+            if (data instanceof JSONObject) {
+                JSONObject next = (JSONObject) data;
+                if (next.has("syncStamp") || next.has("unchanged")) {
+                    if (hasBase && prior == state && token.equals(stateKey)) {
+                        if (Boolean.TRUE.equals(next.opt("unchanged")) && !next.has("syncStamp")) {
+                            if (force) {
+                                ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
+                                if (renderPending && dialog == null) render();
+                            }
+                            return;
+                        }
+                        JSONObject updated = acceptsStamp ? applySyncStamp(prior, next, expected, token) : null;
+                        if (updated != null) {
+                            replaceState(updated);
+                            stateKey = str(updated, "stateToken");
+                            if (force) ReminderSchedule.refresh(this, updated.optJSONArray("notificationDates"));
+                            if ("Доступ".equals(section) && selectedId.isEmpty()) renderPending = true;
+                            if (renderPending && dialog == null) render();
+                            return;
+                        }
+                    }
+                } else if (next.opt("year") instanceof Integer && next.optInt("year") == expected && next.optJSONArray("events") != null &&
+                        next.optJSONArray("tasks") != null) {
+                    String key = str(next, "stateToken");
+                    if (key.isEmpty()) key = next.toString();
+                    if (force || !key.equals(stateKey)) {
+                        renderPending = true;
+                        replaceState(next);
+                        schedulePoll();
+                        stateKey = key;
+                        ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
+                        if (dialog == null) render();
+                    }
+                    return;
                 }
-                return;
             }
-            String key = str(next, "stateToken");
-            if (key.isEmpty()) key = next.toString();
-            if (force || !key.equals(stateKey)) {
-                renderPending = true;
-                state = next;
-                stateKey = key;
-                ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
-                if (dialog == null)
-                    render();
-            }
+            if (hasBase) refresh(force, false);
+            else showError("Не удалось прочитать состояние календаря.");
         });
+    }
+
+    static JSONObject applySyncStamp(JSONObject prior, JSONObject update, int year, String token) {
+        Object nextToken = update.opt("stateToken");
+        Object stamp = update.opt("lastSync");
+        if (!Boolean.TRUE.equals(update.opt("syncStamp")) || update.has("unchanged") ||
+                !(update.opt("year") instanceof Integer) || update.optInt("year") != year ||
+                prior.optInt("year") != year || !token.equals(prior.opt("stateToken")) ||
+                !token.equals(update.opt("baseToken")) || !(nextToken instanceof String) ||
+                token.equals(nextToken) || !update.has("lastSync")) return null;
+        try {
+            if (!UUID.fromString((String)nextToken).toString().equals(nextToken)) return null;
+            if (stamp != JSONObject.NULL) {
+                if (!(stamp instanceof String)) return null;
+                java.time.OffsetDateTime.parse((String)stamp);
+            }
+            // Copy only top-level references; event and checklist arrays are shared.
+            JSONObject result = new JSONObject();
+            Iterator<String> keys = prior.keys();
+            while (keys.hasNext()) {
+                String name = keys.next();
+                result.put(name, prior.get(name));
+            }
+            result.put("lastSync", stamp);
+            result.put("stateToken", nextToken);
+            return result;
+        } catch (IllegalArgumentException | java.time.format.DateTimeParseException | org.json.JSONException invalid) {
+            return null;
+        }
     }
     void action(JSONObject command, CalendarApplication.Reply result) {
         if (outstanding != 0) {
@@ -278,15 +384,19 @@ public final class MainActivity extends Activity {
                 result.accept(data, error);
             else if (error != null)
                 feedback(error);
-            if (error == null)
-                refresh(true);
+            refresh(true);
         });
     }
 
     void showError(String error) {
         if (dialog != null)
             dialog.dismiss();
-        state = new JSONObject();
+        replaceState(new JSONObject());
+        month = 0;
+        section = "Год";
+        body = null;
+        status = null;
+        schedulePoll();
         stateKey = "";
         selectedId = "";
         resetList();
@@ -332,7 +442,6 @@ public final class MainActivity extends Activity {
     public void onBackPressed() {
         if (!selectedId.isEmpty()) {
             selectedId = "";
-            resetList();
             render();
         } else if (!"Год".equals(section))
             go("Год");
@@ -404,8 +513,8 @@ public final class MainActivity extends Activity {
     }
     void open(String id, int yr) {
         selectedId = id;
-        resetList();
         if (yr != year) {
+            resetList();
             renderPending = true;
             year = yr;
             refresh(true);
@@ -438,11 +547,16 @@ public final class MainActivity extends Activity {
         List<Row> rows = new ArrayList<>();
         int[] counts = new int[12];
         int previous = 0;
-        for (JSONObject e : items(array(state, "events"))) {
+        JSONArray events = array(state, "events");
+        for (int index = 0; index < events.length(); index++) {
+            JSONObject e = events.optJSONObject(index);
+            if (e == null) continue;
             String date = str(e, "date");
             if (date.length() != 10)
                 continue;
-            int m = LocalDate.parse(date).getMonthValue();
+            // The core returns canonical ISO dates. Only the two month digits are needed for grouping.
+            int m = (date.charAt(5) - '0') * 10 + date.charAt(6) - '0';
+            if (m < 1 || m > 12) continue;
             counts[m - 1]++;
             if (month != 0 && month != m)
                 continue;
@@ -473,10 +587,7 @@ public final class MainActivity extends Activity {
         });
     }
     private Row eventRow(JSONObject e) {
-        String who = owner(str(e, "employeeId"));
-        String date = pretty(str(e, "date"));
-        return new Row(str(e, "title"), date + (who.isEmpty() ? "" : "  ·  " + who), str(e, "id"),
-                e.optInt("year", year));
+        return new Row(str(e, "title"), null, str(e, "id"), e.optInt("year", year), e);
     }
     private void agenda() {
         List<Row> rows = new ArrayList<>();
@@ -489,16 +600,18 @@ public final class MainActivity extends Activity {
         if (rows.isEmpty())
             rows.add(new Row(section.equals("Задачи") ? "Сейчас нет личных задач" : "Сейчас нет напоминаний",
                     null, null, 0));
-        if (section.equals("Напоминания"))
-            body.addView(
-                    button(ReminderSchedule.enabled(this) ? "Выключить уведомления" : "Включить уведомления",
-                            this::toggleAlerts));
+        if (section.equals("Напоминания")) {
+            Button toggle = button(ReminderSchedule.enabled(this) ? "Выключить уведомления" : "Включить уведомления",
+                    this::toggleAlerts);
+            toggle.setEnabled(!changingReminders);
+            body.addView(toggle);
+        }
         displayRows(rows, null);
     }
     private void toggleAlerts() {
+        if (changingReminders) return;
         if (ReminderSchedule.enabled(this)) {
-            ReminderSchedule.disable(this);
-            render();
+            changeReminders(false);
             return;
         }
         if (Build.VERSION.SDK_INT >= 33
@@ -507,23 +620,38 @@ public final class MainActivity extends Activity {
             requestPermissions(new String[] {Manifest.permission.POST_NOTIFICATIONS}, ALERTS);
             return;
         }
-        ReminderSchedule.enable(this);
-        ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
+        changeReminders(true);
+    }
+    private void changeReminders(boolean enabled) {
+        if (changingReminders) return;
+        changingReminders = true;
+        JSONObject source = state;
         render();
+        app.setReminders(enabled, source.optJSONArray("notificationDates"), (ignored, error) -> {
+            changingReminders = false;
+            if (!alive()) return;
+            if (error != null) feedback(error);
+            else if (enabled && source != state)
+                ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
+            render();
+        });
     }
     @Override
     public void onRequestPermissionsResult(int code, String[] permissions, int[] grants) {
         super.onRequestPermissionsResult(code, permissions, grants);
         if (code == ALERTS && grants.length > 0 && grants[0] == PackageManager.PERMISSION_GRANTED) {
-            ReminderSchedule.enable(this);
-            ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
-            render();
+            changeReminders(true);
         }
     }
     static class Row {
-        String title, sub, id;
-        int year;
+        final String title, sub, id;
+        final int year;
+        final JSONObject event;
         Row(String t, String s, String i, int y) {
+            this(t, s, i, y, null);
+        }
+        Row(String t, String s, String i, int y, JSONObject event) {
+            this.event = event;
             title = t;
             sub = s;
             id = i;
@@ -568,8 +696,14 @@ public final class MainActivity extends Activity {
                 cell.setBackgroundColor(row.id == null ? BG : 0xffffffff);
                 TextView title = (TextView) cell.getChildAt(0), sub = (TextView) cell.getChildAt(1);
                 title.setText(row.title);
-                sub.setText(row.sub);
-                sub.setVisibility(row.sub == null ? View.GONE : View.VISIBLE);
+                String subtitle = row.sub;
+                if (row.event != null) {
+                    String who = owner(str(row.event, "employeeId"));
+                    String date = pretty(str(row.event, "date"));
+                    subtitle = who.isEmpty() ? date : date + "  ·  " + who;
+                }
+                sub.setText(subtitle);
+                sub.setVisibility(subtitle == null ? View.GONE : View.VISIBLE);
                 return cell;
             }
         });
@@ -897,8 +1031,8 @@ public final class MainActivity extends Activity {
                 feedback(error);
             else {
                 feedback(request == WRITE ? "Файл сохранён." : "Файл импортирован.");
-                refresh(true);
             }
+            refresh(true);
         };
         if (request == PICK)
             app.importDocument(uri, done);

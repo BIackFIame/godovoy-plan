@@ -364,20 +364,25 @@ fn paused_transport_releases_both_ports_and_failed_resume_can_be_cancelled() {
     // Both ports already belong to other sockets. A saved pause must still open.
     let network = Network::start(store, config).unwrap();
     assert!(network.paused());
+    assert!(!network.can_sync_automatically());
     assert!(network.address().is_none());
     assert!(network.set_profile_paused(false).is_err());
+    assert!(network.can_sync_automatically());
     assert!(network.paused());
     assert!(network.status().warning.is_some());
     network.set_profile_paused(true).unwrap();
+    assert!(!network.can_sync_automatically());
     drop(tcp);
     drop(udp);
     thread::sleep(Duration::from_millis(3100));
     let tcp = TcpListener::bind(tcp_addr).unwrap();
     let udp = UdpSocket::bind(udp_addr).unwrap();
     assert!(network.set_profile_paused(false).is_err());
+    assert!(network.can_sync_automatically());
     drop(tcp);
     // Allowed resume retries when the explicitly configured TCP port becomes free.
     eventually(|| !network.paused());
+    assert!(network.can_sync_automatically());
     assert!(network.address().is_some());
     assert!(TcpListener::bind(tcp_addr).is_err());
     assert!(network.status().warning.is_some());

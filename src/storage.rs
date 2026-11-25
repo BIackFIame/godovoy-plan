@@ -106,7 +106,7 @@ impl std::fmt::Display for StagingSizeLimit {
 
 impl std::error::Error for StagingSizeLimit {}
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ApiSettings {
     pub token: [u8; 32],
     #[serde(default)]
@@ -119,7 +119,7 @@ fn is_first_key(generation: &u64) -> bool {
     *generation == 0
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Workspace {
     pub id: Id,
     #[serde(default, skip_serializing_if = "is_first_key")]
@@ -135,7 +135,7 @@ pub struct Workspace {
     pub calendar: Calendar,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalState {
     pub device: Id,
     pub join_proof: [u8; 32],
@@ -260,6 +260,15 @@ impl LocalState {
             .as_ref()
             .map_or(0, |w| w.calendar.latest())
             .max(self.revision_floor.unwrap_or(0))
+    }
+
+    pub fn follow_event(&self, id: Id, year: i32) -> Fallible<crate::model::Occurrence<'_>> {
+        self.workspace
+            .as_ref()
+            .ok_or("Сначала подключитесь к пространству.")?
+            .calendar
+            .follow_event(id, year)
+            .ok_or_else(|| "Событие больше недоступно.".into())
     }
 
     pub fn workspace_mut(&mut self) -> Fallible<&mut Workspace> {

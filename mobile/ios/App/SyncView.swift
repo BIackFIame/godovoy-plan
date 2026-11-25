@@ -156,15 +156,15 @@ struct SyncView: View {
             let url = try await model.core.exportURL()
             sharedURL = url
             sharing = SharedFile(url: url)
-        } catch { model.failure = error.localizedDescription }
+        } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
     }
     private func exportPlan() async {
         workingFile = true; defer { workingFile = false }
-        do { exported = ExchangeDocument(data: try await model.core.exportFile()); showingExport = true } catch { model.failure = error.localizedDescription }
+        do { exported = ExchangeDocument(data: try await model.core.exportFile()); showingExport = true } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
     }
     private func importPlan(_ url: URL) async {
         workingFile = true; defer { workingFile = false }
-        do { try await model.core.importFile(url); await model.refresh(); message = "Обмен завершён" } catch { model.failure = error.localizedDescription }
+        do { try await model.core.importFile(url); await model.refresh(); message = "Обмен завершён" } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
     }
 }
 

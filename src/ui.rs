@@ -1451,16 +1451,17 @@ impl App {
         }
         let note = self.note.trim().to_owned();
         let result = self.store.lock().unwrap().transaction(|state| {
-            let revision = state.revision()?;
-            let calendar = &mut state.workspace_mut()?.calendar;
-            let event = calendar
-                .follow_event(id, year)
-                .ok_or("Событие больше недоступно.")?;
+            let event = state.follow_event(id, year)?;
             if event.note() != expected {
                 return Err(CHANGED.into());
             }
+            if event.note() == note {
+                return Ok(());
+            }
             let active_year = event.year;
-            calendar
+            let revision = state.revision()?;
+            state.workspace_mut()?
+                .calendar
                 .plans
                 .get_mut(&id)
                 .unwrap()
@@ -1479,16 +1480,17 @@ impl App {
 
     fn check(&mut self, id: Id, year: i32, task: Id, done: bool) {
         let result = self.store.lock().unwrap().transaction(|state| {
-            let revision = state.revision()?;
-            let calendar = &mut state.workspace_mut()?.calendar;
-            let event = calendar
-                .follow_event(id, year)
-                .ok_or("Событие больше недоступно.")?;
+            let event = state.follow_event(id, year)?;
             if !event.event.tasks.iter().any(|item| item.id == task) {
                 return Err("Пункт чек-листа был изменён.".into());
             }
+            if event.checked(task) == done {
+                return Ok(());
+            }
             let active_year = event.year;
-            calendar
+            let revision = state.revision()?;
+            state.workspace_mut()?
+                .calendar
                 .plans
                 .get_mut(&id)
                 .unwrap()
@@ -3637,14 +3639,21 @@ impl eframe::App for App {
             || self.notification.busy()
         {
             Duration::from_millis(250)
-        } else if (self.network.as_ref().is_ok() || self.api_controls.running_port().is_some())
+        } else if (self.network.as_ref().is_ok_and(Network::can_sync_automatically)
+            || self.api_controls.running_port().is_some())
             && !ctx.input(|input| input.viewport().minimized == Some(true))
         {
             // Other processes or peers can change the visible calendar.
             Duration::from_secs(2)
         } else {
+            // egui subtracts a predicted frame from repaint delays. Compensate
+            // when waiting for an absolute deadline to avoid spinning just before it.
+            let frame_lead = ctx.input(|input| {
+                Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default()
+            });
             self.next_reminder_check
                 .saturating_duration_since(Instant::now())
+                .saturating_add(frame_lead)
         };
         ctx.request_repaint_after(delay);
     }
@@ -4428,6 +4437,25 @@ mod design_interactions {
         });
         app.save_event(&source, false).unwrap();
         (app, source.id, task)
+    }
+
+    #[test]
+    fn repeated_task_and_note_preserve_calendar_snapshot() {
+        let directory = tempfile::tempdir().unwrap();
+        let (mut app, event, task) = copy_test_event(&directory.path().join("profile"));
+        app.check(event, 2027, task, true);
+        app.load_note((event, 2027), "");
+        app.note = "Согласовано".into();
+        app.save_note(event, 2027, "");
+        let before = app.reader.snapshot().state;
+
+        app.check(event, 2027, task, true);
+        app.save_note(event, 2027, "Согласовано");
+        let after = app.reader.snapshot().state;
+        assert!(Arc::ptr_eq(&before, &after));
+        let saved = after.follow_event(event, 2027).unwrap();
+        assert!(saved.checked(task));
+        assert_eq!(saved.note(), "Согласовано");
     }
 
     #[test]

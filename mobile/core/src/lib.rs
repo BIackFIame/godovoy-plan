@@ -11,14 +11,24 @@ use godovoy_plan::{
     network::{Config, Network},
     storage::{SharedStore, Store},
 };
-use serde::Deserialize;
-use serde_json::{Value, json};
+use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::BTreeSet,
     io,
     net::SocketAddrV4,
     path::{Path, PathBuf},
 };
+
+#[derive(Serialize)]
+struct Success<T> {
+    ok: bool,
+    data: T,
+}
+
+fn success(data: impl Serialize) -> Fallible<String> {
+    Ok(serde_json::to_string(&Success { ok: true, data })?)
+}
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -38,6 +48,8 @@ enum Command {
     State {
         year: i32,
         if_token: Option<Id>,
+        #[serde(default)]
+        accept_sync_stamp: bool,
     },
     CreateWorkspace {
         name: String,
@@ -245,14 +257,14 @@ impl Mobile {
             .ok_or_else(|| "Профиль недоступен.".into())
     }
 
-    fn request(&mut self, input: Value) -> Fallible<Value> {
+    fn request(&mut self, input: Value) -> Fallible<String> {
         self.refresh()?.verify_access()?;
         let session = self.session.as_mut().ok_or("Профиль недоступен.")?;
         if matches!(
             input.get("op").and_then(Value::as_str),
             Some("editEvent" | "deleteEvent")
         ) {
-            return editor::edit_event(&session.store, input);
+            return success(editor::edit_event(&session.store, input)?);
         }
         let cmd =
             serde_json::from_value::<Command>(input).map_err(|_| "Неверные параметры запроса.")?;
@@ -276,7 +288,11 @@ impl Mobile {
             }
         }
         match cmd {
-            Command::State { year, if_token } => return calendar::state(session, year, if_token),
+            Command::State {
+                year,
+                if_token,
+                accept_sync_stamp,
+            } => return calendar::state(session, year, if_token, accept_sync_stamp),
             Command::CreateWorkspace { name, employee } => {
                 session.store.lock().unwrap().transaction(|s| {
                     s.create_workspace(short_name(name)?, short_name(employee)?)
@@ -327,9 +343,9 @@ impl Mobile {
                 text,
                 base,
             } => calendar::note(&session.store, event_id, year, &text, base.as_deref())?,
-            Command::PairingRequest => return Ok(json!(session.net()?.pairing_request())),
+            Command::PairingRequest => return success(session.net()?.pairing_request()),
             Command::Invite { request } => {
-                return Ok(json!(session.net()?.make_invite(request.trim())?));
+                return success(session.net()?.make_invite(request.trim())?);
             }
             Command::Join {
                 code,
@@ -403,14 +419,14 @@ impl Mobile {
                 let output =
                     staging::directory(&self.initial)?.join(format!("{}.yrplan", Id::new_v4()));
                 exchange::export_file(&session.store, &output)?;
-                return Ok(json!(output));
+                return success(output);
             }
             Command::Import { path } => {
                 let path = staging::input_path(&self.initial, &path)?;
                 exchange::import_file(&session.store, &path)?;
             }
         }
-        Ok(Value::Null)
+        success(())
     }
 }
 

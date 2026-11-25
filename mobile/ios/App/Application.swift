@@ -1,3 +1,4 @@
+import Combine
 import SwiftUI
 import UIKit
 
@@ -9,42 +10,69 @@ import UIKit
     private var refreshVersion: UInt = 0
     let core = CalendarClient.shared
 
+    private enum Update { case full, stamp, unchanged }
+
     func snapshot(year: Int) async throws -> GPState {
-        let prior = state
-        switch try await read(year: year, prior: prior) {
-        case .state(let current): return current
-        case .unchanged:
-            guard let prior, prior.year == year else { throw GPError("Не удалось обновить календарь.") }
-            return prior
-        }
+        do { return try await read(year: year).0 }
+        catch { await refresh(silent: true); throw error }
     }
-    private func read(year: Int, prior: GPState?) async throws -> GPSnapshot {
-        var fields: GPCommand = ["op": .string("state"), "year": .integer(year)]
-        if let prior, prior.year == year, let token = prior.stateToken {
-            fields["ifToken"] = .string(token)
+
+    private func read(year: Int) async throws -> (GPState, Update) {
+        let full: GPCommand = ["op": .string("state"), "year": .integer(year)]
+        if let prior = state, prior.year == year, let token = prior.stateToken {
+            var request = full
+            request["ifToken"] = .string(token)
+            if prior.supportsSyncStamp == true { request["acceptSyncStamp"] = .flag(true) }
+            do {
+                let reply = try await core.value(request, as: GPSnapshot.self)
+                switch reply {
+                case .state(let current) where current.year == year: return (current, .full)
+                case .unchanged where state?.year == year && state?.stateToken == token:
+                    return (prior, .unchanged)
+                case .stamp(let stamp) where prior.supportsSyncStamp == true && state?.year == year && state?.stateToken == token:
+                    if let next = stamp.applying(to: prior, year: year, token: token) { return (next, .stamp) }
+                default: break
+                }
+            } catch is DecodingError {
+                // Recover from an incompatible conditional response with one full read.
+            }
         }
-        return try await core.value(fields, as: GPSnapshot.self)
+        guard case .state(let current) = try await core.value(full, as: GPSnapshot.self),
+              current.year == year else { throw GPError("Не удалось обновить календарь.") }
+        return (current, .full)
     }
+
     func refresh(silent: Bool = false) async {
         refreshVersion &+= 1
         let version = refreshVersion
         let requestedYear = year
         do {
-            let result = try await read(year: requestedYear, prior: state)
-            guard requestedYear == year && version == refreshVersion else { return }
-            switch result {
-            case .state(let current):
+            let (current, update) = try await read(year: requestedYear)
+            guard !Task.isCancelled && requestedYear == year && version == refreshVersion else { return }
+            switch update {
+            case .full:
                 state = current
                 GPReminderSchedule.refresh(dates: current.notificationDates)
+            case .stamp:
+                state = current
+                if !silent { GPReminderSchedule.refresh(dates: current.notificationDates) }
             case .unchanged:
-                if !silent, let state { GPReminderSchedule.refresh(dates: state.notificationDates) }
+                if !silent { GPReminderSchedule.refresh(dates: current.notificationDates) }
             }
         } catch {
-            guard version == refreshVersion && requestedYear == year else { return }
+            guard !Task.isCancelled && version == refreshVersion && requestedYear == year else { return }
             let wasShowingCalendar = state != nil
             state = nil
             GPReminderSchedule.refresh(dates: [])
             if !silent || wasShowingCalendar { failure = error.localizedDescription }
+        }
+    }
+    var needsPeerPolling: Bool { state?.lanEnabled != false }
+
+    func pollWhileNeeded() async {
+        while needsPeerPolling && !Task.isCancelled {
+            do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
+            if needsPeerPolling && !busy { await refresh(silent: true) }
         }
     }
     func run(_ op: String, _ fields: GPCommand = [:]) async -> Bool {
@@ -53,7 +81,7 @@ import UIKit
         defer { busy = false }
         var command = fields; command["op"] = .string(op)
         do { try await core.run(command); await refresh(); return true }
-        catch { failure = error.localizedDescription; return false }
+        catch { failure = error.localizedDescription; await refresh(silent: true); return false }
     }
     func copy(_ op: String, fields: GPCommand = [:]) async -> Bool {
         guard !busy else { return false }
@@ -62,14 +90,18 @@ import UIKit
         do {
             let text = try await core.value(command, as: String.self)
             UIPasteboard.general.setItems([["public.utf8-plain-text": text]], options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(15 * 60)])
+            await refresh(silent: true)
             return true
-        } catch { failure = error.localizedDescription; return false }
+        } catch { failure = error.localizedDescription; await refresh(silent: true); return false }
     }
 }
 
 @main struct GodovoyPlanApp: App {
     @StateObject private var model = CalendarModel()
     @Environment(\.scenePhase) private var phase
+    @State private var observedZone: String?
+    @State private var zoneCheck: UUID?
+    private var shouldPoll: Bool { phase == .active && model.needsPeerPolling }
     var body: some Scene {
         WindowGroup {
             ZStack {
@@ -98,12 +130,33 @@ import UIKit
             .task(id: phase) {
                 if phase == .background { try? await model.core.lifecycle(foreground: false); return }
                 guard phase == .active else { return }
+                let zone = TimeZone.autoupdatingCurrent.identifier
+                if observedZone != zone {
+                    observedZone = zone
+                    zoneCheck = UUID()
+                }
                 do { try await model.core.lifecycle(foreground: true) } catch { model.failure = error.localizedDescription }
                 await model.refresh()
-                while !Task.isCancelled {
-                    do { try await Task.sleep(nanoseconds: 4_000_000_000) } catch { return }
-                    if !model.busy { await model.refresh(silent: true) }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.significantTimeChangeNotification)
+                .merge(with: NotificationCenter.default.publisher(for: .NSSystemTimeZoneDidChange))) { notification in
+                let zone = TimeZone.autoupdatingCurrent.identifier
+                if notification.name == .NSSystemTimeZoneDidChange || zone != observedZone {
+                    observedZone = zone
+                    zoneCheck = UUID()
                 }
+                if phase == .active { Task { await model.refresh() } }
+            }
+            .task(id: phase == .active ? zoneCheck : nil) {
+                guard phase == .active, let expected = zoneCheck else { return }
+                // Chrono may reuse the old zone for one second after a rapid change.
+                do { try await Task.sleep(nanoseconds: 1_200_000_000) } catch { return }
+                guard !Task.isCancelled && zoneCheck == expected else { return }
+                await model.refresh(silent: true)
+                if !Task.isCancelled && zoneCheck == expected { zoneCheck = nil }
+            }
+            .task(id: shouldPoll) {
+                if shouldPoll { await model.pollWhileNeeded() }
             }
         }
     }

@@ -28,29 +28,57 @@ public final class ReminderSchedule {
     }
     // Keep the manifest default for upgrades from versions with active reminders.
     // A fresh or opted-out profile should not start on boot or clock changes.
-    static void configureReceiver(Context context, boolean enabled) {
+    private static void configureReceiver(Context context, boolean enabled, boolean durable) {
         PackageManager packages = context.getPackageManager();
         ComponentName receiver = new ComponentName(context, ReminderReceiver.class);
         int wanted = enabled ? PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
                              : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
         if (packages.getComponentEnabledSetting(receiver) != wanted) {
-            packages.setComponentEnabledSetting(receiver, wanted, PackageManager.DONT_KILL_APP);
+            int flags = PackageManager.DONT_KILL_APP;
+            if (durable && android.os.Build.VERSION.SDK_INT >= 30)
+                flags |= PackageManager.SYNCHRONOUS;
+            packages.setComponentEnabledSetting(receiver, wanted, flags);
         }
     }
-    public static synchronized void enable(Context context) {
-        configureReceiver(context, true);
-        preferences(context).edit().putBoolean("enabled", true).apply();
+    static synchronized void initialize(Context context) {
+        SharedPreferences pref = preferences(context);
+        boolean enabled = pref.getBoolean("enabled", false);
+        // Older versions kept future dates even for an unsubscribed profile.
+        if (!enabled && pref.contains("dates"))
+            pref.edit().remove("dates").apply();
+        configureReceiver(context, enabled, false);
+    }
+    public static synchronized void enable(Context context, JSONArray dates) {
         context.getSystemService(NotificationManager.class).createNotificationChannel(
                 new NotificationChannel(CHANNEL, "Напоминания календаря", NotificationManager.IMPORTANCE_DEFAULT));
+        SharedPreferences pref = preferences(context);
+        Set<String> next = validDates(dates);
+        // If the process stops between these operations, the receiver reads
+        // the persisted opt-in before arming anything on the next boot.
+        configureReceiver(context, true, true);
+        if (!pref.edit().putBoolean("enabled", true).putStringSet("dates", next).commit()) {
+            pref.edit().putBoolean("enabled", false).remove("dates").apply();
+            configureReceiver(context, false, true);
+            throw new IllegalStateException("Не удалось сохранить настройки напоминаний.");
+        }
         rearm(context);
     }
     public static synchronized void disable(Context context) {
-        preferences(context).edit().putBoolean("enabled", false).apply();
+        boolean saved = preferences(context).edit().putBoolean("enabled", false).remove("dates").commit();
         cancelAlarm(context);
-        configureReceiver(context, false);
+        configureReceiver(context, false, true);
         context.getSystemService(NotificationManager.class).cancel(1);
+        if (!saved) throw new IllegalStateException("Не удалось сохранить отключение напоминаний.");
     }
     public static synchronized void refresh(Context context, JSONArray dates) {
+        SharedPreferences pref = preferences(context);
+        if (!pref.getBoolean("enabled", false)) return;
+        Set<String> next = validDates(dates);
+        if (next.equals(pref.getStringSet("dates", null))) return;
+        pref.edit().putStringSet("dates", next).apply();
+        rearm(context);
+    }
+    private static Set<String> validDates(JSONArray dates) {
         Set<String> next = new HashSet<>();
         if (dates != null) {
             for (int i = 0; i < dates.length(); i++) {
@@ -58,10 +86,7 @@ public final class ReminderSchedule {
                 catch (DateTimeParseException ignored) { /* Only accept ISO calendar dates. */ }
             }
         }
-        SharedPreferences pref = preferences(context);
-        if (next.equals(pref.getStringSet("dates", null))) return;
-        pref.edit().putStringSet("dates", next).apply();
-        rearm(context);
+        return next;
     }
     private static PendingIntent alarmIntent(Context context, int flags) {
         Intent intent = new Intent(context, ReminderReceiver.class).setAction(ALARM);

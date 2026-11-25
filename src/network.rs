@@ -242,6 +242,15 @@ impl Network {
         self.core.paused.load(Ordering::Relaxed)
     }
 
+    /// A failed port rebind can resume a paused network without user input.
+    pub fn can_sync_automatically(&self) -> bool {
+        !self.paused()
+            || self.core.inbound.get().is_some_and(|input| {
+                // A successful retry clears its deadline before releasing the ports lock.
+                input.retry_at().is_some() || !self.paused()
+            })
+    }
+
     pub fn set_paused(&self, paused: bool) {
         let _ = self.core.change_pause(paused); // Network::status exposes any pending rebind.
     }

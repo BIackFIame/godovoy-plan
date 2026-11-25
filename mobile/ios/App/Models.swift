@@ -48,7 +48,9 @@ struct GPEvent: Decodable, Identifiable {
 struct GPReminder: Decodable { let eventId, title, date: String; let year: Int }
 struct GPState: Decodable {
     let deviceId: String
-    let workspaceName, address, networkError, lastSync, accessManagerId, stateToken: String?
+    let workspaceName, address, networkError, accessManagerId: String?
+    var lastSync, stateToken: String?
+    let supportsSyncStamp: Bool?
     let year: Int
     let lanEnabled: Bool?
     let canManage, paused: Bool
@@ -66,15 +68,51 @@ struct GPState: Decodable {
     func ownerName(_ id: String?) -> String? { members.first { $0.id == id }?.name }
 }
 
+struct GPSyncStamp: Decodable {
+    let year: Int
+    let baseToken, stateToken: String
+    let lastSync: String?
+
+    private enum CodingKeys: String, CodingKey { case year, baseToken, stateToken, lastSync }
+    init(from decoder: Decoder) throws {
+        let fields = try decoder.container(keyedBy: CodingKeys.self)
+        year = try fields.decode(Int.self, forKey: .year)
+        baseToken = try fields.decode(String.self, forKey: .baseToken)
+        stateToken = try fields.decode(String.self, forKey: .stateToken)
+        // An explicit null clears the displayed timestamp. A missing field is invalid.
+        lastSync = try fields.decode(String?.self, forKey: .lastSync)
+    }
+
+    func applying(to prior: GPState, year requestedYear: Int, token: String) -> GPState? {
+        guard prior.year == requestedYear, year == requestedYear, prior.stateToken == token,
+              baseToken == token, stateToken != token,
+              UUID(uuidString: stateToken)?.uuidString.lowercased() == stateToken else { return nil }
+        if let lastSync, ISO8601DateFormatter().date(from: lastSync) == nil { return nil }
+        var updated = prior
+        updated.stateToken = stateToken
+        updated.lastSync = lastSync
+        return updated
+    }
+}
+
 enum GPSnapshot: Decodable {
     case unchanged
+    case stamp(GPSyncStamp)
     case state(GPState)
 
-    private enum CodingKeys: String, CodingKey { case unchanged }
+    private enum CodingKeys: String, CodingKey { case unchanged, syncStamp }
 
     init(from decoder: Decoder) throws {
         let fields = try decoder.container(keyedBy: CodingKeys.self)
-        if try fields.decodeIfPresent(Bool.self, forKey: .unchanged) == true {
+        if fields.contains(.syncStamp) {
+            guard try fields.decode(Bool.self, forKey: .syncStamp), !fields.contains(.unchanged) else {
+                throw DecodingError.dataCorruptedError(forKey: .syncStamp, in: fields, debugDescription: "Conflicting snapshot markers")
+            }
+            self = .stamp(try GPSyncStamp(from: decoder))
+        } else if fields.contains(.unchanged) {
+            guard try fields.decode(Bool.self, forKey: .unchanged) else {
+                throw DecodingError.dataCorruptedError(forKey: .unchanged, in: fields, debugDescription: "Invalid conditional marker")
+            }
             self = .unchanged
         } else {
             self = .state(try GPState(from: decoder))

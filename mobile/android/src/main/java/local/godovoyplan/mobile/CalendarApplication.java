@@ -42,7 +42,7 @@ public final class CalendarApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
-        ReminderSchedule.configureReceiver(this, ReminderSchedule.enabled(this));
+        ReminderSchedule.initialize(this);
         profile = new File(getNoBackupFilesDir(), "profile");
     }
 
@@ -95,6 +95,14 @@ public final class CalendarApplication extends Application {
             if (reply != null)
                 ui.post(() -> reply.accept(data, error));
         });
+    }
+
+    void setReminders(boolean enabled, org.json.JSONArray dates, Reply reply) {
+        queue(worker, () -> {
+            if (enabled) ReminderSchedule.enable(this, dates);
+            else ReminderSchedule.disable(this);
+            return null;
+        }, reply);
     }
 
     void call(JSONObject command, Reply reply) {

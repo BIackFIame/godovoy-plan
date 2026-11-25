@@ -85,7 +85,9 @@ fn offline_calendar_file_and_abi_contracts() {
     phone.reject(json!({"op":"createWorkspace","employee":"Я","name":" "}));
     phone.ok(json!({"op":"createWorkspace","employee":"Ольга","name":"Офис"}));
     assert_eq!(
-        phone.ok(json!({"op":"state","year":2027,"ifToken":guarded["stateToken"]}))["workspaceName"],
+        phone.ok(
+            json!({"op":"state","year":2027,"ifToken":guarded["stateToken"],"acceptSyncStamp":true})
+        )["workspaceName"],
         "Офис"
     );
     phone.ok(event(&state["deviceId"]));
@@ -96,7 +98,7 @@ fn offline_calendar_file_and_abi_contracts() {
     let task = &first["checklist"][0]["id"];
     let id = &first["id"];
     phone.ok(json!({"op":"check","year":2027,"eventId":id,"taskId":task,"done":true}));
-    let changed = phone.ok(json!({"op":"state","year":2027,"ifToken":before_check["stateToken"]}));
+    let changed = phone.ok(json!({"op":"state","year":2027,"ifToken":before_check["stateToken"],"acceptSyncStamp":true}));
     assert_ne!(changed["stateToken"], before_check["stateToken"]);
     assert_eq!(changed["events"][0]["checklist"][0]["done"], true);
     let note = json!({"op":"note","year":2027,"eventId":id,"text":"Готово","base":""});
@@ -347,7 +349,9 @@ fn fresh_profile_waits_for_an_explicit_local_choice() {
         phone.request(json!({"op":op})).unwrap();
         assert!(phone.session.as_ref().unwrap().network.is_none());
     }
-    assert!(phone.request(json!({"op":"state","year":2027})).unwrap()["address"].is_null());
+    let response = phone.request(json!({"op":"state","year":2027})).unwrap();
+    let envelope: Value = serde_json::from_str(&response).unwrap();
+    assert!(envelope["data"].get("address").unwrap().is_null());
     phone.request(json!({"op":"pairingRequest"})).unwrap();
     let session = phone.session.as_ref().unwrap();
     assert!(session.network.is_some());

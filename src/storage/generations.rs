@@ -151,7 +151,7 @@ impl Store {
         self.successor.clone()
     }
 
-    pub(super) fn ensure_current_generation(&self) -> Fallible<()> {
+    pub(crate) fn ensure_current_generation(&self) -> Fallible<()> {
         if self.successor.is_some() {
             return Err("Доступ перевыпущен. Изменения принимаются в активном профиле.".into());
         }

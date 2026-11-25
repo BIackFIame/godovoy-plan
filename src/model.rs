@@ -16,7 +16,7 @@ pub struct Revision {
     pub operation: Id,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Record<T> {
     pub revision: Revision,
     pub value: T,
@@ -50,14 +50,14 @@ impl Category {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: Id,
     pub title: String,
     pub days_before: u16,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub title: String,
     #[serde(default)]
@@ -70,14 +70,14 @@ pub struct Event {
     pub tasks: Vec<Task>,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub enum YearChange {
     UseTemplate,
     Edit(Arc<Event>),
     Cancel,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct YearRecord {
     pub change: Option<Record<YearChange>>,
     pub checks: BTreeMap<Id, Record<bool>>,
@@ -109,7 +109,7 @@ pub struct ExternalSource {
     pub external_id: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Plan {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source: Option<ExternalSource>,
@@ -270,6 +270,10 @@ impl<'a> Occurrence<'a> {
             .is_some_and(|r| r.value)
     }
 
+    pub fn has_open_tasks(self) -> bool {
+        self.event.tasks.iter().any(|task| !self.checked(task.id))
+    }
+
     pub fn completed(self) -> usize {
         self.event
             .tasks
@@ -294,7 +298,7 @@ impl<'a> Occurrence<'a> {
     pub fn needs_attention(self, today: NaiveDate, member: Id) -> bool {
         self.event.owner == Some(member)
             && self.preparation_date() <= today
-            && (self.completed() < self.event.tasks.len()
+            && (self.has_open_tasks()
                 || (self.event.tasks.is_empty() && self.date >= today))
     }
 }
@@ -304,7 +308,7 @@ fn date_before(date: NaiveDate, days: u16) -> NaiveDate {
         .unwrap_or(NaiveDate::MIN)
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Calendar {
     pub members: BTreeMap<Id, Record<String>>,
     pub plans: BTreeMap<Id, Plan>,

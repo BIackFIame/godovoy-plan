@@ -132,7 +132,7 @@ pub fn agenda(
         }
         let preparation = event.preparation_date();
         if in_range.contains(&preparation)
-            && (event.event.tasks.is_empty() || event.completed() < event.event.tasks.len())
+            && (event.event.tasks.is_empty() || event.has_open_tasks())
         {
             result.push(item(event, preparation, Milestone::Preparation));
         }
