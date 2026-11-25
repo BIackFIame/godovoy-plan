@@ -27,11 +27,21 @@ $env:PATH = "$work\tools;$work\tools-venv\Scripts;$env:PATH"
 $env:CC = 'cl'
 $env:CXX = 'cl'
 meson setup build mesa-26.3.1 --buildtype=release --wrap-mode=nodownload -Db_vscrt=mt -Dgallium-drivers=softpipe '-Dvulkan-drivers=' '-Dplatforms=windows' -Dllvm=disabled -Dzstd=disabled -Dzlib=disabled -Dxmlconfig=disabled -Dexpat=disabled
-meson compile -C build
+ninja -C build src/gallium/targets/wgl/libgallium_wgl.dll src/gallium/targets/libgl-gdi/opengl32.dll
 $dest = New-Item -ItemType Directory (Join-Path $work 'runtime')
 foreach ($name in 'opengl32.dll','libgallium_wgl.dll') {
     $files = @(Get-ChildItem build -Recurse -File -Filter $name)
     if ($files.Count -ne 1) { throw "Expected one built $name" }
     Copy-Item $files[0].FullName $dest
 }
+Copy-Item -Recurse 'mesa-26.3.1/licenses' $dest
+Copy-Item 'mesa-26.3.1/docs/license.rst' "$dest/Mesa-license.rst"
+Copy-Item (Join-Path $PSScriptRoot 'software-renderer.md') "$dest/README.md"
+$manifest = foreach ($name in 'opengl32.dll','libgallium_wgl.dll') {
+    "$((Get-FileHash (Join-Path $dest $name)).Hash.ToLowerInvariant())  $name"
+}
+$manifest | Set-Content -Encoding ascii "$dest/SHA256SUMS.txt"
+$artifact = New-Item -ItemType Directory (Join-Path $work 'artifact')
+Compress-Archive -Path "$dest/*" -DestinationPath "$artifact/Mesa-26.3.1-Softpipe-Windows-$Arch.zip"
+"GP_RENDERER_ARCHIVE=$artifact" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
 "GP_TEST_RENDERER=$dest" | Out-File -Append -Encoding utf8 $env:GITHUB_ENV
