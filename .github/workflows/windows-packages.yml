@@ -75,9 +75,30 @@ jobs:
           retention-days: 1
           compression-level: 0
           if-no-files-found: error
+  renderer-source:
+    if: inputs.scope == 'full' && inputs.renderer_run == ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - name: Скачать и сверить исходные архивы
+        run: |
+          set -euo pipefail
+          mkdir "$RUNNER_TEMP/renderer-source"
+          cd "$RUNNER_TEMP/renderer-source"
+          curl --fail --location --retry 2 --connect-timeout 15 --max-time 150 -o mesa.tar.xz https://archive.mesa3d.org/mesa-26.3.1.tar.xz
+          curl --fail --location --retry 2 --connect-timeout 15 --max-time 60 -o flex.zip https://github.com/lexxmark/winflexbison/releases/download/v2.5.25/win_flex_bison-2.5.25.zip
+          echo '4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961  mesa.tar.xz' | sha256sum -c
+          echo '8d324b62be33604b2c45ad1dd34ab93d722534448f55a16ca7292de32b6ac135  flex.zip' | sha256sum -c
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        with:
+          name: renderer-source-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/renderer-source/
+          retention-days: 1
+          compression-level: 0
+          if-no-files-found: error
   smoke:
-    needs: draft
-    if: ${{ !cancelled() && (needs.draft.result == 'success' || needs.draft.result == 'skipped') }}
+    needs: [draft, renderer-source]
+    if: ${{ !cancelled() && !contains(needs.*.result, 'failure') }}
     permissions:
       actions: read
     strategy:
@@ -85,7 +106,7 @@ jobs:
       matrix:
         arch: ${{ fromJSON(inputs.architecture == 'all' && '["x64","x86","ARM64"]' || format('["{0}"]', inputs.architecture)) }}
     runs-on: ${{ matrix.arch == 'ARM64' && 'windows-11-arm' || 'windows-2022' }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
       - name: Скачать скрипт проверки на текущем коммите
         shell: pwsh
@@ -111,7 +132,12 @@ jobs:
         shell: pwsh
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
-        run: ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $source = Join-Path $env:RUNNER_TEMP 'renderer-source'
+          gh run download $env:GITHUB_RUN_ID --repo $env:GITHUB_REPOSITORY --name "renderer-source-$env:GITHUB_RUN_ID-$env:GITHUB_RUN_ATTEMPT" --dir $source
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH -Source $source
       - name: Получить проверенные архивы для этой машины
         if: inputs.draft_id != ''
         shell: pwsh

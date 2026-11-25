@@ -1,5 +1,5 @@
 # Build the CI VM's software OpenGL driver. No system files or registry entries are changed.
-param([ValidateSet('x86','x64','ARM64')][string]$Arch)
+param([ValidateSet('x86','x64','ARM64')][string]$Arch, [Parameter(Mandatory)][string]$Source)
 $ErrorActionPreference = 'Stop'
 $PSNativeCommandUseErrorActionPreference = $true
 if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hosted') {
@@ -7,12 +7,14 @@ if ($env:GITHUB_ACTIONS -ne 'true' -or $env:RUNNER_ENVIRONMENT -ne 'github-hoste
 }
 $work = New-Item -ItemType Directory (Join-Path $env:RUNNER_TEMP 'gp-test-renderer')
 Set-Location $work
-function Download-Verified($Uri, $File, $Sha256) {
-    curl.exe --fail --silent --show-error --location --retry 3 $Uri --output $File
+function Copy-Verified($File, $Sha256) {
+    Write-Host "Checking $File"
+    Copy-Item -LiteralPath (Join-Path $Source $File) -Destination $File
     if ((Get-FileHash $File).Hash -ne $Sha256) { throw "Digest mismatch for $File" }
 }
-Download-Verified 'https://archive.mesa3d.org/mesa-26.3.1.tar.xz' 'mesa.tar.xz' '4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961'
-Download-Verified 'https://github.com/lexxmark/winflexbison/releases/download/v2.5.25/win_flex_bison-2.5.25.zip' 'flex.zip' '8d324b62be33604b2c45ad1dd34ab93d722534448f55a16ca7292de32b6ac135'
+Copy-Verified 'mesa.tar.xz' '4e4e438eac7b840a9383988cbb7c08dad8041da544b9319fc26d319fa7348961'
+Copy-Verified 'flex.zip' '8d324b62be33604b2c45ad1dd34ab93d722534448f55a16ca7292de32b6ac135'
+Write-Host 'Extracting Mesa and winflexbison'
 tar.exe -xf mesa.tar.xz
 Expand-Archive flex.zip tools
 python -m venv tools-venv
