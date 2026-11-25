@@ -32,6 +32,47 @@ fn template(owner: Id, date: NaiveDate) -> Event {
 }
 
 #[test]
+fn personal_tasks_follow_year_specific_owners_and_their_linked_devices() {
+    use godovoy_plan::planning::personal_events;
+
+    let (colleague, employee, phone, event_id) = (
+        Id::from_u128(1),
+        Id::from_u128(2),
+        Id::from_u128(3),
+        Id::from_u128(4),
+    );
+    let rev = Revision {
+        operation: phone,
+        sequence: 1,
+    };
+    let mut calendar: Calendar = serde_json::from_value(serde_json::json!({
+        "members": {}, "plans": {},
+        "device_people": {(phone.to_string()): Record::new(rev, employee)}
+    }))
+    .unwrap();
+    let plan = calendar.plans.entry(event_id).or_default();
+    plan.templates.insert(
+        2025,
+        Record::new(rev, Some(template(colleague, date(2025, 12, 20)).into())),
+    );
+    plan.years.entry(2025).or_default().change = Some(Record::new(
+        rev,
+        YearChange::Edit(template(phone, date(2025, 12, 22)).into()),
+    ));
+    let today = date(2026, 1, 3);
+    for member in [employee, phone] {
+        let events = personal_events(&calendar, today, member);
+        assert_eq!(events.len(), 1);
+        assert_eq!(
+            (events[0].id, events[0].date),
+            (event_id, date(2025, 12, 22))
+        );
+        assert!(events[0].overridden);
+    }
+    assert!(personal_events(&calendar, today, colleague).is_empty());
+}
+
+#[test]
 fn preparation_and_deadlines_recur_with_new_checklist() {
     let mut calendar = Calendar::default();
     let id = Id::new_v4();

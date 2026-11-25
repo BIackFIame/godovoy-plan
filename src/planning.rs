@@ -3,7 +3,7 @@ use std::ops::RangeInclusive;
 use chrono::{Datelike, Days, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::model::{Calendar, Id, Occurrence};
+use crate::model::{Calendar, Id, Occurrence, YearChange};
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 pub enum Milestone {
@@ -78,14 +78,36 @@ fn through(date: NaiveDate, days: u64) -> NaiveDate {
 
 pub fn personal_events(calendar: &Calendar, today: NaiveDate, member: Id) -> Vec<Occurrence<'_>> {
     let employee = calendar.person_for(member);
-    let mut events: Vec<_> = (today.year() - 1..=through(today, 366).year())
-        .flat_map(|year| calendar.occurrences(year))
-        .filter(|event| {
-            event.event.owner.is_some_and(|owner| {
-                calendar.person_for(owner) == employee && event.needs_attention(today, owner)
+    let years = today.year() - 1..=through(today, 366).year();
+    let is_employee = |id| calendar.person_for(id) == employee;
+    let mut events = Vec::new();
+    for (&id, plan) in &calendar.plans {
+        // Most plans have one template. Only an edit in a particular year can
+        // assign one of its occurrences to a different employee.
+        if plan.templates.len() == 1
+            && let Some((_, template)) = plan.templates.first_key_value()
+            && !template
+                .value
+                .as_ref()
+                .and_then(|event| event.owner)
+                .is_some_and(is_employee)
+            && !plan.years.range(years.clone()).any(|(_, record)| {
+                matches!(record.change.as_ref().map(|r| &r.value),
+                    Some(YearChange::Edit(event)) if event.owner.is_some_and(is_employee))
             })
-        })
-        .collect();
+        {
+            continue;
+        }
+        for year in years.clone() {
+            if let Some(event) = plan.event(id, year)
+                && let Some(owner) = event.event.owner
+                && is_employee(owner)
+                && event.needs_attention(today, owner)
+            {
+                events.push(event);
+            }
+        }
+    }
     events.sort_unstable_by_key(|event| (event.date, event.id));
     events
 }
