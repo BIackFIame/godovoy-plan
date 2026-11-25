@@ -1122,7 +1122,7 @@ impl App {
         usage: ProfileUsage,
     ) {
         ui.horizontal(|ui| {
-            title(ui, "События", SECTION_TITLE_SIZE);
+            title(ui, "События за год", SECTION_TITLE_SIZE);
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 muted(ui, event_count(events.len()))
             });
@@ -3337,7 +3337,7 @@ impl App {
                     for (label, width) in [
                         ("Неделя с", WEEK_WIDTH),
                         ("Дата", DATE_WIDTH),
-                        ("Событие и этап", title_width),
+                        ("Задача или событие", title_width),
                         ("Ответственный", OWNER_WIDTH),
                     ] {
                         agenda_cell(
@@ -3399,9 +3399,7 @@ impl App {
                     .show_rows(ui, LIST_ROW_HEIGHT, rows.len(), |ui, range| {
                         for index in range {
                             let row = rows[index];
-                            let Some((event, caption, date_color)) =
-                                resolve_item(state, row, today)
-                            else {
+                            let Some(item) = resolve_item(state, row, today) else {
                                 continue;
                             };
                             let week_start = row.date.week(chrono::Weekday::Mon).first_day();
@@ -3430,13 +3428,13 @@ impl App {
                                             36.0,
                                             RichText::new(display_date(row.date))
                                                 .size(13.0)
-                                                .color(date_color),
+                                                .color(item.date_color),
                                         );
                                         if item_button(
                                             ui,
                                             title_width,
-                                            &event.event.title,
-                                            &caption,
+                                            item.headline,
+                                            &item.caption,
                                         )
                                         .clicked()
                                         {
@@ -3448,7 +3446,7 @@ impl App {
                                             36.0,
                                             RichText::new(owner_name(
                                                 &workspace.calendar,
-                                                event.event.owner,
+                                                item.owner,
                                             ))
                                             .size(13.0)
                                             .color(MUTED),
@@ -3577,7 +3575,7 @@ impl App {
                     .auto_shrink([false, false])
                     .show_rows(ui, LIST_ROW_HEIGHT, pending.len(), |ui, range| {
                         for &row in &pending[range] {
-                            let Some((event, caption, date_color)) = resolve_item(state, row, today) else {
+                            let Some(item) = resolve_item(state, row, today) else {
                                 continue;
                             };
                             let width = ui.available_width();
@@ -3589,14 +3587,14 @@ impl App {
                                         ui.set_min_size(vec2(width, LIST_ROW_HEIGHT));
                                         let date = RichText::new(short_date(row.date))
                                             .size(13.0)
-                                            .color(date_color);
+                                            .color(item.date_color);
                                         agenda_cell(ui, DATE_WIDTH, crate::theme::CONTROL_HEIGHT, date);
                                         let item_width = ui.available_width() - ui.spacing().item_spacing.x - ACTION_WIDTH;
                                         if item_button(
                                             ui,
                                             item_width,
-                                            &event.event.title,
-                                            &caption,
+                                            item.headline,
+                                            &item.caption,
                                         )
                                         .clicked()
                                         {
@@ -4142,26 +4140,39 @@ fn filter_name(calendar: &Calendar, filter: OwnerFilter) -> &str {
     }
 }
 
+struct ItemLabel<'a> {
+    headline: &'a str,
+    caption: std::borrow::Cow<'a, str>,
+    date_color: egui::Color32,
+    owner: Option<Id>,
+}
+
 fn resolve_item(
     state: &LocalState,
     row: AgendaItem,
     today: NaiveDate,
-) -> Option<(Occurrence<'_>, String, egui::Color32)> {
+) -> Option<ItemLabel<'_>> {
     let event = state
         .workspace
         .as_ref()?
         .calendar
         .event(row.event, row.year)?;
-    let (caption, color) = match row.kind {
-        Milestone::Preparation => ("Начало подготовки".to_owned(), MUTED),
-        Milestone::Event => ("Событие".to_owned(), MUTED),
+    let title = event.event.title.as_str();
+    let (headline, caption, date_color) = match row.kind {
+        Milestone::Preparation => (title, "Начало подготовки".into(), MUTED),
+        Milestone::Event => (title, "Событие".into(), MUTED),
         Milestone::Task(id) => {
             let task = event.event.tasks.iter().find(|task| task.id == id)?;
             let (status, color) = task_alert(row.date, today).unwrap_or(("Срок", MUTED));
-            (format!("{status} · {}", task.title), color)
+            (task.title.as_str(), format!("{status} · {title}").into(), color)
         }
     };
-    Some((event, caption, color))
+    Some(ItemLabel {
+        headline,
+        caption,
+        date_color,
+        owner: event.event.owner,
+    })
 }
 
 fn owner_name(calendar: &Calendar, id: Option<Id>) -> &str {

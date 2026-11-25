@@ -719,7 +719,7 @@ fn compact_calendar_keeps_the_list_and_sync_navigation_visible() {
                 .unwrap_or_else(|| panic!("Надпись «{prefix}» недоступна при {size:?}"))
         };
         assert!(label("Напоминания").right() < label("Синхронизация").left());
-        assert!(label("События").left() > label("Годовой круг").right());
-        assert!(label("События").bottom() < size.y - 46.0);
+        assert!(label("События за год").left() > label("Годовой круг").right());
+        assert!(label("События за год").bottom() < size.y - 46.0);
     }
 }
