@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeSet, HashMap},
     net::SocketAddrV4,
     path::PathBuf,
     sync::{
@@ -246,7 +246,7 @@ struct NoteDraft {
 pub(crate) struct CalendarRow {
     pub(crate) id: Id,
     pub(crate) date: NaiveDate,
-    pub(crate) title: String,
+    pub(crate) title: Arc<str>,
     pub(crate) category: Category,
 }
 
@@ -256,6 +256,7 @@ struct CalendarView {
     search: String,
     category: Option<Category>,
     rows: Arc<[CalendarRow]>,
+    normalized_titles: Option<HashMap<Id, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -812,6 +813,12 @@ impl App {
             });
     }
 
+    fn release_search_index(&mut self) {
+        if let Some(view) = &mut self.calendar_view {
+            view.normalized_titles = None;
+        }
+    }
+
     fn calendar_rows(&mut self, workspace: &Arc<Workspace>) -> Arc<[CalendarRow]> {
         let calendar = &workspace.calendar;
         let snapshot = Arc::downgrade(workspace);
@@ -824,30 +831,45 @@ impl App {
         {
             return Arc::clone(&view.rows);
         }
-        let matches = |category, title: &str| {
+        let mut previous = self
+            .calendar_view
+            .take()
+            .filter(|view| view.snapshot.ptr_eq(&snapshot) && view.year == self.year);
+        // A pasted query and the first character need no index. Build it only as
+        // the user continues the search, and release it when the search is cleared.
+        let mut normalized_titles = previous
+            .as_mut()
+            .filter(|view| !view.search.is_empty() && !search.is_empty())
+            .map(|view| view.normalized_titles.take().unwrap_or_default());
+        let mut matches = |id, category, title: &str| {
             self.category.is_none_or(|selected| selected == category)
-                && (search.is_empty() || search_key(title).contains(&search))
+                && (search.is_empty()
+                    || match &mut normalized_titles {
+                        Some(titles) => titles
+                            .entry(id)
+                            .or_insert_with(|| search_key(title))
+                            .contains(&search),
+                        None => search_key(title).contains(&search),
+                    })
         };
-        let rows: Arc<[CalendarRow]> = if let Some(previous) = &self.calendar_view
-            && previous.snapshot.ptr_eq(&snapshot)
-            && previous.year == self.year
+        let rows: Arc<[CalendarRow]> = if let Some(previous) = &previous
             && (previous.category.is_none() || previous.category == self.category)
             && search.contains(&previous.search)
         {
             previous
                 .rows
                 .iter()
-                .filter(|row| matches(row.category, &row.title))
+                .filter(|row| matches(row.id, row.category, &row.title))
                 .cloned()
                 .collect()
         } else {
             let mut rows: Vec<_> = calendar
                 .occurrences(self.year)
-                .filter(|entry| matches(entry.event.category, &entry.event.title))
+                .filter(|entry| matches(entry.id, entry.event.category, &entry.event.title))
                 .map(|event| CalendarRow {
                     id: event.id,
                     date: event.date,
-                    title: event.event.title.clone(),
+                    title: Arc::from(event.event.title.as_str()),
                     category: event.event.category,
                 })
                 .collect();
@@ -860,6 +882,7 @@ impl App {
             search,
             category: self.category,
             rows: Arc::clone(&rows),
+            normalized_titles,
         });
         rows
     }
@@ -1111,6 +1134,8 @@ impl App {
             });
             if std::mem::take(&mut self.search_focus) {
                 response.request_focus();
+            } else if response.lost_focus() {
+                self.release_search_index();
             }
             if !self.search.is_empty()
                 && ui
@@ -1269,7 +1294,7 @@ impl App {
                         egui::FontId::proportional(14.0)
                     };
                     let mut job = egui::text::LayoutJob::simple(
-                        event.title.clone(),
+                        event.title.to_string(),
                         font,
                         INK,
                         (rect.width() - text_x - 7.0).max(35.0),
@@ -3788,6 +3813,7 @@ impl eframe::App for App {
         let receipts = snapshot.reminder_receipts;
         let today = Local::now().date_naive();
         let Some(workspace) = &state.workspace else {
+            self.calendar_view = None;
             self.show_onboarding(ui, today);
             return;
         };
@@ -3819,6 +3845,9 @@ impl eframe::App for App {
         );
         self.backup_creation_notice(ui);
         self.draft_banner(ui, &workspace.calendar);
+        if self.page != Page::Calendar {
+            self.release_search_index();
+        }
         match self.page {
             Page::Calendar => self.calendar(ui, workspace, today, snapshot.usage),
             Page::Tasks => self.tasks(ui, today, &workspace.calendar),

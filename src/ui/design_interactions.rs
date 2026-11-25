@@ -9,7 +9,7 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
         .map(|month| CalendarRow {
             id: Id::from_u128(u128::from(month)),
             date: NaiveDate::from_ymd_opt(2026, month, 1).unwrap(),
-            title: format!("Событие {month}"),
+            title: format!("Событие {month}").into(),
             category: Category::Partners,
         })
         .collect();
@@ -38,7 +38,7 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
             assert!(
                 painted.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::Shape::Text(text)
-                    if text.galley.text() == rows[index].title
+                    if text.galley.text() == rows[index].title.as_ref()
                         && shape.clip_rect.contains_rect(text.visual_bounding_rect()))
                 }),
                 "expected visible event {}",
@@ -893,4 +893,74 @@ fn agenda_exposes_one_button_across_the_task_row() {
         app.reveal_task.unwrap().kind,
         Milestone::Task(editor.event.tasks[0].id)
     );
+}
+
+#[test]
+fn searching_after_a_title_edit_uses_the_current_occurrence_and_unicode_casing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, id, _) = copy_test_event(&directory.path().join("profile"));
+    app.year = 2027;
+    let rename = |app: &App, title: &str| {
+        let state = app.reader.snapshot().state;
+        let mut editor = Editor::edit(state.follow_event(id, 2027).unwrap());
+        editor.scope = Scope::ThisYear;
+        editor.event.title = title.into();
+        app.save_event(&editor, false).unwrap();
+    };
+    let find = |app: &mut App, query: &str| {
+        app.search = query.into();
+        let state = app.reader.snapshot().state;
+        app.calendar_rows(state.workspace.as_ref().unwrap())
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    };
+
+    let indexed = |app: &App| app.calendar_view.as_ref().unwrap().normalized_titles.is_some();
+    rename(&app, "Отчёт ΟΣ İ");
+    assert_eq!(find(&mut app, "ОТ"), [id]);
+    assert_eq!(find(&mut app, " ОТЧЕТ "), [id]);
+    assert_eq!(find(&mut app, "ος"), [id]);
+    assert_eq!(find(&mut app, "i\u{307}"), [id]);
+    assert!(indexed(&app));
+    let ctx = egui::Context::default();
+    crate::theme::setup(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut render = |app: &mut App, events| {
+        let input = egui::RawInput {
+            events,
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(1100.0, 760.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run_ui(input, |ui| <App as eframe::App>::ui(app, ui, &mut frame));
+    };
+    app.search_focus = true;
+    render(&mut app, Vec::new());
+    render(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!indexed(&app));
+    assert_eq!(find(&mut app, "i"), [id]);
+    assert!(indexed(&app));
+    app.page = Page::Tasks;
+    render(&mut app, Vec::new());
+    assert!(!indexed(&app));
+    assert_eq!(app.search, "i");
+    rename(&app, "Обновлённое название");
+    assert!(find(&mut app, "i\u{307}").is_empty());
+    assert!(find(&mut app, "отчет").is_empty());
+    assert_eq!(find(&mut app, "обновленное"), [id]);
+    app.year = 2028;
+    assert!(find(&mut app, "обновленное").is_empty());
+    assert_eq!(find(&mut app, "шаблон"), [id]);
 }

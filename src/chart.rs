@@ -410,7 +410,7 @@ mod tests {
         CalendarRow {
             id: Id::from_u128(id),
             date: NaiveDate::from_ymd_opt(2028, month, day).unwrap(),
-            title: String::new(),
+            title: "".into(),
             category: Category::Partners,
         }
     }
