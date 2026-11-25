@@ -37,6 +37,8 @@
         el("backup-location").hidden = true;
         secret = "";
         active = false;
+        clearMcpKey();
+        el("mcp-keys").replaceChildren();
         policy = operator = selected = null;
         employees = [];
         for (const form of document.forms) form.reset();
@@ -112,6 +114,7 @@
         const current = readRules();
         const enabled = hasProfile(current);
         el("exceptions").hidden = !enabled;
+        updateMcpOptions();
         const removing = hasProfile(policy.settings) && !enabled;
         el("removal").hidden = !removing;
         if (!removing) el("confirm-removal").checked = false;
@@ -208,8 +211,81 @@
             list.append(li);
         }
     }
+    function clearMcpKey() {
+        el("mcp-token").value = "";
+        el("mcp-issued").hidden = true;
+    }
+    function updateMcpOptions() {
+        const s = policy?.settings;
+        const remoteAllowed = !!s && (!hasProfile(s) || s.allowRemote);
+        el("mcp-remote").disabled = !selected?.mcpRemote || !remoteAllowed;
+        if (el("mcp-remote").disabled) el("mcp-remote").checked = false;
+        const canWrite = el("mcp-remote").checked ? selected?.mcpRemoteWrite : selected?.mcpWrite;
+        el("mcp-write").disabled = !canWrite;
+        if (!canWrite) el("mcp-write").checked = false;
+        el("mcp-create").disabled = !selected?.mcpAvailable;
+        el("mcp-hint").textContent = selected?.mcpAvailable
+            ? "По умолчанию ключ разрешает чтение в офисе. Доступ проверяется при каждом обращении."
+            : "Для подключения сначала выдайте сотруднику личный ключ календаря.";
+    }
+    function showMcpKeys() {
+        el("mcp-keys").replaceChildren();
+        if (!selected) return;
+        const employeeId = selected.id;
+        for (const key of selected.mcpKeys) {
+            const row = document.createElement("div"), revoke = document.createElement("button");
+            row.className = "mcp-key-row";
+            const caption = key.id.slice(0, 8) + " · " + (key.readOnly ? "чтение" : "чтение и запись") +
+                (key.allowRemote ? " · внешний вход" : " · офис");
+            row.append(document.createTextNode(caption));
+            revoke.type = "button";
+            revoke.textContent = "Отозвать";
+            revoke.setAttribute("aria-label", "Отозвать ключ MCP " + key.id.slice(0, 8));
+            revoke.addEventListener("click", () => {
+                if (!window.confirm("Отозвать ключ помощника " + key.id.slice(0, 8) + "?")) return;
+                action("staff-status", async () => {
+                    await request("/v1/employees/" + employeeId + "/mcp/" + key.id + "/revoke", "POST", {});
+                    await reloadEmployees(employeeId);
+                    discardEvidence();
+                    return "Доступ этого помощника закрыт.";
+                });
+            });
+            row.append(revoke);
+            el("mcp-keys").append(row);
+        }
+    }
+    el("mcp-hide").addEventListener("click", clearMcpKey);
+    el("mcp-remote").addEventListener("change", updateMcpOptions);
+    el("mcp-access").addEventListener("toggle", () => {
+        if (!el("mcp-access").open) clearMcpKey();
+    });
+    el("employees").addEventListener("toggle", () => {
+        if (!el("employees").open) clearMcpKey();
+    });
+    onSubmit("mcp-issue", () => {
+        if (!selected || el("mcp-create").disabled) return;
+        const employeeId = selected.id;
+        clearMcpKey();
+        action("staff-status", async () => {
+            const issued = await request("/v1/employees/" + employeeId + "/mcp", "POST", {
+                allowWrite: el("mcp-write").checked, allowRemote: el("mcp-remote").checked
+            });
+            await reloadEmployees(employeeId);
+            if (selected?.id !== employeeId || !el("employees").open || !el("mcp-access").open) return;
+            el("mcp-token").value = issued.token;
+            el("mcp-issued").hidden = false;
+            el("mcp-token").select();
+            discardEvidence();
+            return "Ключ выдан. Передайте его сотруднику по защищённому каналу.";
+        });
+    });
     function showPerson(person) {
+        clearMcpKey();
+        if (selected?.id !== person?.id) el("mcp-access").open = false;
         selected = person;
+        el("mcp-remote").checked = el("mcp-write").checked = false;
+        updateMcpOptions();
+        showMcpKeys();
         el("person").hidden = !person;
         el("person-title").textContent = person?.name || "";
         el("new-name").value = person?.name || "";

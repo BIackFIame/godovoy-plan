@@ -71,3 +71,5 @@ li + li { margin-top: .3rem; }
   .actions span { flex-basis: 100%; }
   .actions span:empty { display: none; }
 }
+
+.mcp-key-row { display: flex; align-items: baseline; justify-content: space-between; flex-wrap: wrap; column-gap: .75rem; }

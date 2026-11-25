@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-fn occurrence(data: &Data, e: Occurrence<'_>, allow_free_text: bool) -> Value {
+pub(crate) fn occurrence(data: &Data, e: Occurrence<'_>, allow_free_text: bool) -> Value {
     let event = e.event;
     let description = if allow_free_text {
         event.description.as_str()
@@ -161,7 +161,7 @@ pub enum Command {
         done: bool,
     },
 }
-fn assigned_to(data: &Data, event: Occurrence<'_>, employee: Id) -> bool {
+pub(crate) fn assigned_to(data: &Data, event: Occurrence<'_>, employee: Id) -> bool {
     event
         .event
         .owner

@@ -70,6 +70,22 @@
             <label class="choice"><input type="checkbox" id="assigned-only"><span><strong>Только назначенные ему события</strong><small>Действует для всех ключей сотрудника, в том числе выданных позже. Он сможет просматривать свои события, а при праве записи — отмечать задачи и вести разрешённый дневник. Шаблоны будут доступны только для чтения.</small></span></label>
             <button type="submit" id="save-scope" disabled>Сохранить видимость</button>
           </form>
+          <details id="mcp-access" class="duties"><summary>Подключение ИИ по MCP</summary>
+            <p>Помощник видит только события, назначенные этому сотруднику. Подключайте модель, которой компания разрешила передавать календарные данные.</p>
+            <div id="mcp-keys"></div>
+            <form id="mcp-issue" autocomplete="off">
+              <label class="choice"><input type="checkbox" id="mcp-write"><span>Разрешить отмечать пункты и менять записи дневника</span></label>
+              <label class="choice"><input type="checkbox" id="mcp-remote"><span>Разрешить внешний вход</span></label>
+              <button type="submit" id="mcp-create">Выдать ключ помощника</button>
+              <small id="mcp-hint"></small>
+            </form>
+            <div id="mcp-issued" hidden>
+              <label for="mcp-token">Новый ключ MCP</label>
+              <input id="mcp-token" type="text" readonly autocomplete="off" spellcheck="false">
+              <small>Сохраните ключ в настройках подключения. После закрытия карточки он будет скрыт.</small>
+              <button type="button" id="mcp-hide">Скрыть ключ</button>
+            </div>
+          </details>
           <form id="revoke" autocomplete="off">
             <p id="revoke-count"></p>
             <label for="confirm-name">Для отзыва ключей введите имя сотрудника</label>

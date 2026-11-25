@@ -33,6 +33,7 @@ fn legacy_office_grant_and_new_remote_grant_for_one_employee_are_independent() {
     let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     let grant = legacy["grants"][id].as_object_mut().unwrap();
     assert_eq!(grant.remove("allow_remote"), Some(false.into()));
+    assert_eq!(grant.remove("purpose"), Some("employee".into()));
     let employee = grant["employee"].as_str().unwrap().to_owned();
     fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
     let remote = cli(
@@ -486,4 +487,147 @@ fn diagnostics_keep_an_unusual_profile_name_on_one_line() {
     let message = String::from_utf8(output.stderr).unwrap();
     assert_eq!(message.lines().count(), 1);
     assert!(message.contains(r"O'Connor & коллеги\nмай\t2026\u{202e}"));
+}
+
+#[test]
+fn mcp_credentials_bind_to_one_employee_key_and_cannot_be_used_as_ordinary_keys() {
+    use blake2::{Blake2s256, Digest};
+    use godovoy_plan::storage::online::{GrantPermissions, GrantPurpose};
+
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("mcp");
+    assert!(cli("init", &dir, &["Команда"]).status.success());
+    let vault = OnlineVault::open(&dir).unwrap();
+    let (office_key, employee_id, employee_token) =
+        vault.lock().unwrap().grant("Анна", None, false).unwrap();
+    let employee = employee_id.to_string();
+    let before = fs::read(dir.join("online-access-v1.json")).unwrap();
+    for flags in [
+        vec!["Анна", "--mcp"],
+        vec!["Анна", "--employee-id", &employee, "--mcp-write"],
+        vec![
+            "Анна",
+            "--employee-id",
+            &employee,
+            "--mcp",
+            "--allow-remote",
+        ],
+        vec![
+            "Анна",
+            "--employee-id",
+            &employee,
+            "--mcp",
+            "--read-only",
+            "--mcp-write",
+        ],
+        vec!["Анна", "--employee-id", &employee, "--mcp", "--mcp"],
+        vec!["Борис", "--employee-id", &employee, "--mcp"],
+    ] {
+        assert!(!cli("grant", &dir, &flags).status.success());
+    }
+    assert_eq!(fs::read(dir.join("online-access-v1.json")).unwrap(), before);
+    let issued = cli(
+        "grant",
+        &dir,
+        &["Анна", "--employee-id", &employee, "--mcp"],
+    );
+    assert!(issued.status.success());
+    let receipt = String::from_utf8(issued.stdout).unwrap();
+    let mcp = receipt.lines().last().unwrap();
+    let acl = vault.lock().unwrap().access().unwrap();
+    assert!(acl.authorize(mcp).is_none());
+    assert!(
+        acl.authorize_for(&employee_token, GrantPurpose::Mcp)
+            .is_none()
+    );
+    let (mcp_id, grant) = acl.authorize_for(mcp, GrantPurpose::Mcp).unwrap();
+    assert_eq!(grant.employee, employee_id);
+    assert_eq!(grant.parent, Some(office_key));
+    let rights = acl.mcp_permissions(grant).unwrap();
+    assert!(rights.read_only && !rights.allow_remote);
+
+    // Simulate the digest comparison used by versions predating the MCP key type.
+    let raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.join("online-access-v1.json")).unwrap()).unwrap();
+    let (_, secret) = mcp.split_once('.').unwrap();
+    let old_digest: [u8; 32] = Blake2s256::digest(secret.as_bytes()).into();
+    assert_ne!(
+        raw["grants"][mcp_id.to_string()]["digest"],
+        serde_json::json!(old_digest)
+    );
+
+    let (remote_reader, _, _) = vault
+        .lock()
+        .unwrap()
+        .grant_with_permissions(
+            "Анна",
+            Some(employee_id),
+            GrantPermissions {
+                read_only: true,
+                allow_remote: true,
+            },
+        )
+        .unwrap();
+    // Independent rights on different parent keys cannot be combined.
+    assert!(
+        !cli(
+            "grant",
+            &dir,
+            &[
+                "Анна",
+                "--employee-id",
+                &employee,
+                "--mcp",
+                "--allow-remote",
+                "--mcp-write"
+            ]
+        )
+        .status
+        .success()
+    );
+    let writer = cli(
+        "grant",
+        &dir,
+        &["Анна", "--employee-id", &employee, "--mcp", "--mcp-write"],
+    );
+    assert!(writer.status.success());
+    let writer_receipt = String::from_utf8(writer.stdout).unwrap();
+    let writer = writer_receipt.lines().last().unwrap();
+    let report = vault.lock().unwrap().protection_report().unwrap();
+    assert_eq!(report["credentials"]["mcp"], 2);
+    assert_eq!(report["credentials"]["assignedOnly"], 2);
+    let status = String::from_utf8(cli("status", &dir, &[]).stdout).unwrap();
+    assert!(status.contains("Действующих ключей MCP: 2."));
+    assert!(status.contains(&format!("Основание MCP: {office_key}")));
+    assert!(!status.contains(mcp) && !status.contains(writer));
+
+    let lock = vault.lock().unwrap();
+    let acl = lock.access().unwrap();
+    let writer_grant = acl.authorize_for(writer, GrantPurpose::Mcp).unwrap().1;
+    assert!(!acl.mcp_permissions(writer_grant).unwrap().read_only);
+    let (_, _, independent) = lock
+        .grant_mcp(
+            "Анна",
+            employee_id,
+            GrantPermissions {
+                read_only: true,
+                allow_remote: true,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        lock.access()
+            .unwrap()
+            .authorize_for(&independent, GrantPurpose::Mcp)
+            .unwrap()
+            .1
+            .parent,
+        Some(remote_reader)
+    );
+    lock.revoke(office_key).unwrap();
+    lock.grant("Анна", Some(employee_id), false).unwrap();
+    let acl = lock.access().unwrap();
+    assert!(acl.authorize_for(mcp, GrantPurpose::Mcp).is_none());
+    assert!(acl.authorize_for(writer, GrantPurpose::Mcp).is_none());
+    assert!(acl.authorize_for(&independent, GrantPurpose::Mcp).is_some());
 }

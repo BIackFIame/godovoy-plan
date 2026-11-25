@@ -12,12 +12,12 @@ use godovoy_plan::{
     model::{Calendar, Id},
     storage::{
         Store,
-        online::{GrantPermissions, OnlineVault},
+        online::{GrantPermissions, GrantPurpose, OnlineVault},
     },
 };
 use std::{env, path::Path};
 
-const HELP: &str = "godovoy-online configure DIR [--backup-root PRIVATE_DIR]\ngodovoy-online protection-report DIR\ngodovoy-online backup DIR NEW_DEST\ngodovoy-online backup-verify BACKUP\ngodovoy-online backup-restore BACKUP NEW_DIR\ngodovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
+const HELP: &str = "godovoy-online configure DIR [--backup-root PRIVATE_DIR]\ngodovoy-online protection-report DIR\ngodovoy-online backup DIR NEW_DEST\ngodovoy-online backup-verify BACKUP\ngodovoy-online backup-restore BACKUP NEW_DIR\ngodovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online grant DIR NAME --employee-id UUID --mcp [--mcp-write] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
 fn describe_window(window: godovoy_plan::storage::online::StandbyWindow) {
     let deadline =
         DateTime::<Utc>::from_timestamp(window.deadline, 0).expect("validated standby deadline");
@@ -173,12 +173,16 @@ fn run() -> Fallible<()> {
         ("grant", [name, options @ ..]) => {
             let mut employee = None;
             let mut permissions = GrantPermissions::default();
+            let mut mcp = false;
+            let mut mcp_write = false;
             let mut iter = options.iter();
             while let Some(option) = iter.next() {
                 match option.as_str() {
                     "--employee-id" if employee.is_none() => {
                         employee = Some(iter.next().ok_or(HELP)?.parse::<Id>()?)
                     }
+                    "--mcp" if !mcp => mcp = true,
+                    "--mcp-write" if !mcp_write => mcp_write = true,
                     "--read-only" if !permissions.read_only => permissions.read_only = true,
                     "--allow-remote" if !permissions.allow_remote => {
                         permissions.allow_remote = true
@@ -186,10 +190,24 @@ fn run() -> Fallible<()> {
                     _ => return Err(HELP.into()),
                 }
             }
-            let (id, employee, token) =
-                vault
-                    .lock()?
-                    .grant_with_permissions(name, employee, permissions)?;
+            let lock = vault.lock()?;
+            let (id, employee, token) = if mcp {
+                if permissions.read_only {
+                    return Err(
+                        "Ключ --mcp уже ограничен чтением. Для записи используется --mcp-write."
+                            .into(),
+                    );
+                }
+                let employee =
+                    employee.ok_or("Для --mcp укажите --employee-id существующего сотрудника.")?;
+                permissions.read_only = !mcp_write;
+                lock.grant_mcp(name, employee, permissions)?
+            } else {
+                if mcp_write {
+                    return Err("--mcp-write используется вместе с --mcp.".into());
+                }
+                lock.grant_with_permissions(name, employee, permissions)?
+            };
             println!(
                 "Сотрудник: {employee}\nID ключа для отзыва: {id}\nКлюч доступа (показывается один раз):\n{token}"
             );
@@ -218,13 +236,24 @@ fn run() -> Fallible<()> {
             } else {
                 println!("Основной режим.");
             }
+            println!(
+                "Действующих ключей MCP: {}.",
+                acl.grants
+                    .values()
+                    .filter(|grant| grant.purpose == GrantPurpose::Mcp)
+                    .count()
+            );
             for (id, name) in acl.employees {
                 println!("Сотрудник {id}: {}", name.escape_debug());
             }
             for (id, grant) in acl.grants {
                 println!(
-                    "Ключ {id}, сотрудник {}, {}, {}",
+                    "Ключ {id}, сотрудник {}, {}, {}, {}",
                     grant.employee,
+                    match grant.purpose {
+                        GrantPurpose::Employee => "календарь",
+                        GrantPurpose::Mcp => "MCP (только свои назначения)",
+                    },
                     if grant.read_only {
                         "чтение"
                     } else {
@@ -236,6 +265,9 @@ fn run() -> Fallible<()> {
                         "только офис"
                     }
                 );
+                if let Some(parent) = grant.parent {
+                    println!("  Основание MCP: {parent}");
+                }
             }
         }
         ("audit", []) => {

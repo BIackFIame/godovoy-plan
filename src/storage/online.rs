@@ -67,8 +67,33 @@ pub fn record(
     });
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrantPurpose {
+    #[default]
+    Employee,
+    Mcp,
+}
+
+impl GrantPurpose {
+    fn digest(self, secret: &str) -> [u8; 32] {
+        let mut hash = Blake2s256::new();
+        if self == Self::Mcp {
+            // Older binaries ignore unknown fields. They must never accept an MCP
+            // secret as an ordinary employee credential, even after a downgrade.
+            hash.update(b"godovoy-plan/mcp-key/v1\0");
+        }
+        hash.update(secret.as_bytes());
+        hash.finalize().into()
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct Grant {
+    #[serde(default)]
+    pub purpose: GrantPurpose,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<Id>,
     pub employee: Id,
     pub read_only: bool,
     #[serde(default)]
@@ -100,17 +125,44 @@ pub struct Access {
 }
 impl Access {
     pub fn authorize(&self, token: &str) -> Option<(Id, &Grant)> {
+        self.authorize_for(token, GrantPurpose::Employee)
+    }
+
+    pub fn authorize_for(&self, token: &str, purpose: GrantPurpose) -> Option<(Id, &Grant)> {
         let (id, secret) = token.split_once('.')?;
         let id = Id::parse_str(id).ok()?;
         let grant = self.grants.get(&id)?;
-        if secret.len() != 43 {
+        if secret.len() != 43 || grant.purpose != purpose {
             return None;
         }
-        let digest: [u8; 32] = Blake2s256::digest(secret.as_bytes()).into();
-        bool::from(digest.ct_eq(&grant.digest)).then_some((id, grant))
+        let digest = purpose.digest(secret);
+        if !bool::from(digest.ct_eq(&grant.digest))
+            || (purpose == GrantPurpose::Mcp && self.mcp_permissions(grant).is_none())
+        {
+            return None;
+        }
+        Some((id, grant))
     }
+
     pub fn active_employee(&self, id: Id) -> bool {
-        self.grants.values().any(|grant| grant.employee == id)
+        self.grants
+            .values()
+            .any(|g| g.purpose == GrantPurpose::Employee && g.employee == id)
+    }
+
+    /// The issuing employee key is the sole authority for a delegated credential.
+    pub fn mcp_permissions(&self, grant: &Grant) -> Option<GrantPermissions> {
+        let parent = self.grants.get(&grant.parent?)?;
+        if grant.purpose != GrantPurpose::Mcp
+            || parent.purpose != GrantPurpose::Employee
+            || parent.employee != grant.employee
+        {
+            return None;
+        }
+        Some(GrantPermissions {
+            read_only: grant.read_only || parent.read_only,
+            allow_remote: grant.allow_remote && parent.allow_remote,
+        })
     }
 }
 #[derive(Serialize, Deserialize)]
@@ -245,6 +297,16 @@ impl LockedVault<'_> {
         {
             return Err("Повреждена область доступа сотрудника.".into());
         }
+        if acl.grants.iter().any(|(id, grant)| {
+            id.is_nil()
+                || !acl.employees.contains_key(&grant.employee)
+                || match grant.purpose {
+                    GrantPurpose::Employee => grant.parent.is_some(),
+                    GrantPurpose::Mcp => acl.mcp_permissions(grant).is_none(),
+                }
+        }) {
+            return Err("Повреждена привязка ключа к сотруднику.".into());
+        }
         self.finish_protection(&mut acl)?;
         Ok(acl)
     }
@@ -305,10 +367,40 @@ impl LockedVault<'_> {
         existing: Option<Id>,
         permissions: GrantPermissions,
     ) -> Fallible<(Id, Id, String)> {
+        self.issue(name, existing, permissions, GrantPurpose::Employee)
+    }
+
+    pub fn grant_mcp(
+        &self,
+        name: &str,
+        employee: Id,
+        permissions: GrantPermissions,
+    ) -> Fallible<(Id, Id, String)> {
+        self.issue(name, Some(employee), permissions, GrantPurpose::Mcp)
+    }
+
+    fn issue(
+        &self,
+        name: &str,
+        existing: Option<Id>,
+        permissions: GrantPermissions,
+        purpose: GrantPurpose,
+    ) -> Fallible<(Id, Id, String)> {
         let mut access = self.access()?;
         if self.standby_window()?.is_some() {
             return Err("Выдача ключей приостановлена до завершения резервного режима.".into());
         }
+        let parent = if purpose == GrantPurpose::Mcp {
+            let employee = existing.ok_or("Укажите сотрудника для MCP.")?;
+            let (parent_id, _) = access.grants.iter().find(|(_, g)| {
+                g.employee == employee && g.purpose == GrantPurpose::Employee
+                    && (permissions.read_only || !g.read_only)
+                    && (!permissions.allow_remote || g.allow_remote)
+            }).ok_or("Для MCP нужен действующий обычный ключ сотрудника с запрошенными правами на этом входе.")?;
+            Some(*parent_id)
+        } else {
+            None
+        };
         if permissions.allow_remote && !access.protection().settings.remote_allowed() {
             self.audit_security("protection_remote_grant_denied", None, existing, None)?;
             return Err("Внешний вход отключён политикой календаря.".into());
@@ -344,16 +436,19 @@ impl LockedVault<'_> {
         access.grants.insert(
             id,
             Grant {
+                purpose,
+                parent,
                 employee,
                 read_only: permissions.read_only,
                 allow_remote: permissions.allow_remote,
-                digest: Blake2s256::digest(secret.as_bytes()).into(),
+                digest: purpose.digest(&secret),
             },
         );
-        let (request, action) = if permissions.allow_remote {
-            ("grant_remote_requested", "grant_remote")
-        } else {
-            ("grant_requested", "grant")
+        let (request, action) = match (purpose, permissions.allow_remote) {
+            (GrantPurpose::Mcp, true) => ("grant_mcp_remote_requested", "grant_mcp_remote"),
+            (GrantPurpose::Mcp, false) => ("grant_mcp_requested", "grant_mcp"),
+            (GrantPurpose::Employee, true) => ("grant_remote_requested", "grant_remote"),
+            (GrantPurpose::Employee, false) => ("grant_requested", "grant"),
         };
         self.audit_security(request, Some(id), Some(employee), None)?;
         record(&mut access.audit, action, id, employee, None);
@@ -385,6 +480,20 @@ impl LockedVault<'_> {
             .ok_or("Такого действующего ключа нет.")?;
         self.audit_security("revoke_requested", Some(id), Some(grant.employee), None)?;
         record(&mut access.audit, "revoke", id, grant.employee, None);
+        access.grants.retain(|child_id, child| {
+            if child.parent == Some(id) {
+                record(
+                    &mut access.audit,
+                    "revoke_mcp",
+                    *child_id,
+                    child.employee,
+                    None,
+                );
+                false
+            } else {
+                true
+            }
+        });
         save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
         sync_directory(self.directory)
     }

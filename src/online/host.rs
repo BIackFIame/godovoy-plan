@@ -1,3 +1,5 @@
+#[path = "mcp.rs"]
+mod mcp;
 #[path = "standby.rs"]
 mod standby;
 use standby::Mode;
@@ -15,7 +17,7 @@ use axum::{
 use godovoy_plan::{
     Fallible,
     model::Id,
-    storage::online::{Access, LockedVault, OnlineVault, record},
+    storage::online::{Access, Data, GrantPurpose, LockedVault, OnlineVault, record},
 };
 use hyper::server::conn::http1;
 use hyper_util::{
@@ -157,7 +159,13 @@ async fn headers(State(host): State<Host>, req: Request, next: Next) -> Response
     );
     response
 }
-async fn with_auth<F>(host: Host, headers: HeaderMap, write: bool, action: F) -> Response
+async fn with_auth<F>(
+    host: Host,
+    headers: HeaderMap,
+    purpose: GrantPurpose,
+    write: bool,
+    action: F,
+) -> Response
 where
     F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
 {
@@ -184,10 +192,10 @@ where
         let Ok(lock) = host.vault.lock() else {
             return unavailable();
         };
-        let Ok(acl) = lock.access() else {
+        let Ok(mut acl) = lock.access() else {
             return unavailable();
         };
-        let Some((id, grant)) = acl.authorize(&token) else {
+        let Some((id, grant)) = acl.authorize_for(&token, purpose) else {
             if let Some((prefix, secret)) = token.split_once('.')
                 && let Ok(id) = Id::parse_str(prefix)
                 && secret.len() == 43
@@ -210,14 +218,23 @@ where
                 "Ключ недействителен или доступ отозван.",
             );
         };
+        let employee = grant.employee;
+        let (read_only, allow_remote) = match purpose {
+            GrantPurpose::Employee => (grant.read_only, grant.allow_remote),
+            GrantPurpose::Mcp => {
+                let Some(rights) = acl.mcp_permissions(grant) else {
+                    return problem(StatusCode::UNAUTHORIZED, "Доступ по ключу MCP отозван.");
+                };
+                (rights.read_only, rights.allow_remote)
+            }
+        };
+        if purpose == GrantPurpose::Mcp {
+            // Only the authorization view of this request is narrowed. Persistent employee rights stay separate.
+            acl.assigned_only.insert(employee);
+        }
         let Ok(deadline) = host.mode.check(&lock) else {
             if lock
-                .audit_security(
-                    "standby_access_denied",
-                    Some(id),
-                    Some(grant.employee),
-                    None,
-                )
+                .audit_security("standby_access_denied", Some(id), Some(employee), None)
                 .is_err()
             {
                 return unavailable();
@@ -227,21 +244,16 @@ where
         let settings = acl.protection().settings;
         if host.entry == EntryPoint::Remote && !settings.remote_allowed() {
             if lock
-                .audit_security(
-                    "protection_remote_denied",
-                    Some(id),
-                    Some(grant.employee),
-                    None,
-                )
+                .audit_security("protection_remote_denied", Some(id), Some(employee), None)
                 .is_err()
             {
                 return unavailable();
             }
             return protection_denied("Внешний вход отключён администратором.", "remote-disabled");
         }
-        if host.entry == EntryPoint::Remote && !grant.allow_remote {
+        if host.entry == EntryPoint::Remote && !allow_remote {
             if lock
-                .audit_security("remote_access_denied", Some(id), Some(grant.employee), None)
+                .audit_security("remote_access_denied", Some(id), Some(employee), None)
                 .is_err()
             {
                 return unavailable();
@@ -255,25 +267,18 @@ where
                 .insert("x-godovoy-access", HeaderValue::from_static("office-only"));
             return response;
         }
-        if write && grant.read_only {
+        if write && read_only {
             if lock
-                .audit_security("write_denied", Some(id), Some(grant.employee), None)
+                .audit_security("write_denied", Some(id), Some(employee), None)
                 .is_err()
             {
                 return unavailable();
             }
             return problem(StatusCode::FORBIDDEN, "Разрешено только чтение.");
         };
-        let mut response = action(
-            &lock,
-            &acl,
-            id,
-            grant.employee,
-            !grant.read_only,
-            &host.mode,
-        );
+        let mut response = action(&lock, &acl, id, employee, !read_only, &host.mode);
         if response.status().is_success() {
-            let scope = if acl.assigned_only.contains(&grant.employee) {
+            let scope = if acl.assigned_only.contains(&employee) {
                 "true"
             } else {
                 "false"
@@ -319,6 +324,7 @@ async fn state(
     with_auth(
         host,
         headers,
+        GrantPurpose::Employee,
         false,
         move |lock, acl, id, employee, edit, mode| match lock.data() {
             Ok(data) => {
@@ -341,9 +347,13 @@ async fn state(
     .await
 }
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
-    with_auth(host, headers, false, |_, _, _, _, _, _| {
-        StatusCode::NO_CONTENT.into_response()
-    })
+    with_auth(
+        host,
+        headers,
+        GrantPurpose::Employee,
+        false,
+        |_, _, _, _, _, _| StatusCode::NO_CONTENT.into_response(),
+    )
     .await
 }
 async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> Response {
@@ -361,88 +371,107 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
     with_auth(
         host,
         headers,
+        GrantPurpose::Employee,
         true,
         move |lock, acl, credential, employee, _, mode| {
             let Ok(cmd) = serde_json::from_slice::<Command>(&body) else {
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
             };
-            if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
-                if lock
-                    .audit_security(
-                        "protection_free_text_denied",
-                        Some(credential),
-                        Some(employee),
-                        None,
-                    )
-                    .is_err()
-                {
-                    return unavailable();
-                }
-                return protection_denied(
-                    "Описания и заметки отключены администратором.",
-                    "free-text-disabled",
-                );
-            }
-            let Ok(mut data) = lock.data() else {
+            let Ok(data) = lock.data() else {
                 return unavailable();
             };
-            if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(&data, employee) {
-                if lock
-                    .audit_security(
-                        "employee_scope_denied",
-                        Some(credential),
-                        Some(employee),
-                        None,
-                    )
-                    .is_err()
-                {
-                    return unavailable();
-                }
-                return protection_denied(
-                    "Действие недоступно в персональном календаре.",
-                    "assigned-only",
-                );
-            }
-            match actions::apply(cmd, &mut data, acl) {
-                Err(e) => problem(
-                    if e.conflict {
-                        StatusCode::CONFLICT
-                    } else {
-                        StatusCode::UNPROCESSABLE_ENTITY
-                    },
-                    e.message,
-                ),
-                Ok((kind, event)) => {
-                    if let Err(e) = data.calendar.validate() {
-                        return problem(StatusCode::UNPROCESSABLE_ENTITY, e);
-                    }
-                    let audit_kind = match kind {
-                        "create" => "create_requested",
-                        "edit" => "edit_requested",
-                        "delete" => "delete_requested",
-                        "check" => "check_requested",
-                        "note" => "note_requested",
-                        _ => return unavailable(),
-                    };
-                    if lock
-                        .audit_security(audit_kind, Some(credential), Some(employee), Some(event))
-                        .is_err()
-                    {
-                        return unavailable();
-                    }
-                    record(&mut data.audit, kind, credential, employee, Some(event));
-                    if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
-                        return standby_unavailable();
-                    }
-                    match lock.save_data(&data) {
-                        Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                        Err(_) => unavailable(),
-                    }
-                }
-            }
+            commit_command(lock, acl, credential, employee, mode, cmd, data)
         },
     )
     .await
+}
+async fn with_mcp_auth<F>(host: Host, headers: HeaderMap, write: bool, action: F) -> Response
+where
+    F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
+{
+    with_auth(host, headers, GrantPurpose::Mcp, write, action).await
+}
+
+fn commit_command(
+    lock: &LockedVault<'_>,
+    acl: &Access,
+    credential: Id,
+    employee: Id,
+    mode: &Mode,
+    cmd: Command,
+    mut data: Data,
+) -> Response {
+    if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
+        if lock
+            .audit_security(
+                "protection_free_text_denied",
+                Some(credential),
+                Some(employee),
+                None,
+            )
+            .is_err()
+        {
+            return unavailable();
+        }
+        return protection_denied(
+            "Описания и заметки отключены администратором.",
+            "free-text-disabled",
+        );
+    }
+    if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(&data, employee) {
+        if lock
+            .audit_security(
+                "employee_scope_denied",
+                Some(credential),
+                Some(employee),
+                None,
+            )
+            .is_err()
+        {
+            return unavailable();
+        }
+        return protection_denied(
+            "Действие недоступно в персональном календаре.",
+            "assigned-only",
+        );
+    }
+    match actions::apply(cmd, &mut data, acl) {
+        Err(e) => problem(
+            if e.conflict {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::UNPROCESSABLE_ENTITY
+            },
+            e.message,
+        ),
+        Ok((kind, event)) => {
+            if let Err(e) = data.calendar.validate() {
+                return problem(StatusCode::UNPROCESSABLE_ENTITY, e);
+            }
+            let audit_kind = match kind {
+                "create" => "create_requested",
+                "edit" => "edit_requested",
+                "delete" => "delete_requested",
+                "check" => "check_requested",
+                "note" => "note_requested",
+                _ => return unavailable(),
+            };
+            if lock
+                .audit_security(audit_kind, Some(credential), Some(employee), Some(event))
+                .is_err()
+            {
+                return unavailable();
+            }
+            record(&mut data.audit, kind, credential, employee, Some(event));
+            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                return standby_unavailable();
+            }
+            match lock.save_data(&data) {
+                Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                Err(_) => unavailable(),
+            }
+        }
+    }
 }
 pub fn router(host: Host) -> Router {
     Router::new()
@@ -465,6 +494,7 @@ pub fn router(host: Host) -> Router {
                 )
             }),
         )
+        .route("/mcp", post(mcp::handle))
         .route("/v1/session", get(session))
         .route("/v1/state", get(state))
         .route("/v1/command", post(command))

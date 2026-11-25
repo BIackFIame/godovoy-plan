@@ -13,8 +13,8 @@ use godovoy_plan::{
     model::Id,
     storage::{
         online::{
-            LockedVault, OnlineVault, OperatorInput, OperatorRecord, ProtectionConflict,
-            ProtectionSettings,
+            GrantPermissions, GrantPurpose, LockedVault, OnlineVault, OperatorInput,
+            OperatorRecord, ProtectionConflict, ProtectionSettings,
         },
         random_bytes,
     },
@@ -173,6 +173,51 @@ async fn employees(State(c): State<Console>) -> Response {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct McpGrantRequest {
+    allow_write: bool,
+    allow_remote: bool,
+}
+async fn issue_mcp(
+    State(c): State<Console>,
+    Path(employee): Path<Id>,
+    Json(request): Json<McpGrantRequest>,
+) -> Response {
+    locked(c, move |lock| {
+        let acl = lock.access()?;
+        let name = acl.employees.get(&employee).ok_or(OperatorInput)?;
+        let (credential, _, token) = lock.grant_mcp(
+            name,
+            employee,
+            GrantPermissions {
+                read_only: !request.allow_write,
+                allow_remote: request.allow_remote,
+            },
+        )?;
+        Ok(json!({"id":credential, "token":token}))
+    })
+    .await
+}
+async fn revoke_mcp(
+    State(c): State<Console>,
+    Path((employee, credential)): Path<(Id, Id)>,
+    Json(_): Json<Confirm>,
+) -> Response {
+    locked(c, move |lock| {
+        let acl = lock.access()?;
+        if !acl
+            .grants
+            .get(&credential)
+            .is_some_and(|g| g.employee == employee && g.purpose == GrantPurpose::Mcp)
+        {
+            return Err(OperatorInput.into());
+        }
+        lock.revoke(credential)?;
+        Ok(json!({"revoked":1}))
+    })
+    .await
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct NameChange {
     previous_name: String,
     name: String,
@@ -308,6 +353,11 @@ fn router(c: Console) -> Router {
         .route("/v1/report", get(report))
         .route("/v1/backup", get(backup_status).post(start_backup))
         .route("/v1/employees", get(employees))
+        .route("/v1/employees/{id}/mcp", post(issue_mcp))
+        .route(
+            "/v1/employees/{id}/mcp/{credential}/revoke",
+            post(revoke_mcp),
+        )
         .route("/v1/employees/{id}/name", put(edit_name))
         .route("/v1/employees/{id}/scope", put(update_scope))
         .route("/v1/employees/{id}/revoke", post(revoke))
@@ -414,6 +464,72 @@ mod tests {
             let bytes = to_bytes(response.into_body(), 1024 * 1024).await.unwrap();
             (code, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
         }
+    }
+    #[tokio::test]
+    async fn assistant_keys_are_issued_only_by_admin_and_revoked_individually() {
+        let f = Fixture::new();
+        let admin = "test-admin-secret";
+        let origin = Some(f.console.origin.as_str());
+        let ((parent, anna, personal), (_, boris, _)) = {
+            let lock = f.console.vault.lock().unwrap();
+            (
+                lock.grant("Анна", None, false).unwrap(),
+                lock.grant("Борис", None, false).unwrap(),
+            )
+        };
+        let issue = format!("/v1/employees/{anna}/mcp");
+        let request = json!({"allowWrite":false,"allowRemote":false});
+        assert_eq!(
+            f.request(Method::POST, &issue, &personal, origin, request.clone())
+                .await
+                .0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            f.request(Method::POST, &issue, admin, None, request.clone())
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        let (code, issued) = f
+            .request(Method::POST, &issue, admin, origin, request)
+            .await;
+        assert_eq!(code, StatusCode::OK);
+        let credential = issued["id"].as_str().unwrap();
+        let token = issued["token"].as_str().unwrap();
+        let (_, directory) = f
+            .request(Method::GET, "/v1/employees", admin, origin, Value::Null)
+            .await;
+        assert!(!directory.to_string().contains(token));
+        let person = directory["employees"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["id"] == anna.to_string())
+            .unwrap();
+        assert_eq!(person["mcpKeys"][0]["id"], credential);
+        assert_eq!(person["mcpKeys"][0]["readOnly"], true);
+        for path in [
+            format!("/v1/employees/{anna}/mcp/{parent}/revoke"),
+            format!("/v1/employees/{boris}/mcp/{credential}/revoke"),
+        ] {
+            assert_eq!(
+                f.request(Method::POST, &path, admin, origin, json!({}))
+                    .await
+                    .0,
+                StatusCode::UNPROCESSABLE_ENTITY
+            );
+        }
+        let revoke = format!("/v1/employees/{anna}/mcp/{credential}/revoke");
+        assert_eq!(
+            f.request(Method::POST, &revoke, admin, origin, json!({}))
+                .await
+                .0,
+            StatusCode::OK
+        );
+        let acl = f.console.vault.lock().unwrap().access().unwrap();
+        assert!(acl.authorize_for(token, GrantPurpose::Mcp).is_none());
+        assert!(acl.authorize(&personal).is_some());
     }
     #[tokio::test]
     async fn admin_secrets_are_separate_and_writes_require_local_origin() {

@@ -1,6 +1,7 @@
 //! Voluntary operator-declared metadata and targeted registry operations.
 use super::{
-    ACCESS, ACCESS_LIMIT, Access, Id, LockedVault, ProtectionConflict, record, save, sync_directory,
+    ACCESS, ACCESS_LIMIT, Access, GrantPurpose, Id, LockedVault, ProtectionConflict, record, save,
+    sync_directory,
 };
 use crate::Fallible;
 use serde::{Deserialize, Serialize};
@@ -90,11 +91,33 @@ impl LockedVault<'_> {
     }
     pub fn employee_directory(&self) -> Fallible<serde_json::Value> {
         let acl = self.access()?;
-        let mut counts = BTreeMap::new();
-        for grant in acl.grants.values() {
-            *counts.entry(grant.employee).or_insert(0usize) += 1;
+        let mut by_employee = BTreeMap::<_, Vec<_>>::new();
+        for (id, grant) in &acl.grants {
+            by_employee
+                .entry(grant.employee)
+                .or_default()
+                .push((id, grant));
         }
-        let employees=acl.employees.into_iter().map(|(id,name)|serde_json::json!({"id":id,"name":name,"assignedOnly":acl.assigned_only.contains(&id),"keys":counts.get(&id).copied().unwrap_or(0)})).collect::<Vec<_>>();
+        let employees: Vec<_> = acl.employees.iter().map(|(id, name)| {
+            let grants = by_employee.get(id).map(Vec::as_slice).unwrap_or_default();
+            let mut mcp_keys = Vec::new();
+            let mut parent_rights = Vec::new();
+            for &(key_id, grant) in grants {
+                match grant.purpose {
+                    GrantPurpose::Mcp => mcp_keys.push(serde_json::json!({
+                        "id":key_id, "readOnly":grant.read_only, "allowRemote":grant.allow_remote
+                    })),
+                    GrantPurpose::Employee => parent_rights.push((!grant.read_only,grant.allow_remote)),
+                }
+            }
+            serde_json::json!({
+                "id":id, "name":name, "assignedOnly":acl.assigned_only.contains(id), "keys":grants.len(),
+                "mcpKeys":mcp_keys, "mcpAvailable":!parent_rights.is_empty(),
+                "mcpWrite":parent_rights.iter().any(|r|r.0),
+                "mcpRemote":parent_rights.iter().any(|r|r.1),
+                "mcpRemoteWrite":parent_rights.contains(&(true,true))
+            })
+        }).collect();
         self.audit_security("employee_directory_requested", None, None, None)?;
         Ok(serde_json::json!({"employees":employees}))
     }
