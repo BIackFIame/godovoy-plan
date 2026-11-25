@@ -69,7 +69,7 @@ name = "storage_permissions"
 
 [features]
 default = ["desktop"]
-server = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
+server = ["dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
 desktop = ["server", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
 
 [dependencies]
@@ -98,6 +98,9 @@ socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 zeroize = "1"
+
+[target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
+sha2 = { version = "0.10", features = ["asm"], optional = true }
 
 [target.'cfg(windows)'.dependencies]
 winreg = "0.56"

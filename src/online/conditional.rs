@@ -15,6 +15,11 @@ use std::{
 
 const MAX_VIEWS: usize = 128;
 type InputDigest = [u8; 32];
+// Apple Silicon provides SHA-256 instructions on every supported device.
+#[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+type InputHasher = sha2::Sha256;
+#[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
+type InputHasher = Blake2b<U32>;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct ReadHint {
@@ -66,8 +71,8 @@ impl Views {
         credential: Id,
         context: &ViewContext<'_>,
         today: NaiveDate,
-    ) -> Fallible<Blake2b<U32>> {
-        let mut source = Blake2b::<U32>::new();
+    ) -> Fallible<InputHasher> {
+        let mut source = InputHasher::new();
         source.update(credential.as_bytes());
         source.update(today.num_days_from_ce().to_be_bytes());
         serde_json::to_writer(&mut source, context)?;

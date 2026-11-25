@@ -21,7 +21,7 @@ use crate::{
     model::{Calendar, Id},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use blake2::{Blake2b, Blake2s256, Digest, digest::consts::U32};
+use blake2::{Blake2s256, Digest, digest::consts::U32};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -299,7 +299,10 @@ impl CalendarFile<'_> {
         Ok(bytes)
     }
 
-    pub fn fingerprint(&mut self, mut source: Blake2b<U32>) -> Fallible<[u8; 32]> {
+    pub fn fingerprint(
+        &mut self,
+        mut source: impl Digest<OutputSize = U32> + std::io::Write,
+    ) -> Fallible<[u8; 32]> {
         let mut bounded = (&mut self.file).take(DATA_LIMIT as u64 + 1);
         std::io::copy(&mut bounded, &mut source)?;
         if bounded.limit() == 0 {
@@ -403,7 +406,11 @@ impl LockedVault<'_> {
     }
 
     /// Extend the caller's fingerprint with the exact bytes committed to disk.
-    pub fn save_data_hashed(&self, data: &Data, mut hash: Blake2b<U32>) -> Fallible<[u8; 32]> {
+    pub fn save_data_hashed(
+        &self,
+        data: &Data,
+        mut hash: impl Digest<OutputSize = U32>,
+    ) -> Fallible<[u8; 32]> {
         self.persist_data(data, |bytes| hash.update(bytes))?;
         Ok(hash.finalize().into())
     }
