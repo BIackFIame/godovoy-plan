@@ -1,0 +1,91 @@
+"""Run published Windows executables in an isolated temporary profile on the runner."""
+import hashlib
+import http.client
+import json
+import os
+from pathlib import Path
+import queue
+import re
+import subprocess
+import tempfile
+import threading
+import urllib.request
+import zipfile
+
+def cli(exe, *args):
+    return subprocess.run([exe, *args], check=True, capture_output=True, encoding="utf-8",
+                          timeout=30).stdout.strip()
+
+def extract_release(release, name, programs, directory):
+    matches = [a for a in release["assets"] if a["name"] == name]
+    assert len(matches) == 1
+    asset = matches[0]
+    archive = directory / name
+    urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    assert asset["digest"] == "sha256:" + digest and asset["size"] == archive.stat().st_size
+    with zipfile.ZipFile(archive) as package:
+        for prog in programs:
+            assert package.namelist().count(prog) == 1
+            (directory / prog).write_bytes(package.read(prog))
+    print(name, digest, flush=True)
+
+def http(port, key, path):
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    try:
+        conn.request("GET", path, headers={"Authorization": "Bearer " + key})
+        response = conn.getresponse()
+        return response.status, response.read()
+    finally:
+        conn.close()
+
+def server_flow(exe, directory):
+    vault = directory / "vault"
+    cli(exe, "init", vault, "Windows QA")
+    key = cli(exe, "grant", vault, "Employee", "--read-only").splitlines()[-1]
+    process = subprocess.Popen([exe, "serve", vault, "--port", "0"], stderr=subprocess.PIPE,
+                               text=True, encoding="utf-8")
+    try:
+        lines = queue.Queue()
+        threading.Thread(target=lambda: lines.put(process.stderr.readline()), daemon=True).start()
+        line = lines.get(timeout=15)
+        port = int(re.search(r"127\.0\.0\.1:(\d+)", line)[1])
+        assert http(port, key, "/v1/session")[0] == 204
+        status, body = http(port, key, "/v1/state?year=2028")
+        assert status == 200 and json.loads(body)["workspaceName"] == "Windows QA"
+        cli(exe, "revoke", vault, key.split(".")[0])
+        assert http(port, key, "/v1/session")[0] == 401
+    finally:
+        process.terminate()
+        process.wait(timeout=10)
+        process.stderr.close()
+    print("PASS: init, read-only session, year and revocation", flush=True)
+
+def main():
+    tag = os.environ["RELEASE_TAG"]
+    arch = os.environ["PACKAGE_ARCH"]
+    assert os.name == "nt" and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
+    assert arch in ("x64", "x86", "ARM64")
+    url = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tags/" + tag
+    with urllib.request.urlopen(url, timeout=30) as response:
+        release = json.load(response)
+    assert release["tag_name"] == tag and not release["draft"]
+    version = tag[1:]
+    with tempfile.TemporaryDirectory() as work:
+        directory = Path(work)
+        extract_release(release, f"GodovoyPlan-{version}-Windows-{arch}.zip",
+                        ["godovoy-plan.exe", "godovoy-online.exe"], directory)
+        desktop = directory / "godovoy-plan.exe"
+        assert cli(desktop, "--version").endswith(version)
+        online = directory / "godovoy-online.exe"
+        assert cli(online, "--version") == "godovoy-online " + version
+        server_flow(online, directory)
+        if arch == "x64":
+            standalone = directory / "server"
+            standalone.mkdir()
+            extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
+                            [online.name], standalone)
+            server_flow(standalone / online.name, standalone)
+
+if __name__ == "__main__":
+    main()

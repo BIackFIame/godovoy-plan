@@ -1,0 +1,37 @@
+name: Проверка Windows-пакетов выпуска
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег опубликованного выпуска
+        required: true
+        default: v0.6.5
+permissions: {}
+jobs:
+  smoke:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-2022
+            arch: x64
+          - runner: windows-2022
+            arch: x86
+          - runner: windows-11-arm
+            arch: ARM64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 12
+    steps:
+      - name: Скачать скрипт проверки на текущем коммите
+        shell: pwsh
+        run: |
+          git init --quiet
+          git fetch --quiet --no-tags --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          git checkout --quiet --detach FETCH_HEAD
+      - name: Проверить опубликованный пакет на Windows
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: python packaging/windows/smoke.py
