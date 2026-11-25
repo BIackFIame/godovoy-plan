@@ -587,6 +587,9 @@
         const uuid = value => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
         const date = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
         const count = value => Number.isSafeInteger(value) && value >= 0;
+        // Assigned-only rows in the authenticated snapshot use the resolved person ID.
+        // A grant may still name one of that person's older device IDs.
+        const assignedOwner = state.events[0]?.ownerId ?? state.tasks[0]?.ownerId ?? state.employeeId;
         function validEvent(event) {
             if (event?.id !== id || !Number.isInteger(event.year) || event.year < 1900 || event.year > 9999 ||
                 typeof event.title !== "string" || typeof event.note !== "string" || typeof event.description !== "string" ||
@@ -594,7 +597,7 @@
                 !count(event.preparationDays) || typeof event.yearly !== "boolean" ||
                 !(event.ownerId === null || uuid(event.ownerId)) || typeof event.revision !== "string" ||
                 !/^\d+:[a-f0-9-]{36}$/.test(event.revision) || !Array.isArray(event.checklist) ||
-                (state.assignedOnly && event.ownerId !== state.employeeId) ||
+                (state.assignedOnly && event.ownerId !== assignedOwner) ||
                 (state.allowFreeText === false && (event.note !== "" || event.description !== ""))) return false;
             const ids = new Set();
             for (const task of event.checklist) {
