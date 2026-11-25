@@ -251,7 +251,7 @@ fn bad_or_foreign_files_and_duplicate_exports_preserve_previous_data() {
 
     let wrong_key = Profile::new();
     let mut same_workspace = source.snapshot().workspace.clone().unwrap();
-    same_workspace.key[0] ^= 1;
+    std::sync::Arc::make_mut(&mut same_workspace).key[0] ^= 1;
     wrong_key.edit(|state| {
         state.workspace = Some(same_workspace);
         Ok(())

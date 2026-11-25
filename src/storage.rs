@@ -147,7 +147,7 @@ pub struct LocalState {
     pub admitted_this_generation: BTreeSet<Id>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     revision_floor: Option<u64>,
-    pub workspace: Option<Workspace>,
+    pub workspace: Option<Arc<Workspace>>,
     pub peers: BTreeSet<SocketAddrV4>,
     pub last_sync: Option<i64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -232,7 +232,7 @@ impl LocalState {
         calendar
             .members
             .insert(self.device, Record::new(self.revision()?, employee));
-        self.workspace = Some(Workspace {
+        self.workspace = Some(Arc::new(Workspace {
             id: Id::new_v4(),
             key_generation: 0,
             previous_key_proofs: Vec::new(),
@@ -241,7 +241,7 @@ impl LocalState {
             name,
             key: random_bytes()?,
             calendar,
-        });
+        }));
         Ok(())
     }
 
@@ -265,6 +265,7 @@ impl LocalState {
     pub fn workspace_mut(&mut self) -> Fallible<&mut Workspace> {
         self.workspace
             .as_mut()
+            .map(Arc::make_mut)
             .ok_or_else(|| "Сначала подключитесь к пространству.".into())
     }
 }
@@ -694,7 +695,14 @@ impl Store {
                 return Err("Слишком много сохранённых приглашений.".into());
             }
             if let Some(workspace) = &next.workspace {
-                workspace.calendar.validate()?;
+                if !self
+                    .state
+                    .workspace
+                    .as_ref()
+                    .is_some_and(|old| Arc::ptr_eq(old, workspace))
+                {
+                    workspace.calendar.validate()?;
+                }
                 if self.state.workspace.is_none() {
                     // Record that this profile belongs to a team before publishing it.
                     mark_team_initialized(&self.path.with_file_name(TEAM_MARKER))?;
@@ -713,6 +721,11 @@ impl Store {
         let previous = std::mem::replace(&mut view.state, Arc::clone(&self.state));
         drop(view);
         if let Some(wake) = self.calendar_wake.upgrade()
+            && !previous
+                .workspace
+                .as_ref()
+                .zip(self.state.workspace.as_ref())
+                .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
             && previous.workspace.as_ref().map(|w| &w.calendar)
                 != self.state.workspace.as_ref().map(|w| &w.calendar)
             && !wake.changed.swap(true, Ordering::AcqRel)
@@ -848,19 +861,7 @@ impl Drop for ProfileLock {
 fn open_profile_lock(directory: &Path) -> Fallible<ProfileLock> {
     validate_profile_access(directory)?;
     let lock_path = directory.join("profile.lock");
-    check_profile_file(&lock_path)?;
-    let mut options = OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-    }
-    let lock = options
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(lock_path)?;
+    let lock = access::open_lock(&lock_path, OpenOptions::new().create(true).truncate(false))?;
     // Use the Unix primitive directly on every Unix target. The std wrapper
     // reports Unsupported on Android even on kernels with flock support.
     #[cfg(unix)]
@@ -1108,12 +1109,18 @@ mod tests {
             .unwrap();
         assert!(subscription.take_change());
         assert!(!subscription.take_change());
+        let original = store.snapshot();
         store
             .transaction(|s| {
                 s.last_sync = Some(123);
                 Ok(())
             })
             .unwrap();
+        let metadata_only = store.snapshot();
+        assert!(Arc::ptr_eq(
+            original.workspace.as_ref().unwrap(),
+            metadata_only.workspace.as_ref().unwrap()
+        ));
         assert!(!subscription.take_change());
         let rejected: Fallible<()> = store.transaction(|s| {
             s.workspace_mut()?.calendar.members.clear();
@@ -1121,6 +1128,26 @@ mod tests {
         });
         assert!(rejected.is_err());
         assert!(!subscription.take_change());
+        let rename = |state: &mut LocalState, name: &str| -> Fallible<()> {
+            let id = state.device;
+            state
+                .workspace_mut()?
+                .calendar
+                .members
+                .get_mut(&id)
+                .unwrap()
+                .value = name.into();
+            Ok(())
+        };
+        assert!(store.transaction(|s| rename(s, "")).is_err());
+        assert!(Arc::ptr_eq(&metadata_only, &store.snapshot()));
+        assert!(!subscription.take_change());
+        store.transaction(|s| rename(s, "Ольга")).unwrap();
+        assert!(subscription.take_change());
+        assert_eq!(
+            original.workspace.as_ref().unwrap().calendar.members[&original.device].value,
+            "Анна"
+        );
     }
 
     #[test]

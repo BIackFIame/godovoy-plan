@@ -2,7 +2,7 @@
 //! so pause can release the OS handles before returning, even during an idle poll.
 use super::*;
 use mio::{Events, Interest, Poll, Registry, Token, Waker, event::Source};
-use std::sync::OnceLock;
+use std::sync::{Condvar, OnceLock};
 
 struct Signal {
     registry: Registry,
@@ -30,6 +30,7 @@ pub(super) struct Ports {
 pub(super) struct Inbound {
     config: Config,
     pub(super) ports: Mutex<Ports>,
+    resumed: Condvar,
     tcp_signal: Option<Signal>,
     udp_signal: Option<Signal>,
     pub(super) sync_thread: OnceLock<thread::Thread>,
@@ -75,6 +76,7 @@ impl Inbound {
             Self {
                 config,
                 ports: Default::default(),
+                resumed: Condvar::new(),
                 tcp_signal,
                 udp_signal,
                 sync_thread: OnceLock::new(),
@@ -90,7 +92,19 @@ impl Inbound {
                 .is_ok()
         })
     }
+    pub(super) fn wait_for_resume(&self, core: &Core) {
+        let ports = self.ports.lock().unwrap();
+        drop(
+            self.resumed
+                .wait_while(ports, |_| {
+                    core.paused.load(Ordering::Acquire) && !core.stopped.load(Ordering::Acquire)
+                })
+                .unwrap(),
+        );
+    }
+
     pub(super) fn wake(&self) {
+        self.resumed.notify_all();
         for s in [&self.tcp_signal, &self.udp_signal].into_iter().flatten() {
             let _ = s.waker.wake();
         }

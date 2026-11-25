@@ -217,7 +217,7 @@ impl Store {
         }
         workspace.calendar.merge(previous.calendar.clone());
         workspace.calendar.validate()?;
-        next.workspace = Some(workspace);
+        next.workspace = Some(Arc::new(workspace));
         next.peers.clear();
         next.peers.insert(peer);
         self.install_generation(next)
@@ -296,7 +296,7 @@ mod tests {
         state
             .create_workspace("Офис".into(), "Анна".into())
             .unwrap();
-        let initial = state.workspace.unwrap();
+        let initial = Arc::unwrap_or_clone(state.workspace.unwrap());
         let mut newer = initial.clone();
         let mut fork = initial.clone();
         newer.rotate_key().unwrap();

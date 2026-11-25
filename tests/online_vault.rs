@@ -20,6 +20,32 @@ fn cli(action: &str, dir: &Path, more: &[&str]) -> Output {
 }
 
 #[test]
+fn acl_reads_accept_exact_limit_and_reject_trailing_or_oversized_documents() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("bounded");
+    let vault = OnlineVault::init(
+        &dir,
+        "Календарь".into(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let lock = vault.lock().unwrap();
+    let path = dir.join("online-access-v1.json");
+    let mut padded = fs::read(&path).unwrap();
+    padded.resize(512 * 1024, b' ');
+    fs::write(&path, &padded).unwrap();
+    assert!(lock.access().is_ok());
+    padded.push(b' ');
+    fs::write(&path, &padded).unwrap();
+    assert!(lock.access().is_err());
+    padded.truncate(512 * 1024);
+    *padded.last_mut().unwrap() = b'{';
+    fs::write(path, padded).unwrap();
+    assert!(lock.access().is_err());
+}
+
+#[test]
 fn legacy_office_grant_and_new_remote_grant_for_one_employee_are_independent() {
     let tmp = TempDir::new().unwrap();
     let dir = tmp.path().join("shared");

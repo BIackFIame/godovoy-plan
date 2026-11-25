@@ -42,6 +42,7 @@ public final class CalendarApplication extends Application {
     @Override
     public void onCreate() {
         super.onCreate();
+        ReminderSchedule.configureReceiver(this, ReminderSchedule.enabled(this));
         profile = new File(getNoBackupFilesDir(), "profile");
     }
 

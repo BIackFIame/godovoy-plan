@@ -267,7 +267,7 @@ impl Store {
             current.revision_floor =
                 Some(current.latest_revision().max(restored.latest_revision()));
             let workspace = restored.workspace.take().ok_or("Календарь не создан.")?;
-            current.workspace_mut()?.calendar = workspace.calendar;
+            current.workspace_mut()?.calendar = Arc::unwrap_or_clone(workspace).calendar;
             restored = current;
         }
         restored.sync_paused = true;

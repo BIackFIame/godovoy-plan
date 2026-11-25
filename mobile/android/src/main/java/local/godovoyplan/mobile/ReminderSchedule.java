@@ -5,7 +5,9 @@ import android.app.Notification;
 import android.app.NotificationChannel;
 import android.app.NotificationManager;
 import android.app.PendingIntent;
+import android.content.ComponentName;
 import android.content.Context;
+import android.content.pm.PackageManager;
 import android.content.Intent;
 import android.content.SharedPreferences;
 import org.json.JSONArray;
@@ -24,7 +26,19 @@ public final class ReminderSchedule {
     public static boolean enabled(Context context) {
         return preferences(context).getBoolean("enabled", false);
     }
+    // Keep the manifest default for upgrades from versions with active reminders.
+    // A fresh or opted-out profile should not start on boot or clock changes.
+    static void configureReceiver(Context context, boolean enabled) {
+        PackageManager packages = context.getPackageManager();
+        ComponentName receiver = new ComponentName(context, ReminderReceiver.class);
+        int wanted = enabled ? PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
+                             : PackageManager.COMPONENT_ENABLED_STATE_DISABLED;
+        if (packages.getComponentEnabledSetting(receiver) != wanted) {
+            packages.setComponentEnabledSetting(receiver, wanted, PackageManager.DONT_KILL_APP);
+        }
+    }
     public static synchronized void enable(Context context) {
+        configureReceiver(context, true);
         preferences(context).edit().putBoolean("enabled", true).apply();
         context.getSystemService(NotificationManager.class).createNotificationChannel(
                 new NotificationChannel(CHANNEL, "Напоминания календаря", NotificationManager.IMPORTANCE_DEFAULT));
@@ -32,7 +46,8 @@ public final class ReminderSchedule {
     }
     public static synchronized void disable(Context context) {
         preferences(context).edit().putBoolean("enabled", false).apply();
-        context.getSystemService(AlarmManager.class).cancel(alarmIntent(context));
+        cancelAlarm(context);
+        configureReceiver(context, false);
         context.getSystemService(NotificationManager.class).cancel(1);
     }
     public static synchronized void refresh(Context context, JSONArray dates) {
@@ -48,14 +63,18 @@ public final class ReminderSchedule {
         pref.edit().putStringSet("dates", next).apply();
         rearm(context);
     }
-    private static PendingIntent alarmIntent(Context context) {
+    private static PendingIntent alarmIntent(Context context, int flags) {
         Intent intent = new Intent(context, ReminderReceiver.class).setAction(ALARM);
-        return PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_IMMUTABLE);
+        return PendingIntent.getBroadcast(context, 1, intent, PendingIntent.FLAG_IMMUTABLE | flags);
+    }
+    private static void cancelAlarm(Context context) {
+        PendingIntent existing = alarmIntent(context, PendingIntent.FLAG_NO_CREATE);
+        if (existing != null) {
+            context.getSystemService(AlarmManager.class).cancel(existing);
+            existing.cancel();
+        }
     }
     static synchronized void rearm(Context context) {
-        AlarmManager alarms = context.getSystemService(AlarmManager.class);
-        PendingIntent intent = alarmIntent(context);
-        alarms.cancel(intent);
         if (!enabled(context)) return;
         long now = System.currentTimeMillis(), earliest = Long.MAX_VALUE;
         String previous = preferences(context).getString("delivered", "");
@@ -64,7 +83,12 @@ public final class ReminderSchedule {
             long time = LocalDate.parse(date).atTime(9, 0).atZone(ZoneId.systemDefault()).toInstant().toEpochMilli();
             if (time > now && time < earliest) earliest = time;
         }
-        if (earliest != Long.MAX_VALUE) alarms.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, earliest, intent);
+        if (earliest == Long.MAX_VALUE) {
+            cancelAlarm(context);
+        } else {
+            context.getSystemService(AlarmManager.class).setAndAllowWhileIdle(
+                    AlarmManager.RTC_WAKEUP, earliest, alarmIntent(context, 0));
+        }
     }
     static synchronized void deliver(Context context) {
         String day = LocalDate.now().toString();

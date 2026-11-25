@@ -226,7 +226,7 @@ impl Plan {
         }
     }
 
-    fn latest(&self) -> u64 {
+    pub(crate) fn latest(&self) -> u64 {
         self.templates
             .values()
             .map(|r| r.revision.sequence)

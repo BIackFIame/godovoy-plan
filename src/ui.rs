@@ -247,7 +247,7 @@ pub(crate) struct CalendarRow {
 }
 
 struct CalendarView {
-    snapshot: Weak<LocalState>,
+    snapshot: Weak<Workspace>,
     year: i32,
     search: String,
     category: Option<Category>,
@@ -275,7 +275,8 @@ struct TaskRows {
 }
 
 struct PersonalView {
-    snapshot: Weak<LocalState>,
+    device: Id,
+    snapshot: Weak<Workspace>,
     receipts: Weak<BTreeSet<Reminder>>,
     today: NaiveDate,
     events: Vec<(Id, i32)>,
@@ -291,7 +292,7 @@ enum AgendaPeriod {
 }
 
 struct AgendaView {
-    snapshot: Weak<LocalState>,
+    snapshot: Weak<Workspace>,
     today: NaiveDate,
     period: AgendaPeriod,
     owner: OwnerFilter,
@@ -798,12 +799,9 @@ impl App {
             });
     }
 
-    fn calendar_rows(
-        &mut self,
-        state: &Arc<LocalState>,
-        calendar: &Calendar,
-    ) -> Arc<[CalendarRow]> {
-        let snapshot = Arc::downgrade(state);
+    fn calendar_rows(&mut self, workspace: &Arc<Workspace>) -> Arc<[CalendarRow]> {
+        let calendar = &workspace.calendar;
+        let snapshot = Arc::downgrade(workspace);
         let search = search_key(&self.search);
         if let Some(view) = &self.calendar_view
             && view.snapshot.ptr_eq(&snapshot)
@@ -856,11 +854,11 @@ impl App {
     fn calendar(
         &mut self,
         ui: &mut Ui,
-        state: &Arc<LocalState>,
-        calendar: &Calendar,
+        workspace: &Arc<Workspace>,
         today: NaiveDate,
         usage: ProfileUsage,
     ) {
+        let calendar = &workspace.calendar;
         if let Some(id) = self.selected
             && self.calendar_view.as_ref().is_some_and(|view| {
                 view.year == self.year && view.rows.iter().any(|row| row.id == id)
@@ -871,7 +869,7 @@ impl App {
             self.open_event(event.year, id);
         }
         let displayed_year = self.year;
-        let events = self.calendar_rows(state, calendar);
+        let events = self.calendar_rows(workspace);
         let selected = self
             .update_selection(&events, today)
             .and_then(|id| calendar.event(id, displayed_year));
@@ -931,7 +929,7 @@ impl App {
                 ui.separator();
                 ui.add_space(8.0);
 
-                let updated = self.calendar_rows(state, calendar);
+                let updated = self.calendar_rows(workspace);
                 if !Arc::ptr_eq(&events, &updated) {
                     self.update_selection(&updated, today);
                 }
@@ -3143,7 +3141,7 @@ impl App {
         &mut self,
         ui: &mut Ui,
         state: &Arc<LocalState>,
-        workspace: &Workspace,
+        workspace: &Arc<Workspace>,
         today: NaiveDate,
     ) {
         egui::CentralPanel::default()
@@ -3242,7 +3240,7 @@ impl App {
                         );
                     }
                 });
-                let snapshot = Arc::downgrade(state);
+                let snapshot = Arc::downgrade(workspace);
                 if !self.agenda.as_ref().is_some_and(|view| {
                     view.snapshot.ptr_eq(&snapshot)
                         && view.today == today
@@ -3531,24 +3529,27 @@ impl App {
         receipts: &Arc<BTreeSet<Reminder>>,
         today: NaiveDate,
     ) {
-        let snapshot = Arc::downgrade(state);
+        let Some(workspace) = &state.workspace else {
+            self.personal = None;
+            return;
+        };
+        let snapshot = Arc::downgrade(workspace);
         let receipt_snapshot = Arc::downgrade(receipts);
         if self.personal.as_ref().is_some_and(|view| {
             view.snapshot.ptr_eq(&snapshot)
+                && view.device == state.device
                 && view.receipts.ptr_eq(&receipt_snapshot)
                 && view.today == today
         }) {
             return;
         }
-        let Some(workspace) = &state.workspace else {
-            return;
-        };
         let events = planning::personal_events(&workspace.calendar, today, state.device);
         let pending = planning::due_reminders(&events, today)
             .into_iter()
             .filter(|reminder| !receipts.contains(reminder))
             .collect::<Vec<_>>();
         self.personal = Some(PersonalView {
+            device: state.device,
             snapshot,
             receipts: receipt_snapshot,
             today,
@@ -3642,7 +3643,8 @@ impl eframe::App for App {
             // Other processes or peers can change the visible calendar.
             Duration::from_secs(2)
         } else {
-            self.next_reminder_check.saturating_duration_since(Instant::now())
+            self.next_reminder_check
+                .saturating_duration_since(Instant::now())
         };
         ctx.request_repaint_after(delay);
     }
@@ -3690,7 +3692,7 @@ impl eframe::App for App {
         self.backup_creation_notice(ui);
         self.draft_banner(ui, &workspace.calendar);
         match self.page {
-            Page::Calendar => self.calendar(ui, &state, &workspace.calendar, today, snapshot.usage),
+            Page::Calendar => self.calendar(ui, workspace, today, snapshot.usage),
             Page::Tasks => self.tasks(ui, today, &workspace.calendar),
             Page::Agenda => self.agenda_page(ui, &state, workspace, today),
             Page::Reminders => self.reminders_page(ui, &state, &pending, today),
@@ -4721,23 +4723,36 @@ mod design_interactions {
         app.year = 2026;
         app.search = "ПАРТНЕРАМ".into();
         let state = store.lock().unwrap().snapshot();
-        let calendar = &state.workspace.as_ref().unwrap().calendar;
-        let original = app.calendar_rows(&state, calendar);
+        let workspace = state.workspace.as_ref().unwrap();
+        let original = app.calendar_rows(workspace);
         assert_eq!(original[0].id, event);
+        store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                state.last_sync = Some(123);
+                Ok(())
+            })
+            .unwrap();
+        let stamped = store.lock().unwrap().snapshot();
+        assert!(Arc::ptr_eq(
+            &original,
+            &app.calendar_rows(stamped.workspace.as_ref().unwrap())
+        ));
         app.search = " партнёрам ".into();
-        assert!(Arc::ptr_eq(&original, &app.calendar_rows(&state, calendar)));
+        assert!(Arc::ptr_eq(&original, &app.calendar_rows(workspace)));
         app.search.push_str(" отсутствует");
-        assert!(app.calendar_rows(&state, calendar).is_empty());
+        assert!(app.calendar_rows(workspace).is_empty());
         app.search = "ёрам".into();
-        assert_eq!(app.calendar_rows(&state, calendar)[0].id, event);
+        assert_eq!(app.calendar_rows(workspace)[0].id, event);
         app.category = Some(Category::Team);
-        assert!(app.calendar_rows(&state, calendar).is_empty());
+        assert!(app.calendar_rows(workspace).is_empty());
         app.category = None;
         app.year = 2027;
-        assert!(app.calendar_rows(&state, calendar).is_empty());
+        assert!(app.calendar_rows(workspace).is_empty());
 
         app.year = 2026;
-        assert_eq!(app.calendar_rows(&state, calendar).len(), 1);
+        assert_eq!(app.calendar_rows(workspace).len(), 1);
         store
             .lock()
             .unwrap()
@@ -4747,8 +4762,8 @@ mod design_interactions {
             })
             .unwrap();
         let updated = store.lock().unwrap().snapshot();
-        let calendar = &updated.workspace.as_ref().unwrap().calendar;
-        assert!(app.calendar_rows(&updated, calendar).is_empty());
+        let workspace = updated.workspace.as_ref().unwrap();
+        assert!(app.calendar_rows(workspace).is_empty());
     }
 
     #[test]

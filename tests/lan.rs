@@ -198,7 +198,7 @@ fn one_use_invite_offline_edits_and_relay_to_another_peer() {
 
     let disk = std::fs::read_to_string(third.profile.path().join("profile/calendar.json")).unwrap();
     let persisted: godovoy_plan::storage::LocalState = serde_json::from_str(&disk).unwrap();
-    let calendar = persisted.workspace.unwrap().calendar;
+    let calendar = &persisted.workspace.as_ref().unwrap().calendar;
     assert_eq!(calendar.event(event, 2026).unwrap().completed(), 2);
     assert_eq!(calendar.event(event, 2027).unwrap().completed(), 0);
 }

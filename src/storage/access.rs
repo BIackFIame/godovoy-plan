@@ -28,6 +28,68 @@ pub(super) fn check_directory(path: &Path) -> Fallible<()> {
     Ok(())
 }
 
+/// Inspect the handle that will actually be used. Never follow the final
+/// component or wait for a special file while deciding whether it is regular.
+pub(super) fn open_regular(
+    path: &Path,
+    options: &mut fs::OpenOptions,
+) -> Fallible<(fs::File, fs::Metadata)> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        options.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err("Ожидался обычный файл хранилища.".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 { // FILE_ATTRIBUTE_REPARSE_POINT
+            return Err("Файл содержит точку повторной обработки.".into());
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.nlink() != 1 || metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err("Файл должен принадлежать текущему пользователю и не иметь других ссылок.".into());
+        }
+    }
+    Ok((file, metadata))
+}
+
+pub(super) fn open_lock(path: &Path, options: &mut fs::OpenOptions) -> Fallible<fs::File> {
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Readers and writers may wait on the same lock. Pin its name while open.
+        options.share_mode(0x1 | 0x2); // FILE_SHARE_READ | FILE_SHARE_WRITE
+    }
+    let (file, _metadata) = open_regular(path, options)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if _metadata.mode() & 0o077 != 0 {
+            return Err("Файл блокировки должен иметь закрытые права (0600).".into());
+        }
+    }
+    Ok(file)
+}
+
 #[cfg(unix)]
 fn managed(name: &std::ffi::OsStr) -> bool {
     let Some(name) = name.to_str() else {
@@ -39,6 +101,9 @@ fn managed(name: &std::ffi::OsStr) -> bool {
         "calendar.json"
             | "online-access-v1.json"
             | "online-calendar-v1.json"
+            | "online-protection-required-v1.json"
+            | "online-standby-v1.json"
+            | "online-backup-check-v1.json"
             | "profile.lock"
             | "team-initialized"
             | "reminders-v1.json"
@@ -303,5 +368,37 @@ fn run_windows_acl(directory: &Path, create: bool) -> Fallible<()> {
             return Err("Проверка прав Windows не завершилась вовремя, профиль не открыт.".into());
         }
         thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[cfg(test)]
+mod lock_files {
+    use super::*;
+
+    #[test]
+    fn opens_normal_lock_and_rejects_directory() {
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("profile.lock");
+        let created = open_lock(&lock, fs::OpenOptions::new().create_new(true)).unwrap();
+        drop(created);
+        assert!(open_lock(&lock, &mut fs::OpenOptions::new()).is_ok());
+        assert!(open_lock(tmp.path(), &mut fs::OpenOptions::new()).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn lock_requires_private_permissions_and_a_single_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let lock = tmp.path().join("profile.lock");
+        let alias = tmp.path().join("other.lock");
+        let created = open_lock(&lock, fs::OpenOptions::new().create_new(true)).unwrap();
+        drop(created);
+        fs::hard_link(&lock, &alias).unwrap();
+        assert!(open_lock(&lock, &mut fs::OpenOptions::new()).is_err());
+        fs::remove_file(alias).unwrap();
+        fs::set_permissions(&lock, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(open_lock(&lock, &mut fs::OpenOptions::new()).is_err());
+        assert_eq!(fs::metadata(lock).unwrap().permissions().mode() & 0o777, 0o644);
     }
 }

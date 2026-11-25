@@ -45,7 +45,7 @@ impl PeerRoutes {
         self.addresses.values().copied()
     }
 
-    pub(crate) fn remember(&mut self, device: Id, address: SocketAddrV4) {
+    pub(crate) fn remember(&mut self, device: Id, address: SocketAddrV4) -> bool {
         let changed = match self.addresses.get(&device) {
             Some(current) => *current != address,
             None => self.addresses.len() < self.capacity,
@@ -55,7 +55,7 @@ impl PeerRoutes {
         }
         let now = Instant::now();
         if !self.can_save || !self.retry_at.map_or(changed, |retry| retry <= now) {
-            return;
+            return changed;
         }
         match save(&self.path, &self.addresses, ROUTE_FILE_LIMIT) {
             Ok(_) => {
@@ -69,6 +69,7 @@ impl PeerRoutes {
                 self.retry_at = Some(now + WRITE_RETRY_INTERVAL);
             }
         }
+        changed
     }
 }
 
@@ -101,10 +102,11 @@ mod tests {
         let path = directory.path().join("routes.json");
         let address = |port| SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
         let mut routes = PeerRoutes::open(path.clone(), 2);
-        routes.remember(Id::from_u128(1), address(1000));
-        routes.remember(Id::from_u128(2), address(1001));
-        routes.remember(Id::from_u128(3), address(1002));
-        routes.remember(Id::from_u128(1), address(1003));
+        assert!(routes.remember(Id::from_u128(1), address(1000)));
+        assert!(!routes.remember(Id::from_u128(1), address(1000)));
+        assert!(routes.remember(Id::from_u128(2), address(1001)));
+        assert!(!routes.remember(Id::from_u128(3), address(1002)));
+        assert!(routes.remember(Id::from_u128(1), address(1003)));
         let reopened = PeerRoutes::open(path, 2);
         assert!(reopened.warning.is_none());
         assert_eq!(

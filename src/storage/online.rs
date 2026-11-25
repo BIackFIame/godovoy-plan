@@ -16,7 +16,7 @@ mod standby;
 pub use standby::StandbyWindow;
 
 use super::{
-    CALENDAR_MESSAGE_LIMIT, check_profile_file, random_bytes, save, validate_profile_access,
+    CALENDAR_MESSAGE_LIMIT, access, random_bytes, save, validate_profile_access,
 };
 use crate::{
     Fallible,
@@ -210,14 +210,7 @@ impl OnlineVault {
         #[cfg(windows)]
         super::access::create_windows_profile(directory)?;
         validate_profile_access(directory)?;
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.mode(0o600);
-        }
-        let file = opts.open(directory.join(LOCK))?;
+        let file = access::open_lock(&directory.join(LOCK), OpenOptions::new().create_new(true))?;
         file.lock()?;
         let database = Data {
             calendar,
@@ -254,15 +247,7 @@ impl OnlineVault {
     /// In particular an HTTP request cannot pass revocation and then commit a write.
     pub fn lock(&self) -> Fallible<LockedVault<'_>> {
         let path = self.0.join(LOCK);
-        check_profile_file(&path)?;
-        let mut opts = OpenOptions::new();
-        opts.read(true).write(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            opts.custom_flags(libc::O_NOFOLLOW);
-        }
-        let file = opts.open(path)?;
+        let file = access::open_lock(&path, &mut OpenOptions::new())?;
         file.lock()?;
         Ok(LockedVault {
             directory: &self.0,
@@ -270,33 +255,17 @@ impl OnlineVault {
         })
     }
 }
-// Atomically reject symlinks/reparse points and special files when opening a payload.
 fn open_regular(path: &Path) -> Fallible<(File, fs::Metadata)> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    access::open_regular(path, OpenOptions::new().read(true))
+}
+
+fn read_bounded_json<T: DeserializeOwned>(file: File, limit: usize) -> Fallible<T> {
+    let mut bounded = file.take(limit as u64 + 1);
+    let value = serde_json::from_reader(std::io::BufReader::new(&mut bounded))?;
+    if bounded.limit() == 0 {
+        return Err("Хранилище превышает допустимый размер.".into());
     }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        opts.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
-    }
-    let file = opts.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err("Ожидался обычный файл хранилища.".into());
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err("Файл содержит точку повторной обработки.".into());
-        }
-    }
-    Ok((file, metadata))
+    Ok(value)
 }
 fn sync_directory(directory: &Path) -> Fallible<()> {
     #[cfg(unix)]
@@ -317,12 +286,20 @@ impl LockedVault<'_> {
     }
     fn read<T: DeserializeOwned>(&self, name: &str, limit: usize) -> Fallible<T> {
         let (file, _) = self.open_bounded(name, limit)?;
-        Ok(serde_json::from_reader(std::io::BufReader::new(
-            file.take(limit as u64 + 1),
-        ))?)
+        read_bounded_json(file, limit)
     }
     pub fn access(&self) -> Fallible<Access> {
-        let mut acl: Access = self.read(ACCESS, ACCESS_LIMIT)?;
+        // The ACL is small and read on each request under the vault lock.
+        // Parse the current file directly from a bounded contiguous buffer.
+        let mut acl: Access = {
+            let (mut file, size) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
+            let mut bytes = vec![0; size];
+            file.read_exact(&mut bytes)?;
+            if file.read(&mut [0])? != 0 {
+                return Err("Размер файла прав изменился во время чтения.".into());
+            }
+            serde_json::from_slice(&bytes)?
+        };
         if acl
             .assigned_only
             .iter()
@@ -539,5 +516,24 @@ impl LockedVault<'_> {
         });
         save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
         sync_directory(self.directory)
+    }
+}
+
+#[cfg(test)]
+mod file_guards {
+    use super::*;
+    use std::io::{Seek, Write};
+
+    #[test]
+    fn bounded_json_checks_actual_bytes_after_open() {
+        let mut file = tempfile::tempfile().unwrap();
+        file.write_all(b"42  ").unwrap();
+        file.rewind().unwrap();
+        let metadata_len = file.metadata().unwrap().len() as usize;
+        assert_eq!(read_bounded_json::<u8>(file.try_clone().unwrap(), metadata_len).unwrap(), 42);
+        file.seek(std::io::SeekFrom::End(0)).unwrap();
+        file.write_all(b" ").unwrap();
+        file.rewind().unwrap();
+        assert!(read_bounded_json::<u8>(file, metadata_len).is_err());
     }
 }
