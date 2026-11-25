@@ -392,6 +392,7 @@ pub struct App {
     year: i32,
     selected: Option<Id>,
     reveal_event: bool,
+    reveal_task: Option<AgendaItem>,
     search: String,
     search_focus: bool,
     category: Option<Category>,
@@ -489,6 +490,7 @@ impl App {
             year: Local::now().year(),
             selected: None,
             reveal_event: false,
+            reveal_task: None,
             search: String::new(),
             search_focus: false,
             category: None,
@@ -1278,6 +1280,7 @@ impl App {
         today: NaiveDate,
         usage: ProfileUsage,
     ) {
+        let reveal_task = self.reveal_task.take();
         let Some(event) = selected else {
             title(ui, "Событие", SECTION_TITLE_SIZE);
             muted(ui, "Выберите событие в календаре");
@@ -1347,12 +1350,30 @@ impl App {
         }
         for task in &event.event.tasks {
             let mut checked = event.checked(task.id);
-            let changed = ui
-                .push_id(task.id, |ui| {
+            let checkbox = ui
+                .push_id((event.id, event.year, task.id), |ui| {
                     task_checkbox(ui, &mut checked, task, event, today)
                 })
                 .inner;
-            if changed {
+            if reveal_task.is_some_and(|row| {
+                row.event == event.id
+                    && row.year == event.year
+                    && row.kind == Milestone::Task(task.id)
+            }) {
+                checkbox.request_focus();
+                if !ui.clip_rect().contains_rect(checkbox.rect.expand(2.0)) {
+                    checkbox.scroll_to_me(Some(Align::Center));
+                }
+            }
+            if checkbox.has_focus() {
+                ui.painter().rect_stroke(
+                    checkbox.rect.expand(2.0),
+                    4,
+                    Stroke::new(2.0, ACCENT),
+                    egui::StrokeKind::Inside,
+                );
+            }
+            if checkbox.changed() {
                 self.check(event.id, event.year, task.id, checked);
             }
         }
@@ -1779,7 +1800,15 @@ impl App {
             });
     }
 
+    fn open_milestone(&mut self, row: AgendaItem) {
+        self.open_event(row.year, row.event);
+        if matches!(row.kind, Milestone::Task(_)) {
+            self.reveal_task = Some(row);
+        }
+    }
+
     fn open_event(&mut self, year: i32, id: Id) {
+        self.reveal_task = None;
         self.year = year;
         self.selected = Some(id);
         self.search.clear();
@@ -3448,7 +3477,7 @@ impl App {
                                         )
                                         .clicked()
                                         {
-                                            self.open_event(row.year, row.event);
+                                            self.open_milestone(row);
                                         }
                                         agenda_cell(
                                             ui,
@@ -3631,7 +3660,7 @@ impl App {
                         self.reminder_work.enqueue(&[row], pending, today);
                         ui.ctx().request_repaint();
                     }
-                    self.open_event(row.year, row.event);
+                    self.open_milestone(row);
                 } else if let Some(row) = acknowledged {
                     self.reminder_work.enqueue(&[row], pending, today);
                     ui.ctx().request_repaint();
@@ -3853,7 +3882,7 @@ fn task_checkbox(
     task: &Task,
     event: Occurrence<'_>,
     today: NaiveDate,
-) -> bool {
+) -> egui::Response {
     ui.spacing_mut().interact_size.y = 24.0;
     ui.spacing_mut().item_spacing.y = 1.0;
     let color = if *checked { MUTED } else { INK };
@@ -3876,7 +3905,7 @@ fn task_checkbox(
             ui.label(deadline);
         });
     }
-    checkbox.changed()
+    checkbox
 }
 
 fn task_alert(due: NaiveDate, today: NaiveDate) -> Option<(&'static str, egui::Color32)> {

@@ -723,3 +723,64 @@ fn compact_calendar_keeps_the_list_and_sync_navigation_visible() {
         assert!(label("События за год").bottom() < size.y - 46.0);
     }
 }
+
+#[test]
+fn a_task_deadline_reveals_its_checkbox_without_marking_it_complete() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&directory.path().join("profile"));
+    let date = NaiveDate::from_ymd_opt(2028, 4, 12).unwrap();
+    let mut editor = Editor::new(date.year(), date);
+    editor.event.title = "План подготовки".into();
+    for number in 1..=40 {
+        editor.event.tasks.push(Task {
+            id: Id::new_v4(),
+            title: format!("Пункт {number}"),
+            days_before: 0,
+        });
+    }
+    app.save_event(&editor, false).unwrap();
+    let target = &editor.event.tasks[34];
+    let before = app.reader.snapshot().state;
+    let row = AgendaItem {
+        year: date.year(),
+        event: editor.id,
+        kind: Milestone::Task(target.id),
+        date,
+    };
+
+    app.open_milestone(row);
+    app.open_event(date.year(), editor.id);
+    assert!(app.reveal_task.is_none());
+    app.open_milestone(row);
+    let ctx = egui::Context::default();
+    crate::theme::setup(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut shapes = Vec::new();
+    for tick in 0..40 {
+        let input = egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                vec2(960.0, 600.0),
+            )),
+            time: Some(f64::from(tick) / 60.0),
+            ..Default::default()
+        };
+        shapes = ctx
+            .run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
+            .shapes;
+    }
+
+    let focused = ctx.memory(|memory| memory.focused()).unwrap();
+    let checkbox = ctx.read_response(focused).unwrap();
+    assert!(shapes.iter().any(|shape| {
+        let egui::Shape::Text(text) = &shape.shape else {
+            return false;
+        };
+        let bounds = text.visual_bounding_rect();
+        text.galley.text() == target.title
+            && shape.clip_rect.contains_rect(bounds)
+            && checkbox.rect.contains(bounds.center())
+    }));
+    assert!(app.reveal_task.is_none());
+    assert!(Arc::ptr_eq(&before, &app.reader.snapshot().state));
+}
