@@ -1,0 +1,41 @@
+name: Проверка iOS-проекта выпуска
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Тег опубликованного выпуска
+        required: true
+        default: v0.6.5
+permissions:
+  contents: read
+jobs:
+  simulator:
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Проверить и распаковать комплект Xcode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          test "$(uname -m)" = arm64
+          name="GodovoyPlan-${TAG#v}-iOS-Xcode.zip"
+          expected=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" --jq ".assets[] | select(.name == \"$name\") | .digest")
+          [[ "$expected" =~ ^sha256:[a-f0-9]{64}$ ]]
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name"
+          echo "${expected#sha256:}  $name" | shasum -a 256 -c -
+          ditto -x -k "$name" "$RUNNER_TEMP/package"
+      - name: Собрать приложение для устройства без ключа подписи
+        run: |
+          cd "$RUNNER_TEMP/package/GodovoyPlan-iOS"
+          xcodebuild -quiet -project GodovoyPlan.xcodeproj -scheme GodovoyPlan -configuration Release -destination 'generic/platform=iOS' -derivedDataPath "$RUNNER_TEMP/device" CODE_SIGNING_ALLOWED=NO build
+      - name: Создать календарь, сохранить событие и открыть его после перезапуска
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/package/GodovoyPlan-iOS"
+          xcrun simctl list -j devices available > "$RUNNER_TEMP/devices.json"
+          phone=$(python3 -c 'import json,sys; data=json.load(open(sys.argv[1]))["devices"]; print(next(d["udid"] for runtime,devices in reversed(list(data.items())) if ".iOS-" in runtime for d in devices if d["name"].startswith("iPhone") and d["isAvailable"]))' "$RUNNER_TEMP/devices.json")
+          xcrun simctl bootstatus "$phone" -b
+          xcodebuild -project GodovoyPlan.xcodeproj -scheme GodovoyPlan -destination "platform=iOS Simulator,id=$phone" -parallel-testing-enabled NO -only-testing:GodovoyPlanUITests/CalendarUITests/testCreateCalendarAndPersistEvent -resultBundlePath "$RUNNER_TEMP/Calendar.xcresult" test
