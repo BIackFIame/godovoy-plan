@@ -1166,13 +1166,6 @@ impl App {
             let month = events[index].date.month();
             events[..index].partition_point(|row| row.date.month() < month)
         };
-        // Leave enough room to bring December (or the last populated month) to the
-        // top, even when it has only a few dates. Short lists already fit in full.
-        let extra_rows = if events.len() > visible_rows {
-            (visible_rows + 1).saturating_sub(events.len() - month_start(events.len() - 1))
-        } else {
-            0
-        };
         if std::mem::take(&mut self.reveal_event)
             && let Some(index) = events
                 .iter()
@@ -1183,8 +1176,8 @@ impl App {
         }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
-            scroll.show_rows(ui, row_height, events.len() + extra_rows, |ui, range| {
-                for event in &events[range.start.min(events.len())..range.end.min(events.len())] {
+            scroll.show_rows(ui, row_height, events.len(), |ui, range| {
+                for event in &events[range] {
                     let active = self.selected == Some(event.id);
                     let (rect, response) = ui.allocate_exact_size(
                         vec2(ui.available_width(), row_height),

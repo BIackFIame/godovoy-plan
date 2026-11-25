@@ -1,6 +1,54 @@
 use super::*;
 
 #[test]
+fn revealing_december_keeps_preceding_events_in_the_annual_list() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&directory.path().join("profile"));
+    let usage = app.reader.snapshot().usage;
+    let rows: Vec<_> = (1..=12)
+        .map(|month| CalendarRow {
+            id: Id::from_u128(u128::from(month)),
+            date: NaiveDate::from_ymd_opt(2026, month, 1).unwrap(),
+            title: format!("Событие {month}"),
+            category: Category::Partners,
+        })
+        .collect();
+    let ctx = egui::Context::default();
+    crate::theme::setup(&ctx);
+    for (target, neighbor) in [(11, 10), (0, 1)] {
+        app.selected = Some(rows[target].id);
+        app.reveal_event = true;
+        let mut render = || {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    vec2(340.0, 220.0),
+                )),
+                ..Default::default()
+            };
+            ctx.run_ui(input, |ui| {
+                egui::CentralPanel::default().show_inside(ui, |ui| {
+                    app.event_list(ui, &rows, rows[0].date, usage);
+                });
+            })
+        };
+        render();
+        let painted = render();
+        for index in [target, neighbor] {
+            assert!(
+                painted.shapes.iter().any(|shape| {
+                    matches!(&shape.shape, egui::Shape::Text(text)
+                    if text.galley.text() == rows[index].title
+                        && shape.clip_rect.contains_rect(text.visual_bounding_rect()))
+                }),
+                "expected visible event {}",
+                rows[index].title
+            );
+        }
+    }
+}
+
+#[test]
 fn restore_result_keeps_source_files_and_warning_separate_from_backup_status() {
     let directory = tempfile::tempdir().unwrap();
     let store = Store::open(&directory.path().join("profile")).unwrap();
