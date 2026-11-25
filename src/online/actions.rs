@@ -47,7 +47,12 @@ pub(crate) struct EventView<'a> {
     preparation_date: NaiveDate,
     checklist: Checklist<'a>,
     note: &'a str,
-    revision: String,
+    #[serde(serialize_with = "serialize_revision")]
+    revision: Revision,
+}
+
+fn serialize_revision<S: Serializer>(revision: &Revision, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!("{}:{}", revision.sequence, revision.operation))
 }
 
 pub(crate) fn occurrence<'a>(
@@ -73,7 +78,7 @@ pub(crate) fn occurrence<'a>(
         preparation_date: e.preparation_date(),
         checklist: Checklist(e),
         note: if allow_free_text { e.note() } else { "" },
-        revision: format!("{}:{}", e.revision.sequence, e.revision.operation),
+        revision: e.revision,
     }
 }
 
