@@ -33,7 +33,7 @@ def extract_release(release, name, programs, directory):
             (directory / prog).write_bytes(package.read(prog))
     print(name, digest, flush=True)
 
-def http(port, key, path):
+def get_authorized(port, key, path):
     conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
     try:
         conn.request("GET", path, headers={"Authorization": "Bearer " + key})
@@ -60,11 +60,11 @@ def server_flow(exe, directory):
         threading.Thread(target=lambda: lines.put(process.stderr.readline()), daemon=True).start()
         line = lines.get(timeout=15)
         port = int(re.search(r"127\.0\.0\.1:(\d+)", line)[1])
-        assert http(port, key, "/v1/session")[0] == 204
-        status, body = http(port, key, "/v1/state?year=2028")
+        assert get_authorized(port, key, "/v1/session")[0] == 204
+        status, body = get_authorized(port, key, "/v1/state?year=2028")
         assert status == 200 and json.loads(body)["workspaceName"] == "Windows QA"
         cli(exe, "revoke", vault, key.split(".")[0])
-        assert http(port, key, "/v1/session")[0] == 401
+        assert get_authorized(port, key, "/v1/session")[0] == 401
     finally:
         process.terminate()
         process.wait(timeout=10)
