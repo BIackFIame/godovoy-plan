@@ -43,6 +43,7 @@ public final class MainActivity extends Activity {
     private CalendarApplication app;
     private LinearLayout root, body;
     JSONObject state = new JSONObject();
+    private boolean renderPending;
     private String section = "Год", selectedId = "", stateKey = "";
     int year = LocalDate.now().getYear();
     private int month, outstanding;
@@ -229,7 +230,7 @@ public final class MainActivity extends Activity {
         final int expected = year;
         loading = true;
         String token = str(state, "stateToken");
-        JSONObject request = force || token.isEmpty() || state.optInt("year") != year
+        JSONObject request = token.isEmpty() || state.optInt("year") != year
                 ? message("state", "year", year) : message("state", "year", year, "ifToken", token);
         app.call(request, (data, error) -> {
             if (!alive())
@@ -243,10 +244,18 @@ public final class MainActivity extends Activity {
             if (expected != year || !(data instanceof JSONObject))
                 return;
             JSONObject next = (JSONObject) data;
-            if (next.optBoolean("unchanged")) return;
+            if (next.optBoolean("unchanged")) {
+                if (force && token.equals(stateKey)) {
+                    ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
+                    if (renderPending && dialog == null)
+                        render();
+                }
+                return;
+            }
             String key = str(next, "stateToken");
             if (key.isEmpty()) key = next.toString();
             if (force || !key.equals(stateKey)) {
+                renderPending = true;
                 state = next;
                 stateKey = key;
                 ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
@@ -333,6 +342,7 @@ public final class MainActivity extends Activity {
     private void render() {
         if (!alive())
             return;
+        renderPending = false;
         boolean joined = !str(state, "workspaceName").isEmpty();
         if (!joined) {
             newPage("Годовой план");
@@ -396,6 +406,7 @@ public final class MainActivity extends Activity {
         selectedId = id;
         resetList();
         if (yr != year) {
+            renderPending = true;
             year = yr;
             refresh(true);
         } else
@@ -405,6 +416,7 @@ public final class MainActivity extends Activity {
         int next = year + by;
         if (next < 1900 || next > 9999)
             return;
+        renderPending = true;
         year = next;
         resetList();
         refresh(true);
@@ -737,8 +749,10 @@ public final class MainActivity extends Activity {
             hint(form, "Последний обмен · " + last);
         }
         boolean paused = state.optBoolean("paused");
-        form.addView(button(paused ? "Возобновить синхронизацию" : "Приостановить синхронизацию",
-                () -> action(message("pause", "paused", !paused), null)));
+        boolean enabled = state.optBoolean("lanEnabled", true);
+        String syncAction = !enabled ? "Включить обмен по локальной сети" :
+                paused ? "Возобновить синхронизацию" : "Приостановить синхронизацию";
+        form.addView(button(syncAction, () -> action(message("pause", "paused", enabled && !paused), null)));
         form.addView(button("Добавить адрес коллеги", () -> {
             LinearLayout panel = vertical();
             EditText field = field(panel, "IPv4-адрес и порт", "", false);

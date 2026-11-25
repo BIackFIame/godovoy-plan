@@ -242,7 +242,11 @@ fn linked_employees_share_personal_work_but_keep_independent_device_access() {
     .unwrap();
     let request = desktop.pairing_request();
     let invite = phone.ok(json!({"op":"invite","request":request}));
-    let address = state["address"].as_str().unwrap().parse().unwrap();
+    let address = phone.state(2027)["address"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
     desktop
         .join_async(
             invite.as_str().unwrap().into(),
@@ -320,6 +324,10 @@ fn linked_employees_share_personal_work_but_keep_independent_device_access() {
 fn reopening_a_session_keeps_background_pause_until_foreground() {
     let tmp = TempDir::new().unwrap();
     let mut phone = super::Mobile::open(tmp.path().join("profile")).unwrap();
+    phone
+        .request(json!({"op":"createWorkspace","name":"Команда","employee":"Анна"}))
+        .unwrap();
+    phone.request(json!({"op":"pause","paused":false})).unwrap();
     phone.request(json!({"op":"background"})).unwrap();
     phone.session = None;
     let paused =
@@ -329,4 +337,18 @@ fn reopening_a_session_keeps_background_pause_until_foreground() {
     assert!(paused(&mut phone));
     phone.request(json!({"op":"foreground"})).unwrap();
     assert!(!paused(&mut phone));
+}
+
+#[test]
+fn fresh_profile_waits_for_an_explicit_local_choice() {
+    let tmp = TempDir::new().unwrap();
+    let mut phone = super::Mobile::open(tmp.path().join("profile")).unwrap();
+    for op in ["foreground", "background", "foreground"] {
+        phone.request(json!({"op":op})).unwrap();
+        assert!(phone.session.as_ref().unwrap().network.is_none());
+    }
+    assert!(phone.request(json!({"op":"state","year":2027})).unwrap()["address"].is_null());
+    phone.request(json!({"op":"pairingRequest"})).unwrap();
+    let session = phone.session.as_ref().unwrap();
+    assert!(session.network.is_some());
 }

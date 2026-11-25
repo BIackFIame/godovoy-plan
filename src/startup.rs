@@ -103,16 +103,15 @@ pub fn run(
     .map_err(|error| error.to_string().into())
 }
 
-fn open_calendar(store: SharedStore, mut config: Config, standard_profile: bool) -> App {
-    let network = match Network::start(store.clone(), config) {
+pub(crate) fn start_network(store: SharedStore, mut config: Config) -> Result<Network, String> {
+    match Network::start(store.clone(), config) {
         Ok(network) => Ok(network),
         Err(error) if *config.listen.ip() == Ipv4Addr::UNSPECIFIED => {
             config.listen = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0);
             Network::start(store.clone(), config).map_err(|second| format!("{error}. {second}"))
         }
         Err(error) => Err(error.to_string()),
-    };
-    App::new(store, network, standard_profile)
+    }
 }
 
 struct BackupPicker {
@@ -283,7 +282,7 @@ impl Desktop {
     fn start(&mut self, store: Fallible<SharedStore>) {
         match store {
             Ok(store) => {
-                let mut app = open_calendar(store, self.config, self.standard_profile);
+                let mut app = App::open(store, self.config, self.standard_profile);
                 if let Some(result) = self.restored.take() {
                     app.report_restore(result);
                 }
@@ -615,11 +614,7 @@ impl eframe::App for Desktop {
                 .as_ref()
                 .is_some_and(|app| app.backup_creation_busy());
         if let Some(app) = &mut self.app {
-            if self.picker.is_none() {
-                app.logic(context, frame);
-            } else {
-                app.poll_api_controls();
-            }
+            app.logic(context, frame);
         }
         if let Some(directory) = self.app.as_mut().and_then(|app| app.renewed_profile.take()) {
             drop(self.app.take());

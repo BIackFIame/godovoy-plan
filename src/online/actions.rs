@@ -103,6 +103,39 @@ pub(crate) struct CalendarView<'a> {
     tasks: Vec<EventView<'a>>,
 }
 
+#[derive(Serialize)]
+struct ChangedRow<'v, 'a> {
+    index: usize,
+    event: &'v EventView<'a>,
+}
+
+#[derive(Serialize)]
+pub(crate) struct ChangedEvent<'v, 'a> {
+    id: Id,
+    year: i32,
+    events: Vec<ChangedRow<'v, 'a>>,
+    tasks: Vec<ChangedRow<'v, 'a>>,
+}
+
+impl<'a> CalendarView<'a> {
+    pub(crate) fn changed_event(&self, id: Id) -> ChangedEvent<'_, 'a> {
+        fn rows<'v, 'a>(events: &'v [EventView<'a>], id: Id) -> Vec<ChangedRow<'v, 'a>> {
+            events
+                .iter()
+                .enumerate()
+                .filter(|(_, event)| event.id == id)
+                .map(|(index, event)| ChangedRow { index, event })
+                .collect()
+        }
+        ChangedEvent {
+            id,
+            year: self.context.year,
+            events: rows(&self.events, id),
+            tasks: rows(&self.tasks, id),
+        }
+    }
+}
+
 impl<'a> ViewContext<'a> {
     pub(crate) fn new(acl: &'a Access, year: i32, employee: Id, can_edit: bool) -> Self {
         let assigned_only = acl.assigned_only.contains(&employee);

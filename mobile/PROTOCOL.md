@@ -6,7 +6,7 @@
 
 | op | Дополнительные входные поля | data |
 |---|---|---|
-| state | year (число) | `{deviceId,employeeId,workspaceName,year,members,employees,events,tasks,reminders,paused,lastSync}`. `workspaceName` и `lastSync` могут быть null. `members` — `{id,name,revoked,employeeId}[]`. `events` — события выбранного года. `tasks` — события текущего пользователя, которым требуется внимание сегодня. `reminders` — `{eventId,year,title,date}[]`. |
+| state | year (число) | `{deviceId,employeeId,workspaceName,year,members,employees,events,tasks,reminders,lanEnabled,paused,lastSync}`. `workspaceName` и `lastSync` могут быть null. `members` — `{id,name,revoked,employeeId}[]`. `events` — события выбранного года. `tasks` — события текущего пользователя, которым требуется внимание сегодня. `reminders` — `{eventId,year,title,date}[]`. |
 | createWorkspace | name, employee | null |
 | createEvent | title, date, yearly (bool), preparationDays (число), ownerId (UUID или null), category (`Campaign`, `Partners`, `Team`, `Operations`), checklist (`{title,daysBefore}[]`), description (строка, опционально) | null |
 | check | eventId, year, taskId, done (bool) | null |
@@ -50,3 +50,5 @@
 У события `ownerId` хранит исходное назначение, а `employeeId` обозначает сотрудника после применения связей. Для нового назначения выбирайте ID из `employees`. Если ответственный в форме редактирования остался прежним, отправляйте исходный `ownerId`. У каждого события и каждой годовой записи сохраняются собственные идентификаторы, отметки и история.
 
 Команда `linkEmployeeDevice` доступна устройству с правом управления. Список `deviceIds` в команде `revoke` всегда содержит конкретные устройства. После отзыва одного устройства назначения по-прежнему видны на остальных устройствах сотрудника с действующим ключом.
+
+`lanEnabled` показывает сохранённый выбор локального обмена на этом устройстве. Новый профиль и новый локальный календарь запускаются без слушателей TCP/UDP. Команды `pairingRequest`, `join`, `rejoin`, `invite`, `peer` и `pause` с `paused=false` выражают явный выбор обмена. Команды чтения и жизненного цикла сами по себе этот выбор не меняют.

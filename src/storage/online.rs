@@ -238,7 +238,7 @@ impl OnlineVault {
         Ok(Self(directory.canonicalize()?))
     }
     pub fn open(directory: &Path) -> Fallible<Self> {
-        validate_profile_access(directory)?;
+        super::check_private_directory(directory)?;
         if directory.join("calendar.json").try_exists()? {
             return Err("Нельзя использовать P2P-профиль как хранилище узла.".into());
         }
@@ -247,6 +247,7 @@ impl OnlineVault {
                 return Err("Повреждён каталог узла.".into());
             }
         }
+        validate_profile_access(directory)?;
         Ok(Self(directory.canonicalize()?))
     }
     /// Every administrative change and authenticated read/write shares this lock.
@@ -371,7 +372,7 @@ impl LockedVault<'_> {
         Ok(())
     }
     pub fn data(&self) -> Fallible<Data> {
-        self.read(DATA, DATA_LIMIT)
+        Ok(serde_json::from_slice(&self.data_bytes()?)?)
     }
     /// Read the exact bytes used for both the conditional view fingerprint and decoding.
     pub fn data_bytes(&self) -> Fallible<Vec<u8>> {

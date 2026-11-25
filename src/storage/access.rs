@@ -56,7 +56,7 @@ fn managed(name: &std::ffi::OsStr) -> bool {
 }
 
 #[cfg(unix)]
-fn inspect_file(path: &Path) -> Fallible<()> {
+fn inspect_file(path: &Path, repair: bool) -> Fallible<()> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
     let found = fs::symlink_metadata(path)?;
     if !found.is_file() || found.uid() != rustix::process::geteuid().as_raw() {
@@ -68,6 +68,9 @@ fn inspect_file(path: &Path) -> Fallible<()> {
     }
     if found.mode() & 0o077 == 0 {
         return Ok(());
+    }
+    if !repair {
+        return Err(format!("Файл должен иметь закрытые права (0600): {}", path.display()).into());
     }
     // Narrow permissions on old, user-owned single-link files only. An
     // external hard link might designate data outside the profile.
@@ -156,13 +159,36 @@ fn validate_unix_ancestors(directory: &Path, absolute: &Path) -> Fallible<()> {
 
 #[cfg(unix)]
 pub(super) fn validate_profile_access(directory: &Path) -> Fallible<()> {
+    inspect_profile(directory, true)
+}
+
+#[cfg(all(unix, feature = "server"))]
+pub(super) fn verify_profile_access(directory: &Path) -> Fallible<()> {
+    inspect_profile(directory, false)
+}
+
+#[cfg(unix)]
+fn private_directory_path(directory: &Path) -> Fallible<std::path::PathBuf> {
     check_directory(directory)?;
     let absolute = fs::canonicalize(directory)?;
     // The native mobile shells supply their platform-owned private app container.
     // Its ancestors belong to Android/iOS system users and are managed by the OS sandbox.
     #[cfg(not(any(target_os = "android", target_os = "ios")))]
     validate_unix_ancestors(directory, &absolute)?;
-    let mut paths = vec![absolute];
+    Ok(absolute)
+}
+
+#[cfg(all(unix, feature = "server"))]
+pub(super) fn verify_staging_parent(directory: &Path) -> Fallible<()> {
+    let _absolute = private_directory_path(directory)?;
+    #[cfg(target_os = "macos")]
+    check_mac_acl(&[_absolute], false)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn inspect_profile(directory: &Path, repair: bool) -> Fallible<()> {
+    let mut paths = vec![private_directory_path(directory)?];
     let mut files = Vec::new();
     let backup = directory.join("backups");
     match fs::symlink_metadata(&backup) {
@@ -194,7 +220,7 @@ pub(super) fn validate_profile_access(directory: &Path) -> Fallible<()> {
         check_mac_acl(&paths, false)?;
     }
     for file in files {
-        inspect_file(&file)?;
+        inspect_file(&file, repair)?;
     }
     Ok(())
 }
@@ -204,6 +230,11 @@ pub(super) fn validate_profile_access(directory: &Path) -> Fallible<()> {
     check_directory(directory)?;
     run_windows_acl(directory, false)
 }
+
+#[cfg(all(windows, feature = "server"))]
+pub(super) use validate_profile_access as verify_profile_access;
+#[cfg(all(windows, feature = "server"))]
+pub(super) use validate_profile_access as verify_staging_parent;
 
 #[cfg(windows)]
 pub(super) fn create_windows_profile(directory: &Path) -> Fallible<()> {

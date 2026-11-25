@@ -1,5 +1,5 @@
 //! In-memory validators only. Both credentials and policy are checked before lookup.
-use super::super::actions::ViewContext;
+use super::super::actions::{CalendarView, ViewContext};
 use axum::{
     http::{HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
@@ -27,6 +27,60 @@ impl Default for Views {
 }
 
 impl Views {
+    pub(super) fn input(
+        credential: Id,
+        context: &ViewContext<'_>,
+        today: NaiveDate,
+        data: &[u8],
+    ) -> Fallible<InputDigest> {
+        let mut source = Blake2b::<U32>::new();
+        source.update(credential.as_bytes());
+        source.update(today.num_days_from_ce().to_be_bytes());
+        serde_json::to_writer(&mut source, context)?;
+        source.update(data);
+        Ok(source.finalize().into())
+    }
+
+    pub(super) fn lookup(&self, key: &InputDigest) -> Fallible<Option<HeaderValue>> {
+        let entries = self
+            .entries
+            .lock()
+            .map_err(|_| "Ошибка проверки версии календаря.")?;
+        Ok(entries
+            .iter()
+            .find(|(digest, _)| digest == key)
+            .map(|(_, tag)| tag.clone()))
+    }
+
+    pub(super) fn remember(&self, key: InputDigest, tag: HeaderValue) -> Fallible<()> {
+        let mut entries = self
+            .entries
+            .lock()
+            .map_err(|_| "Ошибка проверки версии календаря.")?;
+        if entries.len() == MAX_VIEWS {
+            entries.pop_front();
+        }
+        entries.push_back((key, tag));
+        Ok(())
+    }
+
+    fn tag_bytes(&self, credential: Id, body: &[u8]) -> Fallible<HeaderValue> {
+        let digest = Blake2b::<U32>::new()
+            .chain_update(self.nonce.as_bytes())
+            .chain_update(credential.as_bytes())
+            .chain_update(body)
+            .finalize();
+        Ok(HeaderValue::from_str(&format!("\"{digest:x}\""))?)
+    }
+
+    pub(super) fn view_tag(
+        &self,
+        credential: Id,
+        view: &CalendarView<'_>,
+    ) -> Fallible<HeaderValue> {
+        self.tag_bytes(credential, &serde_json::to_vec(view)?)
+    }
+
     pub(super) fn response(
         &self,
         credential: Id,
@@ -37,22 +91,8 @@ impl Views {
     ) -> Fallible<Response> {
         // This internal fingerprint may change when another employee edits a private
         // event. Only the digest of the caller's rendered representation leaves the host.
-        let mut source = Blake2b::<U32>::new();
-        source.update(credential.as_bytes());
-        source.update(today.num_days_from_ce().to_be_bytes());
-        serde_json::to_writer(&mut source, &context)?;
-        source.update(&data);
-        let key: InputDigest = source.finalize().into();
-        let known = {
-            let entries = self
-                .entries
-                .lock()
-                .map_err(|_| "Ошибка проверки версии календаря.")?;
-            entries
-                .iter()
-                .find(|(digest, _)| digest == &key)
-                .map(|(_, tag)| tag.clone())
-        };
+        let key = Self::input(credential, &context, today, &data)?;
+        let known = self.lookup(&key)?;
         if let Some(tag) = &known
             && matches_tag(condition, tag)
         {
@@ -67,20 +107,8 @@ impl Views {
         let tag = if let Some(tag) = known {
             tag
         } else {
-            let digest = Blake2b::<U32>::new()
-                .chain_update(self.nonce.as_bytes())
-                .chain_update(credential.as_bytes())
-                .chain_update(&body)
-                .finalize();
-            let tag = HeaderValue::from_str(&format!("\"{digest:x}\""))?;
-            let mut entries = self
-                .entries
-                .lock()
-                .map_err(|_| "Ошибка проверки версии календаря.")?;
-            if entries.len() == MAX_VIEWS {
-                entries.pop_front();
-            }
-            entries.push_back((key, tag.clone()));
+            let tag = self.tag_bytes(credential, &body)?;
+            self.remember(key, tag.clone())?;
             tag
         };
         let response = if matches_tag(condition, &tag) {

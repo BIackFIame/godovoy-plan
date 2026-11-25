@@ -84,7 +84,7 @@ pub(super) fn state(session: &mut Session, year: i32, if_token: Option<Id>) -> F
     }
     let token = previous.unwrap_or_else(Id::new_v4);
     let mut result = json!({"deviceId":snapshot.device,"employeeId":null,"employees":[],"workspaceName":null,"year":year,"members":[],"events":[],"tasks":[],"reminders":[],"notificationDates":[],
-        "address":context.address, "networkError":context.warning, "paused":context.paused, "stateToken":token,
+        "lanEnabled":snapshot.lan_enabled(), "address":context.address, "networkError":context.warning, "paused":context.paused, "stateToken":token,
         "lastSync":context.last_sync.and_then(|s| DateTime::from_timestamp(s,0)).map(|d|d.to_rfc3339()),
         "canManage":false,"accessManagerId":null});
     session.last_state = Some(LastState {

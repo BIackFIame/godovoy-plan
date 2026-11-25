@@ -15,6 +15,10 @@ use std::path::PathBuf;
 use godovoy_plan::{APP_NAME, Fallible, network::Config};
 
 fn main() -> Fallible<()> {
+    if std::env::args_os().skip(1).eq([std::ffi::OsStr::new("--version")]) {
+        println!("godovoy-plan {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut directory = None;
     let mut config = Config::default();
     let mut at_login = false;

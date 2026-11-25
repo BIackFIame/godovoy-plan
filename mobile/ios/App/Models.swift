@@ -50,6 +50,7 @@ struct GPState: Decodable {
     let deviceId: String
     let workspaceName, address, networkError, lastSync, accessManagerId, stateToken: String?
     let year: Int
+    let lanEnabled: Bool?
     let canManage, paused: Bool
     let employees: [GPEmployee]
     let members: [GPMember]

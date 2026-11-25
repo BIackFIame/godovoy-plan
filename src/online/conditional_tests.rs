@@ -41,6 +41,157 @@ mod conditional_tests {
         assert!(to_bytes(response.into_body(), 0).await.unwrap().is_empty());
     }
 
+    async fn save_with_tag(f: &Fixture, key: &str, tag: &str, command: &Value) -> Response {
+        let req = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/command")
+            .header(header::HOST, "calendar.test")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-godovoy-year", "2028")
+            .header("x-godovoy-base", tag)
+            .body(Body::from(command.to_string()))
+            .unwrap();
+        f.app.clone().oneshot(req).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn receipt_matches_entire_authorized_snapshot_and_detects_other_changes() {
+        let f = Fixture::new();
+        let (_, colleague, other_key) =
+            f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let (tag, mut original) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let id = original["events"][0]["id"].clone();
+        let command = json!({"op":"note","eventId":id,"year":2028,"base":"","text":"Запись"});
+        let reply = save_with_tag(&f, &f.key, &tag, &command).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let new_tag = reply.headers()["x-godovoy-state-tag"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let patch: Value =
+            serde_json::from_slice(&to_bytes(reply.into_body(), 65536).await.unwrap()).unwrap();
+        for field in ["events", "tasks"] {
+            let rows = original[field].as_array_mut().unwrap();
+            rows.retain(|row| row["id"] != id);
+            for row in patch[field].as_array().unwrap() {
+                assert_eq!(row["event"]["id"], id);
+                rows.insert(
+                    row["index"].as_u64().unwrap() as usize,
+                    row["event"].clone(),
+                );
+            }
+        }
+        let (expected_tag, expected) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        assert_eq!(new_tag, expected_tag);
+        assert_eq!(original, expected);
+        let mut concurrent = f.create();
+        concurrent["ownerId"] = json!(colleague);
+        assert_eq!(
+            f.request("/v1/command", &other_key, Some(concurrent))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let check = json!({"op":"check","eventId":id,"year":2028,"taskId":original["events"][0]["checklist"][0]["id"],"done":true});
+        let reply = save_with_tag(&f, &f.key, &new_tag, &check).await;
+        assert_eq!(reply.status(), StatusCode::NO_CONTENT);
+        assert!(!reply.headers().contains_key("x-godovoy-state-tag"));
+        let (_, refreshed) = snapshot(get(&f, 2028, &f.key, &[&new_tag]).await).await;
+        assert_eq!(refreshed["events"].as_array().unwrap().len(), 2);
+        let (other_tag, _) = snapshot(get(&f, 2028, &other_key, &[]).await).await;
+        assert_eq!(
+            save_with_tag(&f, &f.key, &other_tag, &check).await.status(),
+            StatusCode::NO_CONTENT
+        );
+        f.vault.lock().unwrap().revoke(f.credential).unwrap();
+        assert_eq!(
+            save_with_tag(&f, &f.key, &new_tag, &check).await.status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+
+    #[tokio::test]
+    async fn private_colleague_edits_are_absent_from_receipts_and_keep_the_visible_base() {
+        let f = Fixture::new();
+        let (_, colleague, colleague_key) =
+            f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        f.vault
+            .lock()
+            .unwrap()
+            .set_employee_scope(f.employee, true)
+            .unwrap();
+        let (base, state) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let mut private = f.create();
+        private["ownerId"] = json!(colleague);
+        private["title"] = json!("Приватный заголовок");
+        assert_eq!(
+            f.request("/v1/command", &colleague_key, Some(private))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        let mut command = json!({"op":"note", "eventId":state["events"][0]["id"], "year":2028, "base":"", "text":"Готово"});
+        let reply = save_with_tag(&f, &f.key, &base, &command).await;
+        assert_eq!(reply.status(), StatusCode::OK);
+        let tag = reply.headers()["x-godovoy-state-tag"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let bytes = to_bytes(reply.into_body(), 65536).await.unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(!body.contains("Приватный заголовок"));
+        assert!(!body.contains(&colleague.to_string()));
+        assert_unchanged(get(&f, 2028, &f.key, &[&tag]).await, &tag).await;
+        let (_, all) = snapshot(get(&f, 2028, &colleague_key, &[]).await).await;
+        command["eventId"] = all["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|event| event["title"] == "Приватный заголовок")
+            .unwrap()["id"]
+            .clone();
+        let denied = save_with_tag(&f, &f.key, &tag, &command).await;
+        assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+        assert!(!denied.headers().contains_key("x-godovoy-state-tag"));
+    }
+
+    #[tokio::test]
+    async fn large_full_read_requires_a_durable_audit_entry() {
+        let f = Fixture::new();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        {
+            let lock = f.vault.lock().unwrap();
+            let mut data = lock.data().unwrap();
+            let template = data.calendar.plans.values().next().unwrap().clone();
+            for _ in 0..600 {
+                data.calendar.plans.insert(Id::new_v4(), template.clone());
+            }
+            lock.save_data(&data).unwrap();
+            assert!(lock.data_bytes().unwrap().len() >= 128 * 1024);
+        }
+        let (_, body) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        assert_eq!(body["events"].as_array().unwrap().len(), 601);
+        let log = f._tmp.path().join("host").join(format!(
+            "security-{}.jsonl",
+            chrono::Utc::now().format("%Y-%m")
+        ));
+        assert!(
+            std::fs::read_to_string(&log)
+                .unwrap()
+                .lines()
+                .last()
+                .unwrap()
+                .contains("state_requested")
+        );
+        std::fs::write(log, b"unfinished synthetic record").unwrap();
+        let denied = get(&f, 2028, &f.key, &[]).await;
+        assert_eq!(denied.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(!denied.headers().contains_key(header::ETAG));
+    }
+
     #[tokio::test]
     async fn conditional_reads_match_http_tags_and_scope_changes() {
         let f = Fixture::new();

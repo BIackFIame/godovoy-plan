@@ -384,15 +384,29 @@ async fn state(
                 return unavailable();
             };
             let today = chrono::Local::now().date_naive();
-            let Ok(response) = views.response(id, context, today, data, &condition) else {
+            let parallel_audit = data.len() >= 128 * 1024 && condition.is_empty();
+            let prepare = || views.response(id, context, today, data, &condition);
+            let audit = || lock.audit_security("state_requested", Some(id), Some(employee), None);
+            let result = if parallel_audit {
+                std::thread::scope(|scope| {
+                    // Keep the vault lock until both the read and its durable audit finish.
+                    let Ok(writer) = std::thread::Builder::new()
+                        .name("calendar-read-audit".into())
+                        .stack_size(256 * 1024)
+                        .spawn_scoped(scope, audit)
+                    else {
+                        return prepare().ok().filter(|_| audit().is_ok());
+                    };
+                    let view = prepare();
+                    writer.join().ok()?.ok()?;
+                    view.ok()
+                })
+            } else {
+                prepare().ok().filter(|_| audit().is_ok())
+            };
+            let Some(response) = result else {
                 return unavailable();
             };
-            if lock
-                .audit_security("state_requested", Some(id), Some(employee), None)
-                .is_err()
-            {
-                return unavailable();
-            }
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
             }
@@ -423,19 +437,98 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             "Требуется application/json.",
         );
     }
+    let views = host.views.clone();
+    let receipt = headers
+        .get("x-godovoy-base")
+        .zip(headers.get("x-godovoy-year"))
+        .and_then(|(tag, year)| {
+            let tag = tag.to_str().ok()?;
+            let tag = tag.strip_prefix("W/").unwrap_or(tag);
+            let hex = tag.strip_prefix('"')?.strip_suffix('"')?;
+            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+                return None;
+            }
+            let year = year.to_str().ok()?.parse::<i32>().ok()?;
+            (1900..=9999)
+                .contains(&year)
+                .then(|| (tag.to_owned(), year))
+        });
     with_auth(
         host,
         headers,
         GrantPurpose::Employee,
         true,
-        move |lock, acl, credential, employee, _, mode| {
+        move |lock, acl, credential, employee, can_edit, mode| {
             let Ok(cmd) = serde_json::from_slice::<Command>(&body) else {
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
             };
-            let Ok(data) = lock.data() else {
+            let today = chrono::Local::now().date_naive();
+            let mut receipt = receipt.and_then(|(base, year)| match &cmd {
+                Command::Check { event_id, .. } | Command::Note { event_id, .. } => {
+                    Some((base, year, *event_id))
+                }
+                _ => None,
+            });
+            let Ok(raw) = lock.data_bytes() else {
                 return unavailable();
             };
-            commit_command(lock, acl, credential, employee, mode, cmd, data)
+            let Ok(mut data) = serde_json::from_slice(&raw) else {
+                return unavailable();
+            };
+            if let Some((base, year, _)) = &receipt {
+                let context = actions::ViewContext::new(acl, *year, employee, can_edit);
+                let known = conditional::Views::input(credential, &context, today, &raw)
+                    .and_then(|key| views.lookup(&key))
+                    .ok()
+                    .flatten();
+                let tag = known.or_else(|| {
+                    views
+                        .view_tag(credential, &context.render(&data, today))
+                        .ok()
+                });
+                if tag.is_none_or(|tag| tag.as_bytes() != base.as_bytes()) {
+                    receipt = None;
+                }
+            }
+            drop(raw);
+            let saved = commit_command(lock, acl, credential, employee, mode, cmd, &mut data);
+            let Some((_, year, event)) = receipt else {
+                return saved;
+            };
+            if saved.status() != StatusCode::NO_CONTENT
+                || chrono::Local::now().date_naive() != today
+            {
+                return saved;
+            }
+            if lock
+                .audit_security("state_requested", Some(credential), Some(employee), None)
+                .is_err()
+            {
+                return unavailable();
+            }
+            let context = actions::ViewContext::new(acl, year, employee, can_edit);
+            let Ok(key) = lock
+                .data_bytes()
+                .and_then(|raw| conditional::Views::input(credential, &context, today, &raw))
+            else {
+                return unavailable();
+            };
+            let view = context.render(&data, today);
+            let Ok(tag) = views.view_tag(credential, &view) else {
+                return unavailable();
+            };
+            if views.remember(key, tag.clone()).is_err() {
+                return unavailable();
+            }
+            let mut reply = Json(view.changed_event(event)).into_response();
+            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                return standby_unavailable();
+            }
+            if chrono::Local::now().date_naive() != today {
+                return saved;
+            }
+            reply.headers_mut().insert("x-godovoy-state-tag", tag);
+            reply
         },
     )
     .await
@@ -454,7 +547,7 @@ fn commit_command(
     employee: Id,
     mode: &Mode,
     cmd: Command,
-    mut data: Data,
+    data: &mut Data,
 ) -> Response {
     if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
         if lock
@@ -473,7 +566,7 @@ fn commit_command(
             "free-text-disabled",
         );
     }
-    if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(&data, employee) {
+    if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(data, employee) {
         if lock
             .audit_security(
                 "employee_scope_denied",
@@ -490,7 +583,7 @@ fn commit_command(
             "assigned-only",
         );
     }
-    match actions::apply(cmd, &mut data, acl) {
+    match actions::apply(cmd, data, acl) {
         Err(e) => problem(
             if e.conflict {
                 StatusCode::CONFLICT
@@ -521,7 +614,7 @@ fn commit_command(
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
             }
-            match lock.save_data(&data) {
+            match lock.save_data(data) {
                 Ok(()) => StatusCode::NO_CONTENT.into_response(),
                 Err(_) => unavailable(),
             }

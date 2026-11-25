@@ -140,6 +140,10 @@ fn single_request(mut args: impl Iterator<Item = OsString>) -> Fallible<()> {
 }
 
 fn run() -> Fallible<()> {
+    if std::env::args_os().skip(1).eq([std::ffi::OsStr::new("--version")]) {
+        println!("godovoy-bridge {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut arguments = env::args_os().skip(1);
     if arguments.next().is_some_and(|s| s == "--request") {
         return single_request(arguments);

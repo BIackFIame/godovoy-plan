@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.5.49"
+version = "0.5.50"
 edition = "2024"
 default-run = "godovoy-plan"
 rust-version = "1.94"
@@ -63,6 +63,7 @@ notify-rust = { version = "4", optional = true }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 snow = { version = "0.10", default-features = false, features = ["use-blake2", "use-chacha20poly1305", "use-curve25519", "use-getrandom"] }
+mio = { version = "1", default-features = false, features = ["os-poll", "net"] }
 socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }

@@ -346,3 +346,50 @@ fn divergent_profiles_over_plan_limit_keep_both_copies_and_report_reason() {
         assert!(calendar.plans.contains_key(&Id::from_u128(start)));
     }
 }
+
+#[test]
+fn paused_transport_releases_both_ports_and_failed_resume_can_be_cancelled() {
+    use std::net::{TcpListener, UdpSocket};
+    let tmp = tempfile::tempdir().unwrap();
+    let store = Store::open(&tmp.path().join("profile")).unwrap();
+    store.lock().unwrap().set_sync_paused(true).unwrap();
+    let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    let tcp_addr = tcp.local_addr().unwrap();
+    let udp_addr = udp.local_addr().unwrap();
+    let config = Config {
+        listen: SocketAddrV4::new(Ipv4Addr::LOCALHOST, tcp_addr.port()),
+        discovery_port: Some(udp_addr.port()),
+    };
+    // Both ports already belong to other sockets. A saved pause must still open.
+    let network = Network::start(store, config).unwrap();
+    assert!(network.paused());
+    assert!(network.address().is_none());
+    assert!(network.set_profile_paused(false).is_err());
+    assert!(network.paused());
+    assert!(network.status().warning.is_some());
+    network.set_profile_paused(true).unwrap();
+    drop(tcp);
+    drop(udp);
+    thread::sleep(Duration::from_millis(3100));
+    let tcp = TcpListener::bind(tcp_addr).unwrap();
+    let udp = UdpSocket::bind(udp_addr).unwrap();
+    assert!(network.set_profile_paused(false).is_err());
+    drop(tcp);
+    // Allowed resume retries when the explicitly configured TCP port becomes free.
+    eventually(|| !network.paused());
+    assert!(network.address().is_some());
+    assert!(TcpListener::bind(tcp_addr).is_err());
+    assert!(network.status().warning.is_some());
+    drop(udp);
+    eventually(|| network.status().warning.is_none());
+    assert!(UdpSocket::bind(udp_addr).is_err());
+    network.set_paused(true);
+    let tcp = TcpListener::bind(tcp_addr).unwrap();
+    let udp = UdpSocket::bind(udp_addr).unwrap();
+    assert!(network.address().is_none());
+    drop((tcp, udp));
+    network.set_paused(false);
+    assert!(!network.paused());
+    assert!(TcpListener::bind(tcp_addr).is_err());
+}

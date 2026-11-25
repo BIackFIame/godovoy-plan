@@ -3,8 +3,8 @@ use std::{
     io::{self, BufRead, BufReader, BufWriter, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket},
     sync::{
-        Arc, Mutex, Weak,
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex, OnceLock, Weak,
+        atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
     thread,
@@ -29,6 +29,9 @@ use crate::{
     },
 };
 
+mod discovery;
+mod inbound;
+use inbound::{Inbound, Wait};
 mod pairing;
 use pairing::{ChannelKey, PairingKeys};
 
@@ -75,6 +78,14 @@ pub struct Config {
     pub discovery_port: Option<u16>,
 }
 
+impl Config {
+    fn effective_discovery_port(self) -> Option<u16> {
+        let ip = self.listen.ip();
+        self.discovery_port
+            .filter(|_| ip.is_unspecified() || ip.is_loopback())
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -113,10 +124,14 @@ struct Core {
     store: SharedStore,
     reader: StoreReader,
     listen: SocketAddrV4,
+    port: AtomicU16,
+    dialing: Mutex<()>,
+    inbound: OnceLock<Inbound>,
     stopped: AtomicBool,
     paused: AtomicBool,
     generation: AtomicUsize,
     invites: Mutex<BTreeMap<Id, InviteState>>,
+    pending_discovery: Mutex<Option<(Id, discovery::Key)>>,
     discovered: Mutex<BTreeMap<SocketAddrV4, Seen>>,
     routes: Mutex<PeerRoutes>,
     connected: Mutex<BTreeMap<Id, Instant>>,
@@ -143,31 +158,27 @@ impl Network {
     }
 
     pub fn start_with_pause(store: SharedStore, config: Config, paused: bool) -> Fallible<Self> {
-        let listener = TcpListener::bind(config.listen)?;
-        listener.set_nonblocking(true)?;
-        let SocketAddr::V4(listen) = listener.local_addr()? else {
-            return Err("Ожидался IPv4-адрес".into());
+        let config = Config {
+            discovery_port: config.effective_discovery_port(),
+            ..config
         };
         let paused = paused || store.lock().unwrap().sync_paused();
-        let core = Arc::new(Core::new(store, listen)?);
+        let core = Arc::new(Core::new(store, config.listen)?);
+        let (inbound, tcp, udp) = Inbound::new(config);
+        if !paused {
+            inbound.bind(&mut inbound.ports.lock().unwrap(), &core)?;
+        }
+        core.inbound
+            .set(inbound)
+            .map_err(|_| "Повторная инициализация сети.")?;
         core.paused.store(paused, Ordering::Release);
-
         let mut workers = Vec::new();
         if let Some(port) = config.discovery_port {
-            match discovery_socket(port) {
-                Ok(socket) => {
-                    let core = Arc::clone(&core);
-                    workers.push(thread::spawn(move || discover(core, socket, port)));
-                }
-                Err(error) => {
-                    core.status.lock().unwrap().warning = Some(format!(
-                        "Автопоиск недоступен. Можно подключаться по адресу. {error}"
-                    ));
-                }
-            }
+            let core = Arc::clone(&core);
+            workers.push(thread::spawn(move || discover(core, udp, port)));
         }
         let accept_core = Arc::clone(&core);
-        workers.push(thread::spawn(move || listen_forever(accept_core, listener)));
+        workers.push(thread::spawn(move || listen_forever(accept_core, tcp)));
         let sync_core = Arc::clone(&core);
         workers.push(thread::spawn(move || sync_forever(sync_core)));
         Ok(Self {
@@ -178,17 +189,26 @@ impl Network {
     }
 
     pub fn address(&self) -> Option<SocketAddrV4> {
+        if !self.core.active() {
+            return None;
+        }
         let listen = self.core.listen;
         let ip = if listen.ip().is_unspecified() {
             primary_ipv4()?
         } else {
             *listen.ip()
         };
-        Some(SocketAddrV4::new(ip, listen.port()))
+        Some(SocketAddrV4::new(
+            ip,
+            self.core.port.load(Ordering::Acquire),
+        ))
     }
 
     pub fn status(&self) -> Status {
         let mut status = self.core.status.lock().unwrap().clone();
+        if let Some(warning) = self.core.inbound.get().and_then(Inbound::warning) {
+            status.warning = Some(warning);
+        }
         status.route_warning = self.core.routes.lock().unwrap().warning.clone();
         status.recent_peers = self
             .core
@@ -214,28 +234,19 @@ impl Network {
     }
 
     pub fn set_paused(&self, paused: bool) {
-        if self.core.paused.swap(paused, Ordering::AcqRel) != paused {
-            self.core.generation.fetch_add(1, Ordering::AcqRel);
-        }
-        if paused {
-            self.core.connected.lock().unwrap().clear();
-        }
+        let _ = self.core.change_pause(paused); // Network::status exposes any pending rebind.
     }
 
     pub fn set_profile_paused(&self, paused: bool) -> Fallible<()> {
         let mut store = self.core.store.lock().unwrap();
         if paused {
-            self.set_paused(true);
+            self.core.change_pause(true)?;
         }
         store.set_sync_paused(paused).map_err(|error| {
-            if paused {
-                format!("Обмен приостановлен до закрытия приложения. Не удалось сохранить паузу. {error}").into()
-            } else {
-                error
-            }
+            if paused { format!("Обмен приостановлен до закрытия приложения. Не удалось сохранить паузу. {error}").into() } else {error}
         })?;
         if !paused {
-            self.set_paused(false);
+            self.core.change_pause(false)?;
         }
         Ok(())
     }
@@ -349,7 +360,7 @@ impl Network {
     }
 
     pub fn remember_peer(&self, address: SocketAddrV4) -> Fallible<()> {
-        check_address(address)?;
+        self.core.check_peer(address)?;
         self.core.store.lock().unwrap().transaction(|state| {
             if !state.peers.contains(&address) && state.peers.len() >= MAX_PEERS {
                 return Err(
@@ -358,7 +369,9 @@ impl Network {
             }
             state.peers.insert(address);
             Ok(())
-        })
+        })?;
+        self.core.wake_sync();
+        Ok(())
     }
 
     pub fn remove_saved_address(&self, address: SocketAddrV4) -> Fallible<()> {
@@ -372,6 +385,10 @@ impl Network {
 impl Drop for Network {
     fn drop(&mut self) {
         self.core.stopped.store(true, Ordering::Release);
+        let _ = self.core.change_pause(true);
+        for worker in &self.workers {
+            worker.thread().unpark();
+        }
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
@@ -392,10 +409,14 @@ impl Core {
             store,
             reader,
             listen,
+            port: AtomicU16::new(listen.port()),
+            dialing: Mutex::default(),
+            inbound: OnceLock::new(),
             stopped: AtomicBool::new(false),
             paused: AtomicBool::new(false),
             generation: AtomicUsize::new(0),
             invites: Mutex::default(),
+            pending_discovery: Mutex::default(),
             discovered: Mutex::default(),
             routes: Mutex::new(routes),
             connected: Mutex::default(),
@@ -406,9 +427,51 @@ impl Core {
         })
     }
 
+    fn change_pause(&self, paused: bool) -> Fallible<()> {
+        let inbound = self.inbound.get();
+        let mut ports = inbound.map(|p| p.ports.lock().unwrap());
+        if !paused && let (Some(input), Some(ports)) = (inbound, ports.as_mut()) {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err("Обмен остановлен.".into());
+            }
+            let result = input.bind(ports, self);
+            if result.is_err() {
+                input.wake();
+            }
+            result?;
+        }
+        if self.paused.swap(paused, Ordering::AcqRel) != paused {
+            self.generation.fetch_add(1, Ordering::AcqRel);
+        }
+        if paused {
+            if let (Some(input), Some(ports)) = (inbound, ports.as_mut()) {
+                input.close(ports);
+            }
+            self.connected.lock().unwrap().clear();
+        }
+        if paused {
+            // Let an already admitted TCP connect finish its bounded dial phase.
+            // Once this returns no autonomous dial admitted before pause can start.
+            drop(self.dialing.lock().unwrap());
+        }
+        drop(ports);
+        if let Some(input) = inbound {
+            input.wake();
+        }
+        Ok(())
+    }
+
+    fn advertised_port(&self) -> u16 {
+        // A paused renewal still needs a valid legacy protocol hint. The default
+        // port is used until a dynamic listener has been opened for the first time.
+        match self.port.load(Ordering::Acquire) {
+            0 => SYNC_PORT,
+            port => port,
+        }
+    }
+
     fn pause_for_renewal(&self) -> Fallible<()> {
-        self.paused.store(true, Ordering::Release);
-        self.generation.fetch_add(1, Ordering::AcqRel);
+        self.change_pause(true)?;
         self.invites.lock().unwrap().clear();
         self.store.lock().unwrap().set_sync_paused(true)
     }
@@ -423,6 +486,20 @@ impl Core {
         } else {
             Err("Синхронизация приостановлена.".into())
         }
+    }
+
+    fn permits_ip(&self, ip: Ipv4Addr) -> bool {
+        local_ip(ip) && (!self.listen.ip().is_loopback() || ip.is_loopback())
+    }
+
+    fn check_peer(&self, address: SocketAddrV4) -> Fallible<()> {
+        check_address(address)?;
+        if !self.permits_ip(*address.ip()) {
+            return Err(
+                "Локальный режим loopback допускает только адреса этого компьютера.".into(),
+            );
+        }
+        Ok(())
     }
 
     fn active(&self) -> bool {
@@ -444,6 +521,16 @@ impl Core {
             .as_ref()
             .ok_or("Сначала подключитесь к пространству.")?;
         Ok((state.device, workspace.id, workspace.key))
+    }
+
+    fn wake_sync(&self) {
+        if let Some(worker) = self
+            .inbound
+            .get()
+            .and_then(|inbound| inbound.sync_thread.get())
+        {
+            worker.unpark();
+        }
     }
 
     fn snapshot(&self) -> Arc<LocalState> {
@@ -635,60 +722,103 @@ fn check_address(address: SocketAddrV4) -> Fallible<()> {
     }
 }
 
-fn discovery_socket(port: u16) -> io::Result<UdpSocket> {
+fn discovery_socket(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
     let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     socket.set_reuse_address(true)?;
     #[cfg(unix)]
     socket.set_reuse_port(true)?;
-    socket.set_broadcast(true)?;
-    socket.bind(&SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port).into())?;
-    socket.set_read_timeout(Some(Duration::from_millis(200)))?;
+    socket.set_broadcast(ip.is_unspecified())?;
+    socket.bind(&SocketAddrV4::new(ip, port).into())?;
+    socket.set_nonblocking(true)?;
     Ok(socket.into())
 }
 
-fn discover(core: Arc<Core>, socket: UdpSocket, port: u16) {
+fn discover(core: Arc<Core>, mut wait: Wait, port: u16) {
+    let inbound = core.inbound.get().unwrap();
     let mut announce_at = Instant::now();
-    let mut packet = [0; 64];
+    // One extra byte distinguishes oversized/truncated packets.
+    let mut packet = [0; discovery::LENGTH + 1];
     while !core.stopped.load(Ordering::Relaxed) {
         if !core.active() {
-            thread::sleep(Duration::from_millis(200));
+            wait.until(true, Duration::from_secs(30));
             continue;
         }
-        let (device, workspace) = {
-            let state = core.snapshot();
-            (state.device, state.workspace.as_ref().map(|w| w.id))
-        };
         if Instant::now() >= announce_at {
             announce_at = Instant::now() + Duration::from_secs(3);
-            if let Some(workspace) = workspace {
-                let mut beacon = [0; 42];
-                beacon[..8].copy_from_slice(&MAGIC);
-                beacon[8..24].copy_from_slice(device.as_bytes());
-                beacon[24..40].copy_from_slice(workspace.as_bytes());
-                beacon[40..].copy_from_slice(&core.listen.port().to_be_bytes());
-                let _ = socket.send_to(&beacon, (Ipv4Addr::BROADCAST, port));
+            let state = core.snapshot();
+            if let Some(team) = &state.workspace {
+                let mut keys = vec![discovery::Key::derive(&team.key, true, team.id)];
+                let invites = core.invites.lock().unwrap();
+                keys.extend(
+                    invites
+                        .iter()
+                        .filter(|(_, invite)| invite.expires > Instant::now())
+                        .map(|(id, invite)| discovery::Key::derive(&invite.key, false, *id)),
+                );
+                drop(invites);
+                for key in keys {
+                    if !core.active() {
+                        break;
+                    }
+                    if let Some(message) = key.seal(
+                        state.device,
+                        team.id,
+                        core.advertised_port(),
+                        Utc::now().timestamp(),
+                    ) {
+                        inbound.announce(&message, port);
+                    }
+                }
             }
         }
-        let Ok((42, SocketAddr::V4(source))) = socket.recv_from(&mut packet) else {
+        let (registered, result) = inbound.receive(&mut packet);
+        let source = match result {
+            Ok((discovery::LENGTH, SocketAddr::V4(source))) if core.active() => source,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait.until(
+                    registered,
+                    announce_at.saturating_duration_since(Instant::now()),
+                );
+                continue;
+            }
+            Err(_) => {
+                thread::park_timeout(Duration::from_millis(40));
+                continue;
+            }
+            _ => continue,
+        };
+        if !core.active() || !core.permits_ip(*source.ip()) {
+            continue;
+        }
+        let state = core.snapshot();
+        let now = Utc::now().timestamp();
+        let packet = &packet[..discovery::LENGTH];
+        let hint = state
+            .workspace
+            .as_ref()
+            .and_then(|team| {
+                discovery::Key::derive(&team.key, true, team.id)
+                    .open(packet, now)
+                    .filter(|(_, group, _)| *group == team.id)
+            })
+            .or_else(|| {
+                let pending = core.pending_discovery.lock().unwrap();
+                let (host, key) = pending.as_ref()?;
+                key.open(packet, now).filter(|(from, _, _)| from == host)
+            });
+        let Some((from, remote_workspace, listen_port)) = hint else {
             continue;
         };
-        if packet[..8] != MAGIC || !local_ip(*source.ip()) {
+        if from == state.device {
             continue;
         }
-        let from = Id::from_slice(&packet[8..24]).expect("16 bytes");
-        if from == device {
-            continue;
-        }
-        let remote_workspace = Id::from_slice(&packet[24..40]).expect("16 bytes");
-        if workspace.is_some_and(|current| current != remote_workspace) {
-            continue;
-        }
-        let address = SocketAddrV4::new(*source.ip(), u16::from_be_bytes([packet[40], packet[41]]));
-        if address.port() == 0 {
-            continue;
-        }
+        let address = SocketAddrV4::new(*source.ip(), listen_port);
+        let mut seen = core.discovered.lock().unwrap();
+        let new_route = seen.get(&address).is_none_or(|old| {
+            old.workspace != remote_workspace || old.time.elapsed() >= DISCOVERY_TTL
+        });
         remember_discovery(
-            &mut core.discovered.lock().unwrap(),
+            &mut seen,
             address,
             Seen {
                 device: from,
@@ -696,6 +826,9 @@ fn discover(core: Arc<Core>, socket: UdpSocket, port: u16) {
                 time: Instant::now(),
             },
         );
+        if new_route && seen.contains_key(&address) {
+            core.wake_sync();
+        }
     }
 }
 
@@ -716,7 +849,8 @@ fn remember_discovery(
     }
 }
 
-fn listen_forever(core: Arc<Core>, listener: TcpListener) {
+fn listen_forever(core: Arc<Core>, mut wait: Wait) {
+    let inbound = core.inbound.get().unwrap();
     // Limit work per source and join handlers before releasing the profile.
     let mut workers: Vec<(Ipv4Addr, thread::JoinHandle<()>)> = Vec::new();
     while !core.stopped.load(Ordering::Acquire) {
@@ -728,10 +862,11 @@ fn listen_forever(core: Arc<Core>, listener: TcpListener) {
                 index += 1;
             }
         }
-        match listener.accept() {
+        let (registered, result) = inbound.accept();
+        match result {
             Ok((stream, SocketAddr::V4(address)))
                 if core.active()
-                    && local_ip(*address.ip())
+                    && core.permits_ip(*address.ip())
                     && workers.len() < 8
                     && workers.iter().filter(|(ip, _)| ip == address.ip()).count() < 3 =>
             {
@@ -740,12 +875,15 @@ fn listen_forever(core: Arc<Core>, listener: TcpListener) {
                 workers.push((
                     ip,
                     thread::spawn(move || {
-                        let _ = respond(&core, stream, ip);
+                        let _ = respond(&core, stream.into(), ip);
                     }),
                 ));
             }
             Ok(_) => {}
-            Err(_) => thread::sleep(Duration::from_millis(40)),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait.until(registered, Duration::from_secs(30));
+            }
+            Err(_) => thread::park_timeout(Duration::from_millis(40)),
         }
     }
     for (_, worker) in workers {
@@ -763,6 +901,7 @@ enum PeerProtocol {
 
 struct Backoff {
     next: Instant,
+    last_attempt: Instant,
     protocol: PeerProtocol,
     failures: u8,
 }
@@ -788,8 +927,18 @@ fn next_peer(
 }
 
 fn sync_forever(core: Arc<Core>) {
+    let _ = core
+        .inbound
+        .get()
+        .unwrap()
+        .sync_thread
+        .set(thread::current());
+    let inbound = core.inbound.get().unwrap();
+    let calendar_wake = core.store.lock().unwrap().subscribe_calendar();
     let mut attempts = BTreeMap::<SocketAddrV4, Backoff>::new();
     while !core.stopped.load(Ordering::Relaxed) {
+        inbound.retry(&core);
+        let mut delay = Duration::from_secs(3);
         if core.active()
             && let Ok((_, workspace, _)) = core.sync_context()
         {
@@ -800,9 +949,38 @@ fn sync_forever(core: Arc<Core>) {
                         .then_some(address)
                 },
             ));
-            let peers: BTreeSet<_> = core.snapshot().peers.union(&preferred).copied().collect();
+            let peers: BTreeSet<_> = core
+                .snapshot()
+                .peers
+                .union(&preferred)
+                .filter(|peer| core.permits_ip(*peer.ip()))
+                .copied()
+                .collect();
             attempts.retain(|address, _| peers.contains(address));
             let now = Instant::now();
+            for address in &peers {
+                attempts.entry(*address).or_insert(Backoff {
+                    // A newly admitted peer must finish saving its workspace
+                    // before it can authenticate a separate sync connection.
+                    next: now + Duration::from_millis(300),
+                    last_attempt: now,
+                    failures: 0,
+                    protocol: PeerProtocol::Unknown,
+                });
+            }
+            if calendar_wake.take_change() {
+                // A real edit can use either direction. Preserve the failure backoff
+                // and coalesce rapid writes to a healthy peer into one exchange.
+                core.inbound_until.lock().unwrap().clear();
+                for attempt in attempts
+                    .values_mut()
+                    .filter(|attempt| attempt.failures == 0)
+                {
+                    attempt.next = attempt
+                        .next
+                        .min(attempt.last_attempt + Duration::from_millis(300));
+                }
+            }
             let address = next_peer(
                 &peers,
                 &preferred,
@@ -811,21 +989,42 @@ fn sync_forever(core: Arc<Core>) {
                 now,
             );
             if let Some(address) = address {
-                let retry = attempts.entry(address).or_insert(Backoff {
-                    protocol: PeerProtocol::Unknown,
-                    next: now,
-                    failures: 0,
-                });
+                let retry = attempts.get_mut(&address).expect("known peer");
                 retry.failures = if sync_peer(&core, address, &mut retry.protocol).is_ok() {
                     0
                 } else {
                     (retry.failures + 1).min(3)
                 };
                 let delay = 3 << retry.failures.saturating_sub(1);
-                retry.next = Instant::now() + Duration::from_secs(delay);
+                retry.last_attempt = Instant::now();
+                retry.next = retry.last_attempt + Duration::from_secs(delay);
+            }
+            // Respect the existing 300 ms pacing between distinct ready peers.
+            // With nothing due, sleep until the earliest possible connection.
+            let now = Instant::now();
+            let incoming = core.inbound_until.lock().unwrap();
+            if let Some(earliest) = peers
+                .iter()
+                .map(|peer| {
+                    let retry = attempts.get(peer).map_or(now, |entry| entry.next);
+                    retry.max(incoming.get(peer).copied().unwrap_or(now))
+                })
+                .min()
+            {
+                delay = delay.min(
+                    earliest
+                        .saturating_duration_since(now)
+                        .max(Duration::from_millis(300)),
+                );
             }
         }
-        thread::sleep(Duration::from_millis(300));
+        thread::park_timeout(if core.active() {
+            delay
+        } else {
+            inbound.retry_at().map_or(Duration::from_secs(30), |retry| {
+                retry.saturating_duration_since(Instant::now())
+            })
+        });
     }
 }
 
@@ -924,12 +1123,21 @@ fn join(
         }
         (state.device, state.join_proof)
     };
+    // access_job serializes join attempts. Only the active invitation may resolve its host.
+    struct Pending<'a>(&'a Core);
+    impl Drop for Pending<'_> {
+        fn drop(&mut self) {
+            self.0.pending_discovery.lock().unwrap().take();
+        }
+    }
+    *core.pending_discovery.lock().unwrap() = Some((host, discovery::Key::derive(&key, false, id)));
+    let _pending = Pending(core);
     let request = JoinRequest {
         enforces_managed_access: true,
         device,
         employee,
         proof,
-        port: core.listen.port(),
+        port: core.advertised_port(),
     };
     let deadline = Instant::now() + SESSION_LIMIT;
     let mut attempted = BTreeSet::new();
@@ -979,8 +1187,7 @@ fn join(
                         let mut store = core.store.lock().unwrap();
                         core.require_operation(renewal)?;
                         store.accept_renewal(response.workspace, peer)?;
-                        core.paused.store(true, Ordering::Release);
-                        core.generation.fetch_add(1, Ordering::AcqRel);
+                        core.change_pause(true)?;
                         return Ok(());
                     }
                     core.store.lock().unwrap().transaction(|state| {
@@ -994,6 +1201,7 @@ fn join(
                         Ok(())
                     })?;
                     core.exchanged(response.device, peer);
+                    core.wake_sync();
                     return Ok(());
                 }
                 Ok(Err(reason)) => return Err(reason.into()),
@@ -1090,7 +1298,7 @@ fn sync_peer(core: &Core, address: SocketAddrV4, protocol: &mut PeerProtocol) ->
     send_secure(
         &mut stream,
         &mut transport,
-        &legacy_packet(&state, core.listen.port())?,
+        &legacy_packet(&state, core.advertised_port())?,
     )?;
     let packet: SyncPacket = read_secure(&mut stream, &mut transport)?;
     if packet.device == state.device {
@@ -1135,6 +1343,20 @@ fn before_handshake_response(
     }
 }
 
+fn connect_from(
+    local: Ipv4Addr,
+    address: SocketAddrV4,
+    timeout: Duration,
+) -> io::Result<TcpStream> {
+    if local.is_unspecified() {
+        return TcpStream::connect_timeout(&SocketAddr::V4(address), timeout);
+    }
+    let socket = Socket::new(Domain::IPV4, Type::STREAM, Some(Protocol::TCP))?;
+    socket.bind(&SocketAddrV4::new(local, 0).into())?;
+    socket.connect_timeout(&address.into(), timeout)?;
+    Ok(socket.into())
+}
+
 fn connect<'a>(
     core: &'a Core,
     address: SocketAddrV4,
@@ -1146,16 +1368,18 @@ fn connect<'a>(
 ) -> Fallible<(Connection<'a>, TransportState)> {
     let renewing = kind == Operation::Join && core.snapshot().workspace.is_some();
     core.require_operation(renewing)?;
-    check_address(address)?;
+    core.check_peer(address)?;
     let generation = core.generation.load(Ordering::Acquire);
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining.is_zero() {
         return Err("Истекло время сетевого обмена".into());
     }
-    let tcp = TcpStream::connect_timeout(
-        &SocketAddr::V4(address),
-        remaining.min(Duration::from_millis(700)),
-    )?;
+    let tcp = {
+        let _dial = core.dialing.lock().unwrap();
+        core.require_operation(renewing)?;
+        let timeout = remaining.min(Duration::from_millis(700));
+        connect_from(*core.listen.ip(), address, timeout)?
+    };
     let mut stream = Connection::new(core, tcp, generation, deadline)?;
     stream.allow_paused_renewal = renewing;
     stream.invitation_fallback = fallback;
@@ -1244,7 +1468,7 @@ fn respond(core: &Core, tcp: TcpStream, ip: Ipv4Addr) -> Fallible<()> {
             send_secure(
                 &mut stream,
                 &mut transport,
-                &legacy_packet(&state, core.listen.port())?,
+                &legacy_packet(&state, core.advertised_port())?,
             )?;
             core.inbound_exchange(state.device, device, peer);
             Ok(())
@@ -1276,7 +1500,7 @@ impl SyncHello {
     fn new(core: &Core, state: &Arc<LocalState>) -> Fallible<Self> {
         Ok(Self {
             device: state.device,
-            port: core.listen.port(),
+            port: core.advertised_port(),
             digest: core.calendar_digest(state)?,
         })
     }
@@ -1350,7 +1574,11 @@ fn read_control<const N: usize>(
 
 fn finish_remote_rejection(core: &Core, peer: SocketAddrV4) -> Fallible<()> {
     let error = "Устройство отклонило календарь. Проверьте окно синхронизации на нём.";
-    core.record_merge_error(peer, error);
+    let mut errors = core.merge_errors.lock().unwrap();
+    // Simultaneous sessions may also have diagnosed the exact failure locally.
+    if errors.len() < MAX_PEERS {
+        errors.entry(peer).or_insert_with(|| error.into());
+    }
     Err(error.into())
 }
 
@@ -1512,7 +1740,7 @@ fn register(core: &Core, id: Id, request: JoinRequest, ip: Ipv4Addr) -> Fallible
         let workspace = state.workspace.as_ref().expect("workspace was checked");
         let response = JoinResponse {
             device,
-            port: core.listen.port(),
+            port: core.advertised_port(),
             workspace: workspace.clone(),
         };
         update_sync_time(&mut state.last_sync, Utc::now().timestamp());
@@ -1520,6 +1748,7 @@ fn register(core: &Core, id: Id, request: JoinRequest, ip: Ipv4Addr) -> Fallible
     })?;
     invite.used_by = Some(claimant);
     core.exchanged(request.device, peer);
+    core.wake_sync();
     Ok(response)
 }
 
@@ -1771,8 +2000,8 @@ impl Write for DigestWriter {
 
 fn calendar_digest(calendar: &Calendar) -> Fallible<[u8; 32]> {
     let mut digest = DigestWriter(Blake2s256::new());
-    let mut writer = BufWriter::new(&mut digest);
-    serde_json::to_writer(LimitedWriter::new(&mut writer, MESSAGE_LIMIT), calendar)?;
+    let mut writer = BufWriter::new(LimitedWriter::new(&mut digest, MESSAGE_LIMIT));
+    serde_json::to_writer(&mut writer, calendar)?;
     writer.into_inner().map_err(|e| e.into_error())?;
     Ok(digest.0.finalize().into())
 }
@@ -1781,8 +2010,8 @@ fn encode_calendar(calendar: &Calendar) -> Fallible<Vec<u8>> {
     let mut compressed = Vec::new();
     let mut output = LimitedWriter::new(&mut compressed, MESSAGE_LIMIT);
     let mut encoder = ZlibEncoder::new(&mut output, Compression::fast());
-    let mut writer = BufWriter::new(&mut encoder);
-    serde_json::to_writer(LimitedWriter::new(&mut writer, MESSAGE_LIMIT), calendar)?;
+    let mut writer = BufWriter::new(LimitedWriter::new(&mut encoder, MESSAGE_LIMIT));
+    serde_json::to_writer(&mut writer, calendar)?;
     writer.into_inner().map_err(|e| e.into_error())?;
     encoder.finish()?;
     Ok(compressed)
@@ -1919,6 +2148,147 @@ mod tests {
         model::{Category, Event, Revision, Task},
         storage::Store,
     };
+
+    #[test]
+    fn network_interface_limits_discovery_and_outgoing_sources() {
+        let port = 45737;
+        let conf = |ip| Config {
+            listen: SocketAddrV4::new(ip, 0),
+            discovery_port: Some(port),
+        };
+        assert_eq!(
+            conf(Ipv4Addr::UNSPECIFIED).effective_discovery_port(),
+            Some(port)
+        );
+        assert_eq!(
+            conf(Ipv4Addr::LOCALHOST).effective_discovery_port(),
+            Some(port)
+        );
+        assert_eq!(
+            conf(Ipv4Addr::new(192, 168, 1, 20)).effective_discovery_port(),
+            None
+        );
+        let udp = discovery_socket(Ipv4Addr::LOCALHOST, 0).unwrap();
+        assert_eq!(udp.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        assert!(!udp.broadcast().unwrap());
+        let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let SocketAddr::V4(target) = tcp.local_addr().unwrap() else {
+            unreachable!()
+        };
+        let _client = connect_from(Ipv4Addr::LOCALHOST, target, Duration::from_secs(1)).unwrap();
+        assert_eq!(tcp.accept().unwrap().1.ip(), Ipv4Addr::LOCALHOST);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Store::open(&tmp.path().join("node")).unwrap();
+        let n = Network::start(
+            store,
+            Config {
+                listen: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+                discovery_port: None,
+            },
+        )
+        .unwrap();
+        let foreign = SocketAddrV4::new(Ipv4Addr::new(192, 168, 1, 1), 45736);
+        assert!(n.remember_peer(foreign).is_err());
+        assert!(n.core.check_peer(foreign).is_err());
+    }
+
+    #[test]
+    fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
+        let directory = tempfile::tempdir().unwrap();
+        let host_store = Store::open(&directory.path().join("host")).unwrap();
+        host_store
+            .lock()
+            .unwrap()
+            .transaction(|s| s.create_workspace("Команда".into(), "Анна".into()))
+            .unwrap();
+        let peer_store = Store::open(&directory.path().join("peer")).unwrap();
+        let config = Config {
+            listen: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+            discovery_port: None,
+        };
+        let host = Network::start(host_store.clone(), config).unwrap();
+        let udp = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        let peer = Network::start(
+            peer_store,
+            Config {
+                discovery_port: Some(udp),
+                ..config
+            },
+        )
+        .unwrap();
+        let address = (Ipv4Addr::LOCALHOST, udp);
+        let sender = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let host_address = host.address().unwrap();
+        let snapshot = host.core.snapshot();
+        let group = snapshot.workspace.as_ref().unwrap();
+        let invite = host.make_invite(&peer.pairing_request()).unwrap();
+        let mut fields = invite.splitn(6, '.').collect::<Vec<_>>();
+        fields[5] = "-";
+        let secret: [u8; 32] = URL_SAFE_NO_PAD
+            .decode(fields[3])
+            .unwrap()
+            .try_into()
+            .unwrap();
+        let invite_key = discovery::Key::derive(&secret, false, Id::parse_str(fields[2]).unwrap());
+        let group_key = discovery::Key::derive(&group.key, true, group.id);
+        let beacon = |key: &discovery::Key| {
+            key.seal(
+                snapshot.device,
+                group.id,
+                host_address.port(),
+                Utc::now().timestamp(),
+            )
+            .unwrap()
+        };
+        let wait = |f: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !f() {
+                assert!(Instant::now() < deadline);
+                thread::sleep(Duration::from_millis(5));
+            }
+        };
+        let seen = || {
+            peer.core
+                .discovered
+                .lock()
+                .unwrap()
+                .contains_key(&host_address)
+        };
+        // A group beacon alone cannot complete enrollment.
+        sender.send_to(&beacon(&group_key), address).unwrap();
+        let join = peer.join_async(fields.join("."), "Борис".into(), None);
+        wait(&|| peer.core.pending_discovery.lock().unwrap().is_some());
+        sender.send_to(&beacon(&group_key), address).unwrap();
+        assert!(matches!(
+            join.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+        sender.send_to(&beacon(&invite_key), address).unwrap();
+        join.recv_timeout(Duration::from_secs(5)).unwrap().unwrap();
+        assert!(peer.core.pending_discovery.lock().unwrap().is_none());
+        peer.core.discovered.lock().unwrap().clear();
+        sender.send_to(&beacon(&group_key), address).unwrap();
+        wait(&seen);
+        peer.set_paused(true);
+        peer.core.discovered.lock().unwrap().clear();
+        let monitor = UdpSocket::bind(address).unwrap();
+        monitor
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        let packet = beacon(&group_key);
+        sender.send_to(&packet, address).unwrap();
+        let mut buffer = [0; discovery::LENGTH + 1];
+        assert_eq!(monitor.recv(&mut buffer).unwrap(), discovery::LENGTH);
+        assert!(!seen());
+        drop(monitor);
+        peer.set_paused(false);
+        sender.send_to(&beacon(&group_key), address).unwrap();
+        wait(&seen);
+    }
 
     #[test]
     fn retired_key_cannot_sync_with_new_generation_in_either_wire_protocol() {
@@ -2223,7 +2593,7 @@ mod tests {
             .unwrap()
             .insert(replica.core.listen, beacon);
         assert_eq!(connection.timeout().unwrap(), IO_POLL);
-        let alternate_port = replica.core.listen.port().wrapping_add(1).max(1);
+        let alternate_port = replica.core.advertised_port().wrapping_add(1).max(1);
         let alternate = SocketAddrV4::new(Ipv4Addr::LOCALHOST, alternate_port);
         let expired = Seen {
             time: beacon.time - DISCOVERY_TTL,
@@ -2409,7 +2779,7 @@ mod tests {
             workspace(&target).unwrap().calendar
         );
         let old_snapshot =
-            serde_json::to_vec(&legacy_packet(&source, leader.core.listen.port()).unwrap())
+            serde_json::to_vec(&legacy_packet(&source, leader.core.advertised_port()).unwrap())
                 .unwrap();
         assert!(sent < old_snapshot.len() / 3);
         assert_eq!(received, 87);

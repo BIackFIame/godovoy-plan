@@ -4,6 +4,7 @@ use super::{
     ACCESS, ACCESS_LIMIT, DATA, DATA_LIMIT, LOCK, OnlineVault, evidence, save, sync_directory,
     validate_profile_access,
 };
+use super::super::access::{verify_profile_access, verify_staging_parent};
 use crate::Fallible;
 use blake2::{Blake2s256, Digest};
 use chrono::{DateTime, Utc};
@@ -57,7 +58,7 @@ pub(super) fn private_file(path: &Path) -> Fallible<File> {
 // The shared macOS checker validates the profile ACL and legacy profile files.
 // The backup has additional payload and journal filenames; check their ACLs in batches, too.
 pub(super) fn validate_evidence_directory(dir: &Path) -> Fallible<()> {
-    validate_profile_access(dir)?;
+    verify_profile_access(dir)?;
     #[cfg(target_os = "macos")]
     {
         let mut paths = Vec::new();
@@ -150,7 +151,7 @@ fn staging(parent: &Path) -> Fallible<TempDir> {
 fn parent_for_new(path: &Path, excluded: &Path) -> Fallible<PathBuf> {
     let path = std::path::absolute(path)?;
     let parent = path.parent().ok_or("Укажите новое имя в частной папке.")?;
-    validate_profile_access(parent)?;
+    verify_staging_parent(parent)?;
     let parent = parent.canonicalize()?;
     for ancestor in parent.ancestors() {
         if ancestor == excluded
@@ -392,12 +393,12 @@ impl OnlineVault {
     }
 
     pub fn verify_backup(backup: &Path) -> Fallible<Value> {
-        validate_profile_access(backup)?;
+        verify_profile_access(backup)?;
         let canonical = backup.canonicalize()?;
         let parent = canonical
             .parent()
             .ok_or("У копии нет родительской папки.")?;
-        validate_profile_access(parent)?;
+        verify_staging_parent(parent)?;
         let out = staging(parent)?;
         let verified = reconstruct(&canonical, out.path())?;
         Ok(
@@ -406,7 +407,7 @@ impl OnlineVault {
     }
 
     pub fn restore_backup(backup: &Path, destination: &Path) -> Fallible<Value> {
-        validate_profile_access(backup)?;
+        verify_profile_access(backup)?;
         let canonical = backup.canonicalize()?;
         let dest = parent_for_new(destination, &canonical)?;
         let out = staging(dest.parent().ok_or("Отсутствует родительская папка.")?)?;

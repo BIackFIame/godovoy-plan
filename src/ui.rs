@@ -20,7 +20,7 @@ use godovoy_plan::{
     api::{self, BridgeOutcome},
     exchange::{EXCHANGE_EXTENSION, export_file, import_file},
     model::{Calendar, Category, Event, Id, Occurrence, Record, Revision, Task, YearChange},
-    network::{Network, SYNC_PORT},
+    network::{Config, Network, SYNC_PORT},
     planning::{self, AgendaItem, Horizon, Milestone, OwnerFilter, Reminder},
     storage::{
         BackupEntry, BridgeRunStatus, CALENDAR_MESSAGE_LIMIT, ImportResultKind, ImportStatus,
@@ -238,6 +238,7 @@ struct NoteDraft {
     merging: bool,
 }
 
+#[derive(Clone)]
 pub(crate) struct CalendarRow {
     pub(crate) id: Id,
     pub(crate) date: NaiveDate,
@@ -355,10 +356,33 @@ pub enum RestoreRequest {
     ReturnTo(BackupEntry),
 }
 
+enum DesktopTransport {
+    Waiting(Config),
+    Started(Result<Network, String>),
+}
+impl DesktopTransport {
+    fn start(&mut self, store: &SharedStore) {
+        if let Self::Waiting(config) = self {
+            *self = Self::Started(crate::startup::start_network(store.clone(), *config));
+        }
+    }
+    fn enable(&mut self, store: &SharedStore) -> Fallible<&Network> {
+        store.lock().unwrap().enable_lan()?;
+        self.start(store);
+        self.as_ref().map_err(Into::into)
+    }
+    fn as_ref(&self) -> Result<&Network, &str> {
+        match self {
+            Self::Waiting(_) => Err("Обмен ещё не включён."),
+            Self::Started(result) => result.as_ref().map_err(String::as_str),
+        }
+    }
+}
+
 pub struct App {
     store: SharedStore,
     reader: StoreReader,
-    network: Result<Network, String>,
+    network: DesktopTransport,
     page: Page,
     year: i32,
     selected: Option<Id>,
@@ -419,9 +443,22 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(
+    pub fn open(store: SharedStore, config: Config, standard_profile: bool) -> Self {
+        let mut transport = DesktopTransport::Waiting(config);
+        if store.lock().unwrap().state().lan_enabled() {
+            transport.start(&store);
+        }
+        Self::from_transport(store, transport, standard_profile)
+    }
+
+    #[cfg(test)]
+    fn new(store: SharedStore, network: Result<Network, String>, standard_profile: bool) -> Self {
+        Self::from_transport(store, DesktopTransport::Started(network), standard_profile)
+    }
+
+    fn from_transport(
         store: SharedStore,
-        network: Result<Network, String>,
+        network: DesktopTransport,
         standard_profile: bool,
     ) -> Self {
         let startup = autostart::executable(standard_profile)
@@ -543,11 +580,14 @@ impl App {
                                         ui,
                                         "Передайте коллеге запрос этого устройства. Оставьте приложение открытым, пока не получите приглашение.",
                                     );
-                                    if let Ok(network) = &self.network
-                                        && ui.add_enabled(!waiting, quiet("Скопировать запрос устройства")).clicked()
-                                    {
-                                        ui.ctx().copy_text(network.pairing_request());
-                                        self.message = Some(("Запрос устройства скопирован.".into(), false));
+                                    if ui.add_enabled(!waiting, quiet("Скопировать запрос устройства")).clicked() {
+                                        match self.network.enable(&self.store) {
+                                            Ok(network) => {
+                                                ui.ctx().copy_text(network.pairing_request());
+                                                self.message = Some(("Запрос устройства скопирован.".into(), false));
+                                            }
+                                            Err(error) => self.message = Some((error.to_string(), true)),
+                                        }
                                     }
                                 } else {
                                     muted(ui, "После создания календаря вы сможете пригласить коллег.");
@@ -674,7 +714,7 @@ impl App {
             } else {
                 Some(parse_address(&self.address)?)
             };
-            let network = self.network.as_ref().map_err(|error| error.clone())?;
+            let network = self.network.enable(&self.store)?;
             Ok(network.join_async(self.join_code.clone(), self.employee.clone(), address))
         })();
         match result {
@@ -725,20 +765,21 @@ impl App {
                         if nav(ui, "Интеграции", self.integrations_open) {
                             self.integrations_open = true;
                         }
-                        let sync_label = if self.network.is_err() {
-                            "Синхронизация · сбой"
-                        } else if near_limit {
-                            "Синхронизация · лимит"
-                        } else {
-                            "Синхронизация"
-                        };
+                        let sync_label =
+                            if matches!(self.network, DesktopTransport::Started(Err(_))) {
+                                "Синхронизация · сбой"
+                            } else if near_limit {
+                                "Синхронизация · лимит"
+                            } else {
+                                "Синхронизация"
+                            };
                         if nav(ui, sync_label, self.connections) {
                             self.connections = true;
                             self.message = None;
                         }
                         ui.add_space(7.0);
                         if ui.ctx().content_rect().width() >= 1150.0
-                            && let Ok(network) = &self.network
+                            && let Ok(network) = self.network.as_ref()
                         {
                             let paused = network.paused();
                             let connected = !paused && network.status().recent_peers > 0;
@@ -772,17 +813,36 @@ impl App {
         {
             return Arc::clone(&view.rows);
         }
-        let rows: Arc<[CalendarRow]> = calendar
-            .year(self.year)
-            .into_iter()
-            .filter(|event| matches_filter(*event, self.category, &search))
-            .map(|event| CalendarRow {
-                id: event.id,
-                date: event.date,
-                title: event.event.title.clone(),
-                category: event.event.category,
-            })
-            .collect();
+        let matches = |category, title: &str| {
+            self.category.is_none_or(|selected| selected == category)
+                && (search.is_empty() || search_key(title).contains(&search))
+        };
+        let rows: Arc<[CalendarRow]> = if let Some(previous) = &self.calendar_view
+            && previous.snapshot.ptr_eq(&snapshot)
+            && previous.year == self.year
+            && (previous.category.is_none() || previous.category == self.category)
+            && search.contains(&previous.search)
+        {
+            previous
+                .rows
+                .iter()
+                .filter(|row| matches(row.category, &row.title))
+                .cloned()
+                .collect()
+        } else {
+            let mut rows: Vec<_> = calendar
+                .occurrences(self.year)
+                .filter(|entry| matches(entry.event.category, &entry.event.title))
+                .map(|event| CalendarRow {
+                    id: event.id,
+                    date: event.date,
+                    title: event.event.title.clone(),
+                    category: event.event.category,
+                })
+                .collect();
+            rows.sort_unstable_by_key(|row| (row.date, row.id));
+            rows.into()
+        };
         self.calendar_view = Some(CalendarView {
             snapshot,
             year: self.year,
@@ -2039,7 +2099,7 @@ impl App {
         let mut store = self.store.lock().unwrap();
         let result = store.restore_open_backup(backup)?;
         // Keep writers blocked until the live network sees the saved pause.
-        if let Ok(network) = &self.network {
+        if let Ok(network) = self.network.as_ref() {
             network.set_paused(true);
         }
         Ok((Arc::clone(&self.store), result))
@@ -2335,7 +2395,7 @@ impl App {
     fn file_exchange_section(&mut self, ui: &mut Ui) -> Option<ExchangeRequest> {
         let mut request = None;
         egui::CollapsingHeader::new("Обмен через файл")
-            .default_open(self.network.is_err())
+            .default_open(self.network.as_ref().is_err())
             .show(ui, |ui| {
                 let exchange = &mut self.file_exchange;
                 let working = exchange.job.is_some();
@@ -2537,7 +2597,7 @@ impl App {
             self.hosted_entry.show(ui);
             ui.separator();
             title(ui, "Пригласить коллегу", SECTION_TITLE_SIZE);
-            if let Ok(network) = &self.network {
+            if let Ok(network) = self.network.as_ref() {
                 let mut paused = network.paused();
                 let status = network.status();
                 if let Some(id) = workspace.access_manager.filter(|id| *id != state.device) {
@@ -2668,7 +2728,15 @@ impl App {
                             });
                     }
                 });
-            } else if let Err(error) = &self.network {
+            } else if matches!(self.network, DesktopTransport::Waiting(_)) {
+                if ui
+                    .add(primary("Включить обмен по локальной сети"))
+                    .clicked()
+                    && let Err(error) = self.network.enable(&self.store)
+                {
+                    self.sync_message = Some((error.to_string(), true));
+                }
+            } else if let Err(error) = self.network.as_ref() {
                 ui.colored_label(RED, format!("Обмен по сети недоступен. {error}"));
             }
             ui.separator();
@@ -2687,7 +2755,7 @@ impl App {
                 .default_open(near_limit)
                 .show(ui, |ui| Self::capacity_details(ui, usage));
             ui.separator();
-            if let Ok(network) = &self.network {
+            if let Ok(network) = self.network.as_ref() {
                 ui.collapsing("Доступ к календарю", |ui| {
                     muted(ui, format!("ID этого устройства · {}", state.device));
                     if workspace.access_manager.is_none_or(|id| id == state.device) {
@@ -2797,7 +2865,7 @@ impl App {
         if renew || rejoin {
             let result = (|| -> Fallible<_> {
                 self.flush_local_drafts()?;
-                let network = self.network.as_ref().map_err(|e| e.clone())?;
+                let network = self.network.as_ref()?;
                 if renew {
                     if self.selected_revocations.is_empty() {
                         Ok(network.renew_access_async())
@@ -2845,7 +2913,11 @@ impl App {
         if !self.integrations_open {
             return;
         }
-        ctx.request_repaint_after(Duration::from_secs(1));
+        if self.api_controls.running_port().is_some()
+            && !ctx.input(|input| input.viewport().minimized == Some(true))
+        {
+            ctx.request_repaint_after(Duration::from_secs(1));
+        }
         let mut open = true;
         let mut action = None;
         settings_window(ctx, "Интеграции", &mut open, |ui| {
@@ -3564,8 +3636,13 @@ impl eframe::App for App {
             || self.notification.busy()
         {
             Duration::from_millis(250)
-        } else {
+        } else if (self.network.as_ref().is_ok() || self.api_controls.running_port().is_some())
+            && !ctx.input(|input| input.viewport().minimized == Some(true))
+        {
+            // Other processes or peers can change the visible calendar.
             Duration::from_secs(2)
+        } else {
+            self.next_reminder_check.saturating_duration_since(Instant::now())
         };
         ctx.request_repaint_after(delay);
     }
@@ -4030,12 +4107,12 @@ const MONTH_NAMES: [&str; 12] = [
 ];
 
 fn search_key(text: &str) -> String {
-    text.trim().to_lowercase().replace('ё', "е")
-}
-
-fn matches_filter(event: Occurrence<'_>, category: Option<Category>, search: &str) -> bool {
-    category.is_none_or(|category| event.event.category == category)
-        && (search.is_empty() || search_key(&event.event.title).contains(search))
+    let lower = text.trim().to_lowercase();
+    if lower.contains('ё') {
+        lower.replace('ё', "е")
+    } else {
+        lower
+    }
 }
 
 fn task_rows(
@@ -4649,6 +4726,10 @@ mod design_interactions {
         assert_eq!(original[0].id, event);
         app.search = " партнёрам ".into();
         assert!(Arc::ptr_eq(&original, &app.calendar_rows(&state, calendar)));
+        app.search.push_str(" отсутствует");
+        assert!(app.calendar_rows(&state, calendar).is_empty());
+        app.search = "ёрам".into();
+        assert_eq!(app.calendar_rows(&state, calendar)[0].id, event);
         app.category = Some(Category::Team);
         assert!(app.calendar_rows(&state, calendar).is_empty());
         app.category = None;
@@ -4873,5 +4954,41 @@ mod design_interactions {
     #[test]
     fn search_matches_capital_letters_and_yo() {
         assert!(search_key("Поздравления партнёрам").contains(&search_key("  ПАРТНЕРАМ ")));
+    }
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    use godovoy_plan::storage::Store;
+    use std::net::{Ipv4Addr, TcpListener, TcpStream};
+    use tempfile::tempdir;
+
+    #[test]
+    fn empty_profile_waits_to_listen_and_existing_calendar_starts_normally() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("profile");
+        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, probe.local_addr().unwrap().port());
+        let config = Config {
+            listen: addr,
+            discovery_port: None,
+        };
+        let mut app = App::open(Store::open(&path).unwrap(), config, false);
+        assert!(matches!(app.network, DesktopTransport::Waiting(_)));
+        drop(probe);
+        assert!(TcpStream::connect(addr).is_err());
+        app.company = "Отдел".into();
+        app.employee = "Анна".into();
+        app.create();
+        assert!(TcpStream::connect(addr).is_err());
+        drop(app);
+        let mut app = App::open(Store::open(&path).unwrap(), config, false);
+        assert!(TcpStream::connect(addr).is_err());
+        app.network.enable(&app.store).unwrap();
+        assert!(TcpStream::connect(addr).is_ok());
+        drop(app);
+        let _existing = App::open(Store::open(&path).unwrap(), config, false);
+        assert!(TcpStream::connect(addr).is_ok());
     }
 }

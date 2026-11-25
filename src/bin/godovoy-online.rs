@@ -97,7 +97,7 @@ fn run() -> Fallible<()> {
         }
         _ => {}
     }
-    let vault = OnlineVault::open(dir)?;
+    let open = || OnlineVault::open(dir);
     match (op.as_str(), tail) {
         ("configure", options) => {
             let backup_root = match options {
@@ -118,9 +118,10 @@ fn run() -> Fallible<()> {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(admin::serve(vault, backup_root))?;
+                .block_on(admin::serve(open()?, backup_root))?;
         }
         ("protection-report", []) => {
+            let vault = open()?;
             let lock = vault.lock()?;
             lock.audit_security("operator_report_requested", None, None, None)?;
             println!(
@@ -131,7 +132,7 @@ fn run() -> Fallible<()> {
         ("backup", [dest]) => {
             println!(
                 "{}",
-                serde_json::to_string_pretty(&vault.create_verified_backup(Path::new(dest))?)?
+                serde_json::to_string_pretty(&open()?.create_verified_backup(Path::new(dest))?)?
             );
         }
         ("serve", options) => {
@@ -163,7 +164,7 @@ fn run() -> Fallible<()> {
                 .enable_all()
                 .build()?
                 .block_on(host::serve(
-                    vault,
+                    open()?,
                     port.unwrap_or(45838),
                     origin,
                     entry,
@@ -190,7 +191,6 @@ fn run() -> Fallible<()> {
                     _ => return Err(HELP.into()),
                 }
             }
-            let lock = vault.lock()?;
             let (id, employee, token) = if mcp {
                 if permissions.read_only {
                     return Err(
@@ -201,33 +201,36 @@ fn run() -> Fallible<()> {
                 let employee =
                     employee.ok_or("Для --mcp укажите --employee-id существующего сотрудника.")?;
                 permissions.read_only = !mcp_write;
-                lock.grant_mcp(name, employee, permissions)?
+                open()?.lock()?.grant_mcp(name, employee, permissions)?
             } else {
                 if mcp_write {
                     return Err("--mcp-write используется вместе с --mcp.".into());
                 }
-                lock.grant_with_permissions(name, employee, permissions)?
+                open()?.lock()?.grant_with_permissions(name, employee, permissions)?
             };
             println!(
                 "Сотрудник: {employee}\nID ключа для отзыва: {id}\nКлюч доступа (показывается один раз):\n{token}"
             );
         }
         ("revoke", [key]) => {
-            vault.lock()?.revoke(key.parse()?)?;
+            let key = key.parse()?;
+            open()?.lock()?.revoke(key)?;
             println!("Доступ по ключу отозван.");
         }
         ("revoke-all", []) => {
-            let count = vault.lock()?.revoke_all()?;
+            let count = open()?.lock()?.revoke_all()?;
             println!("Отозвано ключей: {count}.");
         }
         ("standby-begin", [flag, minutes]) if flag == "--minutes" => {
-            describe_window(vault.lock()?.begin_standby(minutes.parse()?)?);
+            let minutes = minutes.parse()?;
+            describe_window(open()?.lock()?.begin_standby(minutes)?);
         }
         ("standby-end", []) => {
-            vault.lock()?.end_standby()?;
+            open()?.lock()?.end_standby()?;
             println!("Резервное окно закрыто. Разрешён основной режим.");
         }
         ("status", []) => {
+            let vault = open()?;
             let lock = vault.lock()?;
             let acl = lock.access()?;
             println!("Календарь: {}", acl.name.escape_debug());
@@ -271,6 +274,7 @@ fn run() -> Fallible<()> {
             }
         }
         ("audit", []) => {
+            let vault = open()?;
             let lock = vault.lock()?;
             let mut audit = lock.access()?.audit;
             audit.extend(lock.data()?.audit);

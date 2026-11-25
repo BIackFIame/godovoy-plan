@@ -4,7 +4,11 @@ use std::{
     io::{self, BufWriter, Read, Write},
     net::SocketAddrV4,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{
+        Arc, Mutex, RwLock, Weak,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
 };
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -148,6 +152,8 @@ pub struct LocalState {
     pub last_sync: Option<i64>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     sync_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lan_enabled: Option<bool>,
     // Kept for readers of profiles written by releases through 0.4. A system
     // delivery attempt did not count as an acknowledgement.
     #[serde(default, rename = "delivered_reminders", skip_deserializing)]
@@ -210,9 +216,17 @@ impl Workspace {
 }
 
 impl LocalState {
+    /// Legacy calendars already had LAN exchange; an empty legacy profile did not choose a group.
+    pub fn lan_enabled(&self) -> bool {
+        self.lan_enabled.unwrap_or(self.workspace.is_some())
+    }
+
     pub fn create_workspace(&mut self, name: String, employee: String) -> Fallible<()> {
         if self.workspace.is_some() {
             return Err("На этом устройстве уже есть пространство.".into());
+        }
+        if self.lan_enabled.is_none() {
+            self.lan_enabled = Some(false);
         }
         let mut calendar = Calendar::default();
         calendar
@@ -341,7 +355,20 @@ impl StoreReader {
     }
 }
 
+// A weak subscription lets the network worker go away without retaining the profile.
+pub(crate) struct CalendarWake {
+    worker: thread::Thread,
+    changed: AtomicBool,
+}
+
+impl CalendarWake {
+    pub(crate) fn take_change(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
+    }
+}
+
 pub struct Store {
+    calendar_wake: Weak<CalendarWake>,
     successor: Option<PathBuf>,
     state: Arc<LocalState>,
     path: PathBuf,
@@ -386,8 +413,24 @@ impl Store {
             use std::os::unix::fs::DirBuilderExt;
             directories.mode(0o700).create(directory)?;
         }
-        if directory.join("online-access-v1.json").try_exists()? || directory.join("online-calendar-v1.json").try_exists()? {
-            return Err("Этот каталог принадлежит центральному узлу. Запустите godovoy-online.".into());
+        if directory.join("online-access-v1.json").try_exists()?
+            || directory.join("online-calendar-v1.json").try_exists()?
+        {
+            return Err(
+                "Этот каталог принадлежит центральному узлу. Запустите godovoy-online.".into(),
+            );
+        }
+        let path = directory.join("calendar.json");
+        // A read of an unrelated directory must not migrate permissions or create a lock.
+        if !create {
+            match fs::symlink_metadata(&path) {
+                Ok(metadata) if metadata.is_file() => {}
+                Ok(_) => return Err("Для открытия нужен обычный файл календаря.".into()),
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    return Err(ProfileOpenIssue::CalendarMissing.into());
+                }
+                Err(error) => return Err(error.into()),
+            }
         }
         let profile_lock = match open_profile_lock(directory) {
             Err(error)
@@ -400,7 +443,6 @@ impl Store {
             }
             result => result?,
         };
-        let path = directory.join("calendar.json");
         let (state, profile_bytes) = match read_calendar_file(&path) {
             Ok(result) => result,
             Err(error)
@@ -419,6 +461,7 @@ impl Store {
                     peers: BTreeSet::new(),
                     last_sync: None,
                     sync_paused: false,
+                    lan_enabled: Some(false),
                     legacy_delivery_attempts: [],
                     api: None,
                 };
@@ -469,6 +512,7 @@ impl Store {
             _profile_lock: profile_lock,
         });
         Ok(Arc::new(Mutex::new(Self {
+            calendar_wake: Weak::new(),
             successor: None,
             state,
             path: directory.join("calendar.json"),
@@ -477,6 +521,15 @@ impl Store {
             import_log,
             reminders,
         })))
+    }
+
+    pub(crate) fn subscribe_calendar(&mut self) -> Arc<CalendarWake> {
+        let wake = Arc::new(CalendarWake {
+            worker: thread::current(),
+            changed: AtomicBool::new(false),
+        });
+        self.calendar_wake = Arc::downgrade(&wake);
+        wake
     }
 
     pub fn reader(&self) -> StoreReader {
@@ -526,6 +579,16 @@ impl Store {
 
     pub fn state(&self) -> &LocalState {
         &self.state
+    }
+
+    pub fn enable_lan(&mut self) -> Fallible<()> {
+        if self.state.lan_enabled() {
+            return Ok(());
+        }
+        self.transaction(|state| {
+            state.lan_enabled = Some(true);
+            Ok(())
+        })
     }
 
     pub fn sync_paused(&self) -> bool {
@@ -649,6 +712,13 @@ impl Store {
         view.usage = ProfileUsage::from_state(&self.state, bytes);
         let previous = std::mem::replace(&mut view.state, Arc::clone(&self.state));
         drop(view);
+        if let Some(wake) = self.calendar_wake.upgrade()
+            && previous.workspace.as_ref().map(|w| &w.calendar)
+                != self.state.workspace.as_ref().map(|w| &w.calendar)
+            && !wake.changed.swap(true, Ordering::AcqRel)
+        {
+            wake.worker.unpark();
+        }
         drop(previous);
     }
 }
@@ -970,18 +1040,23 @@ fn stage(path: &Path, state: &impl Serialize, limit: usize) -> Fallible<(NamedTe
         .prefix(STAGING_PREFIX)
         .rand_bytes(STAGING_SUFFIX_LEN)
         .tempfile_in(path.parent().ok_or("Не указана папка профиля")?)?;
-    let bytes;
-    {
-        let mut writer = BufWriter::new(staging.as_file_mut());
-        let mut bounded = LimitedWriter::new(&mut writer, limit);
-        let result = serde_json::to_writer(&mut bounded, state);
-        if bounded.exceeded {
-            return Err(StagingSizeLimit(limit).into());
-        }
-        result?;
-        bytes = limit - bounded.remaining;
-        writer.flush()?;
+    // Charge buffered chunks to the file limit instead of checking every JSON token.
+    let bounded = LimitedWriter::new(staging.as_file_mut(), limit);
+    let mut writer = BufWriter::with_capacity(32 * 1024, bounded);
+    let result = serde_json::to_writer(&mut writer, state);
+    // Flush only after successful serialization; BufWriter must not retry a failed write.
+    let flushed = if result.is_ok() {
+        writer.flush()
+    } else {
+        Ok(())
+    };
+    let (bounded, _) = writer.into_parts();
+    if bounded.exceeded {
+        return Err(StagingSizeLimit(limit).into());
     }
+    result?;
+    flushed?;
+    let bytes = limit - bounded.remaining;
     staging.as_file().sync_all()?;
     Ok((staging, bytes))
 }
@@ -1021,6 +1096,49 @@ impl<W: Write> Write for LimitedWriter<W> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn calendar_subscription_wakes_only_for_committed_calendar_changes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let profile = Store::open(&tmp.path().join("office")).unwrap();
+        let mut store = profile.lock().unwrap();
+        let subscription = store.subscribe_calendar();
+        store
+            .transaction(|s| s.create_workspace("Компания".into(), "Анна".into()))
+            .unwrap();
+        assert!(subscription.take_change());
+        assert!(!subscription.take_change());
+        store
+            .transaction(|s| {
+                s.last_sync = Some(123);
+                Ok(())
+            })
+            .unwrap();
+        assert!(!subscription.take_change());
+        let rejected: Fallible<()> = store.transaction(|s| {
+            s.workspace_mut()?.calendar.members.clear();
+            Err("cancelled".into())
+        });
+        assert!(rejected.is_err());
+        assert!(!subscription.take_change());
+    }
+
+    #[test]
+    fn buffered_staging_checks_the_last_chunk_before_publication() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("state.json");
+        for length in [31, 32 * 1024 - 1, 32 * 1024, 40 * 1024] {
+            let value = "x".repeat(length);
+            let encoded = serde_json::to_vec(&value).unwrap();
+            assert_eq!(save(&path, &value, encoded.len()).unwrap(), encoded.len());
+            let previous = fs::read(&path).unwrap();
+            assert_eq!(previous, encoded);
+            let error = save(&path, &"y".repeat(length), encoded.len() - 1).unwrap_err();
+            assert!(error.is::<StagingSizeLimit>());
+            assert_eq!(fs::read(&path).unwrap(), previous);
+            assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+        }
+    }
 
     #[test]
     fn employee_roster_preserves_device_access_and_revoked_anchor_assignments() {

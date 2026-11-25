@@ -23,6 +23,7 @@
     let lastLoaded = 0;
     let requestNumber = 0;
     let heartbeatRunning = false;
+    let heartbeatTimer = null;
     let currentYear = new Date().getFullYear();
     let mode = "all";
     let limit = 80;
@@ -72,6 +73,8 @@
     // Drop all workspace DOM, including modal form values. Late responses are
     // fenced by generation even if a browser completes an aborted fetch.
     function clearWorkspace(message, retainCredential = false) {
+        clearInterval(heartbeatTimer);
+        heartbeatTimer = null;
         generation++;
         requestNumber++;
         for (const controller of controllers) controller.abort();
@@ -105,7 +108,7 @@
     }
 
     class Problem extends Error {}
-    async function api(path, {body, data = false, validator = null} = {}) {
+    async function api(path, {body, data = false, validator = null, receipt = null} = {}) {
         const epoch = generation;
         if (!credential || document.hidden) throw new Problem();
         const controller = new AbortController();
@@ -114,6 +117,10 @@
         try {
             const headers = {Authorization: "Bearer " + credential};
             if (body !== undefined) headers["Content-Type"] = "application/json";
+            if (receipt) {
+                headers["X-Godovoy-Base"] = receipt.tag;
+                headers["X-Godovoy-Year"] = String(receipt.year);
+            }
             if (validator) headers["If-None-Match"] = validator;
             const response = await fetch(path, {
                 method: body === undefined ? "GET" : "POST",
@@ -170,15 +177,18 @@
                 if (epoch !== generation || document.hidden) throw new Problem();
                 throw new Problem(typeof problem.error === "string" ? problem.error : "Компьютер компании отклонил изменение.");
             }
-            if (data ? !unchanged && (response.status !== 200 || !/^application\/json(?:;|$)/i.test(response.headers.get("Content-Type") || ""))
-                     : response.status !== 204) {
+            const hasReceipt = receipt && response.status === 200;
+            const expectJson = (data && !unchanged) || hasReceipt;
+            if (expectJson ? response.status !== 200 || !/^application\/json(?:;|$)/i.test(response.headers.get("Content-Type") || "")
+                           : response.status !== (unchanged ? 304 : 204)) {
                 throw new Error("Unexpected response from calendar host");
             }
-            const result = data && !unchanged ? await response.json() : null;
+            const result = expectJson ? await response.json() : null;
             if (epoch !== generation || document.hidden) throw new Problem();
             const until = response.headers.get("x-godovoy-standby-until") || "";
             standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
             lastVerified = performance.now();
+            if (hasReceipt) return {value: result, tag: response.headers.get("x-godovoy-state-tag")};
             return data ? {value: result, tag, unchanged} : null;
         } catch (error) {
             if (!(error instanceof Problem) && epoch === generation) {
@@ -205,6 +215,7 @@
             throw new Problem();
         }
         state = next;
+        if (heartbeatTimer === null) heartbeatTimer = setInterval(heartbeat, 3000);
         stateTag = /^(?:W\/)?"[!#-~]{1,128}"$/.test(response.tag || "") ? response.tag : null;
         currentYear = year;
         lastLoaded = performance.now();
@@ -239,36 +250,52 @@
         }
         let lastMonth = "";
         let rows;
-        for (const event of events.slice(0, limit)) {
-            const month = event.date.slice(0, 7);
-            const date = isoDate(event.date);
-            if (month !== lastMonth) {
-                const group = element("section", undefined, "month");
-                const label = monthLabel.format(date);
-                group.append(element("h2", label[0].toLocaleUpperCase("ru") + label.slice(1)));
-                rows = element("ul", undefined, "items");
-                group.append(rows);
-                list.append(group);
-                lastMonth = month;
+        function appendPage(start) {
+            let first;
+            for (const event of events.slice(start, limit)) {
+                const month = event.date.slice(0, 7);
+                const date = isoDate(event.date);
+                if (month !== lastMonth) {
+                    const group = element("section", undefined, "month");
+                    const label = monthLabel.format(date);
+                    group.append(element("h2", label[0].toLocaleUpperCase("ru") + label.slice(1)));
+                    rows = element("ul", undefined, "items");
+                    group.append(rows);
+                    list.append(group);
+                    lastMonth = month;
+                }
+                const item = element("li");
+                const open = button("", () => detail(event), "event");
+                open.append(element("span", dateLabel.format(date), "date"));
+                const summary = element("span");
+                const owner = ownerName(event.ownerId);
+                summary.append(element("strong", event.title), element("span",
+                    [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
+                open.append(summary);
+                if (event.checklist.length) {
+                    const done = event.checklist.filter((task) => task.done).length;
+                    const counter = element("span", done + "/" + event.checklist.length, "count");
+                    counter.setAttribute("aria-label", "Выполнено " + done + " из " + event.checklist.length);
+                    open.append(counter);
+                }
+                item.append(open);
+                rows.append(item);
+                if (!first) first = open;
             }
-            const item = element("li");
-            const open = button("", () => detail(event), "event");
-            open.append(element("span", dateLabel.format(date), "date"));
-            const summary = element("span");
-            const owner = ownerName(event.ownerId);
-            summary.append(element("strong", event.title), element("span",
-                [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
-            open.append(summary);
-            if (event.checklist.length) {
-                const done = event.checklist.filter((task) => task.done).length;
-                const counter = element("span", done + "/" + event.checklist.length, "count");
-                counter.setAttribute("aria-label", "Выполнено " + done + " из " + event.checklist.length);
-                open.append(counter);
+            if (events.length > limit) {
+                const more = button("Показать ещё", () => {
+                    const start = limit;
+                    const focused = document.activeElement === more;
+                    more.remove();
+                    limit += 80;
+                    const added = appendPage(start);
+                    if (focused && added) added.focus({preventScroll: true});
+                }, "more");
+                list.append(more);
             }
-            item.append(open);
-            rows.append(item);
+            return first;
         }
-        if (events.length > limit) list.append(button("Показать ещё", () => { limit += 80; renderList(); }, "more"));
+        appendPage(0);
     }
 
     function section(title) {
@@ -459,6 +486,31 @@
         });
     }
 
+    function applyReceipt(reply, id, year) {
+        const receipt = reply?.value;
+        if (!receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
+        function replaceRows(previous, changes) {
+            if (!Array.isArray(changes)) return null;
+            const rows = previous.filter(event => event.id !== id);
+            let lastIndex = -1;
+            for (const change of changes) {
+                if (!Number.isInteger(change?.index) || change.index <= lastIndex || change.index > rows.length ||
+                    change.event?.id !== id || !Number.isInteger(change.event.year) || !Array.isArray(change.event.checklist)) return null;
+                rows.splice(change.index, 0, change.event);
+                lastIndex = change.index;
+            }
+            return rows;
+        }
+        const events = replaceRows(state.events, receipt.events);
+        const tasks = replaceRows(state.tasks, receipt.tasks);
+        if (!events || !tasks) return false;
+        state = {...state, events, tasks};
+        stateTag = reply.tag;
+        lastLoaded = performance.now();
+        renderList();
+        return true;
+    }
+
     async function save(command, reopen = null, year = currentYear) {
         if (writing || !state || !state.canEdit) return;
         const epoch = generation;
@@ -467,9 +519,16 @@
         el("close").disabled = true;
         el("sheet-error").textContent = "";
         try {
-            await api("/v1/command", {body: command});
+            const prior = state;
+            const receipt = stateTag && year === currentYear && (command.op === "check" || command.op === "note")
+                ? {tag: stateTag, year} : null;
+            ++requestNumber;
+            const reply = await api("/v1/command", {body: command, receipt});
+            if (epoch !== generation || document.hidden) return;
             writing = false;
-            await load(year);
+            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year)) {
+                await load(year);
+            }
             if (epoch !== generation) return;
             const fresh = reopen && [...state.events, ...state.tasks].find((e) => e.id === reopen.id && e.year === reopen.year);
             if (fresh) detail(fresh);
@@ -525,7 +584,7 @@
         if (document.hidden) { clearWorkspace(writing ? prompts.uncertain : prompts.hidden, !writing); return; }
         if (credential) refresh();
     });
-    setInterval(async () => {
+    async function heartbeat() {
         if (!state || document.hidden) return;
         if (performance.now() - lastVerified >= leaseMs) {
             clearWorkspace(writing ? prompts.uncertain : prompts.disconnected);
@@ -542,7 +601,7 @@
             }
         } catch { /* api applies the lock policy. */ }
         finally { if (generation === epoch) heartbeatRunning = false; }
-    }, 3000);
+    }
     const loopback = ["127.0.0.1", "localhost", "[::1]"].includes(location.hostname);
     secure = window.isSecureContext && (location.protocol === "https:" || (location.protocol === "http:" && loopback));
     clearWorkspace(secure ? prompts.login : "Откройте календарь через HTTPS или локальный порт защищённого туннеля.");

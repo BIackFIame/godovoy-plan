@@ -50,7 +50,11 @@ struct SyncView: View {
                         LabeledContent("Последний обмен") { Text(date, format: .dateTime.day().month().hour().minute()) }
                     }
                     if let error = state.networkError { Text(error).foregroundStyle(.red) }
-                    Toggle("Приостановить обмен", isOn: Binding(get: { state.paused }, set: { paused in Task { _ = await model.run("pause", ["paused": .flag(paused)]) } })).disabled(model.busy)
+                    if state.lanEnabled == false {
+                        Button("Включить обмен по локальной сети") { Task { _ = await model.run("pause", ["paused": .flag(false)]) } }.disabled(model.busy)
+                    } else {
+                        Toggle("Приостановить обмен", isOn: Binding(get: { state.paused }, set: { paused in Task { _ = await model.run("pause", ["paused": .flag(paused)]) } })).disabled(model.busy)
+                    }
                     DisclosureGroup("Подключить по адресу") {
                         TextField("IPv4 и порт коллеги", text: $peer).textInputAutocapitalization(.never).autocorrectionDisabled().keyboardType(.numbersAndPunctuation)
                         Button("Сохранить адрес") { Task { if await model.run("peer", ["address": .string(peer)]) { peer = ""; message = "Адрес сохранён" } } }.disabled(peer.isBlank || model.busy || state.paused)

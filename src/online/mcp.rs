@@ -206,7 +206,7 @@ impl Context<'_, '_> {
                 unavailable()
             };
         }
-        let Ok(data) = self.lock.data() else {
+        let Ok(mut data) = self.lock.data() else {
             return unavailable();
         };
         let (event_id, year) = match &call {
@@ -285,7 +285,7 @@ impl Context<'_, '_> {
             self.employee,
             self.mode,
             command,
-            data,
+            &mut data,
         );
         match response.status() {
             StatusCode::NO_CONTENT => result(id, json!({"saved":true})),

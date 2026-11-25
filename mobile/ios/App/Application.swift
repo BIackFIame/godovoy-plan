@@ -10,25 +10,34 @@ import UIKit
     let core = CalendarClient.shared
 
     func snapshot(year: Int) async throws -> GPState {
-        try await core.value(["op": .string("state"), "year": .integer(year)], as: GPState.self)
+        let prior = state
+        switch try await read(year: year, prior: prior) {
+        case .state(let current): return current
+        case .unchanged:
+            guard let prior, prior.year == year else { throw GPError("Не удалось обновить календарь.") }
+            return prior
+        }
+    }
+    private func read(year: Int, prior: GPState?) async throws -> GPSnapshot {
+        var fields: GPCommand = ["op": .string("state"), "year": .integer(year)]
+        if let prior, prior.year == year, let token = prior.stateToken {
+            fields["ifToken"] = .string(token)
+        }
+        return try await core.value(fields, as: GPSnapshot.self)
     }
     func refresh(silent: Bool = false) async {
         refreshVersion &+= 1
         let version = refreshVersion
         let requestedYear = year
         do {
-            var fields: GPCommand = ["op": .string("state"), "year": .integer(requestedYear)]
-            if silent, let prior = state, prior.year == year, let token = prior.stateToken {
-                fields["ifToken"] = .string(token)
-            }
-            let result = try await core.value(fields, as: GPSnapshot.self)
+            let result = try await read(year: requestedYear, prior: state)
             guard requestedYear == year && version == refreshVersion else { return }
             switch result {
             case .state(let current):
                 state = current
                 GPReminderSchedule.refresh(dates: current.notificationDates)
             case .unchanged:
-                break
+                if !silent, let state { GPReminderSchedule.refresh(dates: state.notificationDates) }
             }
         } catch {
             guard version == refreshVersion && requestedYear == year else { return }

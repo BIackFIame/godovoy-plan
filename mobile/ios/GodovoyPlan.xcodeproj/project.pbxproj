@@ -218,7 +218,7 @@
 				CODE_SIGN_ENTITLEMENTS = App/Application.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -229,7 +229,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/RustLibs/$(PLATFORM_NAME)",
 				);
-				MARKETING_VERSION = 0.5.48;
+				MARKETING_VERSION = 0.5.50;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lgodovoy_mobile_core",
@@ -343,7 +343,7 @@
 				CODE_SIGN_ENTITLEMENTS = App/Application.entitlements;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 5;
+				CURRENT_PROJECT_VERSION = 6;
 				ENABLE_USER_SCRIPT_SANDBOXING = YES;
 				INFOPLIST_FILE = App/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -354,7 +354,7 @@
 					"$(inherited)",
 					"$(PROJECT_DIR)/RustLibs/$(PLATFORM_NAME)",
 				);
-				MARKETING_VERSION = 0.5.48;
+				MARKETING_VERSION = 0.5.50;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-lgodovoy_mobile_core",

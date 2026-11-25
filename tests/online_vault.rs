@@ -631,3 +631,80 @@ fn mcp_credentials_bind_to_one_employee_key_and_cannot_be_used_as_ordinary_keys(
     assert!(acl.authorize_for(writer, GrantPurpose::Mcp).is_none());
     assert!(acl.authorize_for(&independent, GrantPurpose::Mcp).is_some());
 }
+
+#[cfg(unix)]
+#[test]
+fn failed_profile_probes_preserve_unrelated_files_and_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    let folder = tmp.path().join("unrelated");
+    fs::create_dir(&folder).unwrap();
+    fs::set_permissions(&folder, fs::Permissions::from_mode(0o700)).unwrap();
+    let sentinel = folder.join("reminders-v1.json");
+    fs::write(&sentinel, "other application").unwrap();
+    fs::set_permissions(&sentinel, fs::Permissions::from_mode(0o644)).unwrap();
+    let destination = tmp.path().join("destination");
+    for output in [
+        cli("grant", &folder, &["Test"]),
+        cli(
+            "init",
+            &destination,
+            &["--from-profile", folder.to_str().unwrap()],
+        ),
+        cli("backup-verify", &folder, &[]),
+        cli("backup-restore", &folder, &[destination.to_str().unwrap()]),
+    ] {
+        assert!(!output.status.success());
+    }
+    assert_eq!(fs::read_dir(&folder).unwrap().count(), 1);
+    assert_eq!(
+        fs::metadata(&sentinel).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "other application");
+    assert!(!destination.exists());
+
+    assert!(cli("init", &destination, &["Team"]).status.success());
+    let permissions_file = destination.join("online-access-v1.json");
+    fs::set_permissions(&permissions_file, fs::Permissions::from_mode(0o644)).unwrap();
+    for (action, args) in [
+        ("unknown-command", &[][..]),
+        ("grant", &["Test", "--typo"]),
+        ("revoke", &["invalid-id"]),
+        ("serve", &["--port", "invalid-port"]),
+    ] {
+        assert!(!cli(action, &destination, args).status.success());
+        assert_eq!(
+            fs::metadata(&permissions_file)
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o644
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn valid_backup_checks_the_parent_without_migrating_sibling_files() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let vault = tmp.path().join("central");
+    assert!(cli("init", &vault, &["Team"]).status.success());
+    let backup = tmp.path().join("backup");
+    let sibling = tmp.path().join("reminders-v1.json");
+    fs::write(&sibling, "unrelated sibling").unwrap();
+    fs::set_permissions(&sibling, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        cli("backup", &vault, &[backup.to_str().unwrap()])
+            .status
+            .success()
+    );
+    assert!(cli("backup-verify", &backup, &[]).status.success());
+    assert_eq!(
+        fs::metadata(sibling).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+}

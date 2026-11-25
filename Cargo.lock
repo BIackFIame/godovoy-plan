@@ -1567,7 +1567,7 @@ dependencies = [
 
 [[package]]
 name = "godovoy-plan"
-version = "0.5.49"
+version = "0.5.50"
 dependencies = [
  "axum",
  "base64 0.22.1",
@@ -1582,6 +1582,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "libc",
+ "mio",
  "notify-rust",
  "rfd",
  "rustix 1.1.6",

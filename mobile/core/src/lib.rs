@@ -137,8 +137,14 @@ impl Session {
             network_error: None,
             last_state: None,
         };
-        session.connect(background);
+        if session.lan_enabled() {
+            session.connect(background);
+        }
         Ok(session)
+    }
+
+    fn lan_enabled(&self) -> bool {
+        self.store.lock().unwrap().state().lan_enabled()
     }
 
     fn connect(&mut self, background: bool) {
@@ -250,6 +256,25 @@ impl Mobile {
         }
         let cmd =
             serde_json::from_value::<Command>(input).map_err(|_| "Неверные параметры запроса.")?;
+        if matches!(
+            &cmd,
+            Command::PairingRequest
+                | Command::Join { .. }
+                | Command::Rejoin { .. }
+                | Command::Invite { .. }
+                | Command::Peer { .. }
+                | Command::Pause { paused: false }
+        ) && session.network.is_none()
+        {
+            if self.background_pause.is_some() && !matches!(cmd, Command::Pause { .. }) {
+                return Err("Для подключения откройте календарь на экране.".into());
+            }
+            session.store.lock().unwrap().enable_lan()?;
+            if self.background_pause.is_none() {
+                session.connect(false);
+                session.net()?;
+            }
+        }
         match cmd {
             Command::State { year, if_token } => return calendar::state(session, year, if_token),
             Command::CreateWorkspace { name, employee } => {
@@ -363,7 +388,9 @@ impl Mobile {
                 }
             }
             Command::Foreground => {
-                if session.network.is_none() {
+                if session.network.is_none()
+                    && (session.lan_enabled() || session.network_error.is_some())
+                {
                     session.connect(false);
                 }
                 if let Some(previous) = self.background_pause.take()
