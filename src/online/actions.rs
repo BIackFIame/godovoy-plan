@@ -51,8 +51,14 @@ pub(crate) struct EventView<'a> {
     revision: Revision,
 }
 
-fn serialize_revision<S: Serializer>(revision: &Revision, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.collect_str(&format_args!("{}:{}", revision.sequence, revision.operation))
+fn serialize_revision<S: Serializer>(
+    revision: &Revision,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    serializer.collect_str(&format_args!(
+        "{}:{}",
+        revision.sequence, revision.operation
+    ))
 }
 
 pub(crate) fn occurrence<'a>(
@@ -100,11 +106,17 @@ pub(crate) struct ViewContext<'a> {
     year: i32,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct PublicYear {
+    year: i32,
+    allow_free_text: bool,
+}
+
 #[derive(Serialize)]
-pub(crate) struct CalendarView<'a> {
+pub(crate) struct CalendarView<'a, E = Vec<EventView<'a>>> {
     #[serde(flatten)]
     context: ViewContext<'a>,
-    events: Vec<EventView<'a>>,
+    events: E,
     tasks: Vec<EventView<'a>>,
 }
 
@@ -166,22 +178,43 @@ impl<'a> ViewContext<'a> {
         }
     }
 
-    pub(crate) fn render(self, data: &'a Data, today: NaiveDate) -> CalendarView<'a> {
-        let visible = |e| occurrence(data, e, self.allow_free_text);
+    pub(crate) fn public_rows_key(&self) -> Option<PublicYear> {
+        (!self.assigned_only).then_some(PublicYear {
+            year: self.year,
+            allow_free_text: self.allow_free_text,
+        })
+    }
+    pub(crate) fn event_rows(&self, data: &'a Data) -> Vec<EventView<'a>> {
         let mut events: Vec<_> = data
             .calendar
             .occurrences(self.year)
             .filter(|e| !self.assigned_only || assigned_to(data, *e, self.employee_id))
             .collect();
         events.sort_unstable_by_key(|e| (e.date, e.id));
+        events
+            .into_iter()
+            .map(|e| occurrence(data, e, self.allow_free_text))
+            .collect()
+    }
+    pub(crate) fn with_rows<E>(
+        self,
+        data: &'a Data,
+        today: NaiveDate,
+        events: E,
+    ) -> CalendarView<'a, E> {
+        let tasks = personal_events(&data.calendar, today, self.employee_id)
+            .into_iter()
+            .map(|e| occurrence(data, e, self.allow_free_text))
+            .collect();
         CalendarView {
-            events: events.into_iter().map(visible).collect(),
-            tasks: personal_events(&data.calendar, today, self.employee_id)
-                .into_iter()
-                .map(visible)
-                .collect(),
             context: self,
+            events,
+            tasks,
         }
+    }
+    pub(crate) fn render(self, data: &'a Data, today: NaiveDate) -> CalendarView<'a> {
+        let events = self.event_rows(data);
+        self.with_rows(data, today, events)
     }
 }
 

@@ -69,7 +69,7 @@ name = "storage_permissions"
 
 [features]
 default = ["desktop"]
-server = ["dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
+server = ["serde_json/raw_value", "dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
 desktop = ["server", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
 
 [dependencies]
