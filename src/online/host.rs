@@ -512,7 +512,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             let Ok(raw) = lock.data_bytes() else {
                 return unavailable();
             };
-            let Ok(mut data) = serde_json::from_slice(&raw) else {
+            let Ok((mut data, original)) = views.data_for_write(&raw) else {
                 return unavailable();
             };
             let receipt = receipt.and_then(|(base, year, event)| {
@@ -530,17 +530,23 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             if let Some(response) =
                 prepare_command(lock, acl, credential, employee, mode, cmd, &mut data)
             {
+                views.restore_after_failure(original);
                 return response;
             }
             let Some((year, source, event)) = receipt else {
                 return match lock.save_data(&data) {
                     Ok(()) => StatusCode::NO_CONTENT.into_response(),
-                    Err(_) => unavailable(),
+                    Err(_) => {
+                        views.restore_after_failure(original);
+                        unavailable()
+                    }
                 };
             };
             let Ok(key) = lock.save_data_hashed(&data, source) else {
+                views.restore_after_failure(original);
                 return unavailable();
             };
+            drop(original);
             if chrono::Local::now().date_naive() != today {
                 return StatusCode::NO_CONTENT.into_response();
             }
