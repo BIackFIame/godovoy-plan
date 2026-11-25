@@ -961,7 +961,17 @@ impl App {
                             Layout::top_down(Align::Min),
                             |ui| {
                                 ui.set_width(dial);
-                                self.dial(ui, &events, today);
+                                if compact {
+                                    ScrollArea::vertical()
+                                        .id_salt("compact-calendar-wheel")
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                            ui.set_width(dial);
+                                            self.dial(ui, &events, today);
+                                        });
+                                } else {
+                                    self.dial(ui, &events, today);
+                                }
                             },
                         );
                         let width = width - dial - gap;
