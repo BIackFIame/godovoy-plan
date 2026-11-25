@@ -226,9 +226,6 @@
         el("gate").hidden = true;
         el("logout").hidden = false;
         el("workspace").hidden = false;
-        el("account").textContent = (ownerName(state.employeeId) || "Сотрудник") +
-            (state.assignedOnly ? " · Только назначенные события" : "") +
-            (state.canEdit ? "" : " · Только чтение");
         el("create").hidden = !state.canEdit || state.assignedOnly === true;
         renderList();
     }
@@ -265,6 +262,10 @@
         el("year").textContent = String(currentYear);
         el("previous").disabled = currentYear <= 1900;
         el("next").disabled = currentYear >= 9999;
+        el("account").textContent = (ownerName(state.employeeId) || "Сотрудник") +
+            (mode === "mine" ? " · " + state.workspaceName : "") +
+            (state.assignedOnly ? " · Только назначенные события" : "") +
+            (state.canEdit ? "" : " · Только чтение");
         el("calendar-name").textContent = mode === "mine" ? "Мои задачи" : state.workspaceName;
         el("create").classList.toggle("primary", mode === "all");
         const list = el("list");
@@ -290,7 +291,10 @@
                     const group = element("section", undefined, "month");
                     const label = entry ? month : monthLabel.format(date);
                     if (entry && day < today) group.classList.add("overdue");
-                    group.append(element("h2", label[0].toLocaleUpperCase("ru") + label.slice(1)));
+                    const heading = element("h2", label[0].toLocaleUpperCase("ru") + label.slice(1));
+                    heading.id = "agenda-group-" + i;
+                    group.setAttribute("aria-labelledby", heading.id);
+                    group.append(heading);
                     rows = element("ul", undefined, "items");
                     group.append(rows);
                     list.append(group);
@@ -302,15 +306,19 @@
                     detail(entry ? event : visibleEvents()[i], entry?.next?.id);
                 }, entry ? "event personal" : "event");
                 if (entry) open.id = "personal-" + event.id + "-" + event.year;
-                open.append(element("span", dateLabel.format(date), "date"));
+                const stamp = element("time", dateLabel.format(date), "date");
+                stamp.dateTime = day;
+                if (entry && day.slice(0, 4) !== today.slice(0, 4)) {
+                    stamp.append(element("span", day.slice(0, 4), "sub"));
+                }
+                open.append(stamp);
                 const summary = element("span");
-                const owner = ownerName(event.ownerId);
                 if (entry) {
                     summary.append(element("strong", entry.next?.title || event.title),
                         element("span", entry.next ? event.title : "Дата события", "sub"));
                 } else {
                     summary.append(element("strong", event.title), element("span",
-                        [categories[event.category], owner].filter(Boolean).join(" · "), "sub"));
+                        [categories[event.category], ownerName(event.ownerId)].filter(Boolean).join(" · "), "sub"));
                 }
                 open.append(summary);
                 if (!entry && event.checklist.length) {
