@@ -22,7 +22,7 @@ use crate::{
 };
 
 const APP_SIZE: Vec2 = vec2(1340.0, 850.0);
-const APP_MIN_SIZE: Vec2 = vec2(1040.0, 630.0);
+const APP_MIN_SIZE: Vec2 = vec2(800.0, 500.0);
 const RECOVERY_SIZE: Vec2 = vec2(710.0, 400.0);
 const RECOVERY_MIN_SIZE: Vec2 = vec2(600.0, 360.0);
 
@@ -781,6 +781,11 @@ fn restore_failure_message(error: Box<dyn std::error::Error + Send + Sync>) -> S
 
 fn resize(ctx: &egui::Context, size: Vec2, minimum: Vec2) {
     ctx.send_viewport_cmd(ViewportCommand::MinInnerSize(minimum));
+    let size = ctx.input(|i| {
+        i.viewport()
+            .monitor_size
+            .map_or(size, |monitor| size.min(monitor))
+    });
     ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
 }
 

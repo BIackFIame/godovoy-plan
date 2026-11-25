@@ -55,6 +55,8 @@ use drafts::{Drafts, MAX_NOTE_DRAFTS};
 use people::{DeviceAssignments, employee_options};
 use reminder_work::{ReminderWork, Status as ReminderWorkStatus};
 
+const COMPACT_CALENDAR_WIDTH: f32 = 1040.0;
+
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
     Calendar,
@@ -747,8 +749,15 @@ impl App {
             )
             .show_inside(ui, |ui| {
                 ui.horizontal(|ui| {
-                    workspace_brand(ui, &workspace.name);
-                    ui.add_space(12.0);
+                    if ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH {
+                        ui.spacing_mut().button_padding.x = 6.0;
+                        ui.scope(crate::app_icon::show)
+                            .response
+                            .on_hover_text(&workspace.name);
+                    } else {
+                        workspace_brand(ui, &workspace.name);
+                        ui.add_space(12.0);
+                    }
                     if nav(ui, "Календарь", self.page == Page::Calendar) {
                         self.page = Page::Calendar;
                     }
@@ -937,9 +946,13 @@ impl App {
                 }
                 let events = updated;
                 let width = ui.available_width();
-                if self.show_circle && width >= 555.0 {
-                    let dial = (width * 0.43).clamp(245.0, 368.0);
-                    let gap = 20.0;
+                let compact = ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH;
+                if self.show_circle && (width >= 555.0 || compact && width >= 400.0) {
+                    let (dial, gap) = if compact {
+                        ((width * 0.40).clamp(190.0, 242.0), 12.0)
+                    } else {
+                        ((width * 0.43).clamp(245.0, 368.0), 20.0)
+                    };
                     let height = ui.available_height();
                     ui.horizontal_top(|ui| {
                         ui.spacing_mut().item_spacing.x = gap;
@@ -992,16 +1005,23 @@ impl App {
             self.reveal_event = true;
             ui.ctx().request_repaint();
         }
-        ui.horizontal_wrapped(|ui| {
+        let legend = |ui: &mut Ui, categories: &[Category]| {
             ui.spacing_mut().item_spacing.x = 9.0;
-            for category in Category::ALL {
+            for &category in categories {
                 ui.horizontal(|ui| {
                     ui.spacing_mut().item_spacing.x = 3.0;
                     legend_marker(ui, category);
                     ui.label(RichText::new(category.label()).size(11.5).color(MUTED));
                 });
             }
-        });
+        };
+        if ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH {
+            for pair in Category::ALL.chunks(2) {
+                ui.horizontal(|ui| legend(ui, pair));
+            }
+        } else {
+            ui.horizontal_wrapped(|ui| legend(ui, &Category::ALL));
+        }
     }
 
     fn calendar_controls(&mut self, ui: &mut Ui, today: NaiveDate) {
@@ -1053,7 +1073,11 @@ impl App {
             if view_option(ui, "Список", !self.show_circle) {
                 self.show_circle = false;
             }
-            ui.add_space(8.0);
+            if ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH {
+                ui.end_row();
+            } else {
+                ui.add_space(8.0);
+            }
 
             let response = ui.add(
                 TextEdit::singleline(&mut self.search)

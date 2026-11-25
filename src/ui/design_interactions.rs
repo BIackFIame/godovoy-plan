@@ -683,3 +683,43 @@ fn personal_due_filters_follow_checklist_dates_across_new_year() {
 fn search_matches_capital_letters_and_yo() {
     assert!(search_key("Поздравления партнёрам").contains(&search_key("  ПАРТНЕРАМ ")));
 }
+
+#[test]
+fn compact_calendar_keeps_the_list_and_sync_navigation_visible() {
+    let profile = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&profile.path().join("profile"));
+    app.year = 2028;
+    app.network = DesktopTransport::Started(Err("Без сети".into()));
+    for size in [vec2(819.0, 574.0), vec2(960.0, 600.0), vec2(1024.0, 640.0)] {
+        let ctx = egui::Context::default();
+        crate::theme::setup(&ctx);
+        let mut frame = eframe::Frame::_new_kittest();
+        let mut shapes = Vec::new();
+        for _ in 0..4 {
+            let input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            shapes = ctx
+                .run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
+                .shapes;
+        }
+        let label = |prefix: &str| {
+            shapes
+                .iter()
+                .find_map(|shape| {
+                    let egui::Shape::Text(text) = &shape.shape else {
+                        return None;
+                    };
+                    let bounds = text.visual_bounding_rect();
+                    (text.galley.text().starts_with(prefix)
+                        && shape.clip_rect.contains_rect(bounds))
+                    .then_some(bounds)
+                })
+                .unwrap_or_else(|| panic!("Надпись «{prefix}» недоступна при {size:?}"))
+        };
+        assert!(label("Напоминания").right() < label("Синхронизация").left());
+        assert!(label("События").left() > label("Годовой круг").right());
+        assert!(label("События").bottom() < size.y - 46.0);
+    }
+}

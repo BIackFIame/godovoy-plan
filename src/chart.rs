@@ -141,11 +141,8 @@ pub fn year_wheel(
     let marker_radius = radius - 12.0;
     for (month, rows) in months.into_iter().enumerate() {
         if needs_group(rows, marker_radius) {
-            let month_angle = -FRAC_PI_2 + (month as f32 + 0.5) * TAU / 12.0;
-            let size = vec2(54.0, 22.0);
-            let bounds = response.rect.shrink2(size * 0.5);
-            let point = bounds.clamp(polar(center, radius + 18.0, month_angle));
-            let rect = Rect::from_center_size(point, size);
+            let rect = month_button(response.rect, radius + 18.0, month);
+            let point = rect.center();
             let label = format!("{} · {}", MONTH_NAMES[month], event_count(rows.len()));
             let control = ui
                 .interact(
@@ -356,6 +353,28 @@ fn angle(date: NaiveDate) -> f32 {
     -FRAC_PI_2 + (date.month0() as f32 + (date.day0() as f32 + 0.5) / days) * TAU / 12.0
 }
 
+fn month_button(chart: Rect, ring: f32, month: usize) -> Rect {
+    let size = vec2(54.0, 22.0);
+    let center = chart.center();
+    let angle = -FRAC_PI_2 + (month as f32 + 0.5) * TAU / 12.0;
+    let mut point = polar(center, ring, angle);
+    // Keep the adjacent targets on opposite sides of January and July apart.
+    let half_gap = size.x * 0.5 + 2.0;
+    point.x = if month < 6 {
+        point.x.max(center.x + half_gap)
+    } else {
+        point.x.min(center.x - half_gap)
+    };
+    // The next badge on either side is at 45 degrees. Both hit boxes extend 1 pt.
+    let outer_row = ring * std::f32::consts::FRAC_1_SQRT_2 + size.y + 2.5;
+    match month {
+        0 | 11 => point.y = point.y.min(center.y - outer_row),
+        5 | 6 => point.y = point.y.max(center.y + outer_row),
+        _ => {}
+    }
+    Rect::from_center_size(chart.shrink2(size * 0.5).clamp(point), size)
+}
+
 fn polar(center: Pos2, radius: f32, angle: f32) -> Pos2 {
     pos2(
         center.x + angle.cos() * radius,
@@ -392,6 +411,22 @@ mod tests {
             date: NaiveDate::from_ymd_opt(2028, month, day).unwrap(),
             title: String::new(),
             category: Category::Partners,
+        }
+    }
+
+    #[test]
+    fn dense_months_have_separate_hit_boxes_at_every_wheel_width() {
+        for width in 190..=368 {
+            let height = width.min(308) as f32;
+            let chart = Rect::from_min_size(Pos2::ZERO, vec2(width as f32, height));
+            let ring = (height - 59.0) * 0.5 + 18.0;
+            let buttons: [_; 12] = std::array::from_fn(|month| month_button(chart, ring, month));
+            for (i, button) in buttons.iter().enumerate() {
+                assert!(chart.contains_rect(*button));
+                for other in &buttons[..i] {
+                    assert!(!button.expand(1.0).intersects(other.expand(1.0)), "{width}");
+                }
+            }
         }
     }
 
