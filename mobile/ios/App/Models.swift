@@ -45,6 +45,31 @@ struct GPEvent: Decodable, Identifiable {
     let revision: String
     var month: Int { Int(date.dropFirst(5).prefix(2)) ?? 0 }
 }
+/// The wheel counts the whole year while the list follows the month and search filters.
+struct GPYearSections {
+    private(set) var counts = Array(repeating: 0, count: 12)
+    private(set) var rows = Array(repeating: [GPEvent](), count: 12)
+
+    init(events: [GPEvent], selectedMonth: Int?, search: String) {
+        for event in events {
+            // The wheel is hidden during search. Discard misses before grouping them.
+            if !search.isEmpty {
+                if let selectedMonth, event.month != selectedMonth { continue }
+                guard event.title.localizedCaseInsensitiveContains(search) else { continue }
+            }
+            let month = event.month
+            guard (1...12).contains(month) else { continue }
+            if search.isEmpty { counts[month - 1] += 1 }
+            if selectedMonth == nil || selectedMonth == month {
+                rows[month - 1].append(event)
+            }
+        }
+        for index in rows.indices where rows[index].count > 1 {
+            rows[index].sort { ($0.date, $0.title) < ($1.date, $1.title) }
+        }
+    }
+}
+
 struct GPReminder: Decodable { let eventId, title, date: String; let year: Int }
 struct GPState: Decodable {
     let deviceId: String

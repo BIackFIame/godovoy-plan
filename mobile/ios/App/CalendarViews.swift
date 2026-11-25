@@ -6,19 +6,26 @@ struct CalendarView: View {
     @State private var creating = false
     @State private var search = ""
     var body: some View {
-        List {
+        let sections = model.state.map {
+            GPYearSections(events: $0.events, selectedMonth: month, search: search)
+        }
+        return List {
             Section {
                 HStack { yearButton(-1); Spacer(); Text(String(model.year)).font(.title2.bold()).monospacedDigit(); Spacer(); yearButton(1) }
-                if let events = model.state?.events, !events.isEmpty && search.isEmpty {
-                    GPYearWheel(counts: (1...12).map { m in events.filter { $0.month == m }.count }, selected: $month)
+                if let sections, search.isEmpty, sections.counts.contains(where: { $0 > 0 }) {
+                    GPYearWheel(counts: sections.counts, selected: $month)
                     if month != nil { Button("Показать весь год") { month = nil } }
                 }
             }
-            if let state = model.state {
-                let list = state.events.filter { (month == nil || $0.month == month) && (search.isEmpty || $0.title.localizedCaseInsensitiveContains(search)) }.sorted { ($0.date, $0.title) < ($1.date, $1.title) }
-                if list.isEmpty { Text(search.isEmpty ? "Событий пока нет" : "Событий по этому запросу нет").foregroundStyle(.secondary) }
-                ForEach((1...12).filter { m in list.contains { $0.month == m } }, id: \.self) { m in
-                    Section(GPDate.months[m - 1]) { ForEach(list.filter { $0.month == m }) { event in EventLink(event: event) } }
+            if let sections {
+                if sections.rows.allSatisfy(\.isEmpty) {
+                    Text(search.isEmpty ? "Событий пока нет" : "Событий по этому запросу нет")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(sections.rows.indices.filter { !sections.rows[$0].isEmpty }, id: \.self) { index in
+                    Section(GPDate.months[index]) {
+                        ForEach(sections.rows[index]) { event in EventLink(event: event) }
+                    }
                 }
             }
         }
@@ -88,7 +95,13 @@ struct DetailView: View {
         }
         .task(id: id) { await reload() }.refreshable { await reload() }
         .onReceive(model.$state) { state in
-            guard let state else { return }; if let event = (state.events + state.tasks).first(where: { $0.id == id && $0.year == year }) { update(event) } else if state.year == year { event = nil }
+            guard let state else { return }
+            let matches: (GPEvent) -> Bool = { $0.id == id && $0.year == year }
+            if let current = state.events.first(where: matches) ?? state.tasks.first(where: matches) {
+                update(current)
+            } else if state.year == year {
+                event = nil
+            }
         }
     }
     private func update(_ next: GPEvent) { if !loaded || note == base { note = next.note; base = next.note }; event = next; loaded = true }
