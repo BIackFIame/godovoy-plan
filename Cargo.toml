@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.6.4"
+version = "0.6.5"
 edition = "2024"
 default-run = "godovoy-plan"
 # Only the named integration suites below are executable test targets.
