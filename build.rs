@@ -2,7 +2,9 @@ use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     println!("cargo::rerun-if-changed=build.rs");
-    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows") {
+    if env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("windows")
+        || env::var_os("CARGO_FEATURE_DESKTOP").is_none()
+    {
         return;
     }
 

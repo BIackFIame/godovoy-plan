@@ -1,3 +1,7 @@
+#[path = "standby.rs"]
+mod standby;
+use standby::Mode;
+
 use super::actions::{self, Command};
 use axum::{
     Json, Router,
@@ -35,6 +39,7 @@ pub struct Host {
     origin: String,
     authority: String,
     entry: EntryPoint,
+    mode: Mode,
     operations: Arc<Semaphore>,
 }
 impl Host {
@@ -70,9 +75,27 @@ impl Host {
             origin,
             authority: authority.as_str().into(),
             entry,
+            mode: Mode::Primary,
             operations: Arc::new(Semaphore::new(16)),
         })
     }
+    fn enable_standby(&mut self) -> Fallible<()> {
+        if self.entry != EntryPoint::Office {
+            return Err("Резервный узел поддерживает только офисный вход.".into());
+        }
+        self.mode = Mode::standby(&self.vault.lock()?)?;
+        Ok(())
+    }
+}
+fn standby_unavailable() -> Response {
+    let mut response = problem(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "Вход закрыт. Проверьте состояние резервного окна.",
+    );
+    response
+        .headers_mut()
+        .insert("x-godovoy-standby", HeaderValue::from_static("unavailable"));
+    response
 }
 fn problem(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
@@ -129,7 +152,7 @@ async fn headers(State(host): State<Host>, req: Request, next: Next) -> Response
 }
 async fn with_auth<F>(host: Host, headers: HeaderMap, write: bool, action: F) -> Response
 where
-    F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool) -> Response + Send + 'static,
+    F: FnOnce(&LockedVault<'_>, &Access, Id, Id, bool, &Mode) -> Response + Send + 'static,
 {
     let Some(token) = headers
         .get(header::AUTHORIZATION)
@@ -180,6 +203,20 @@ where
                 "Ключ недействителен или доступ отозван.",
             );
         };
+        let Ok(deadline) = host.mode.check(&lock) else {
+            if lock
+                .audit_security(
+                    "standby_access_denied",
+                    Some(id),
+                    Some(grant.employee),
+                    None,
+                )
+                .is_err()
+            {
+                return unavailable();
+            }
+            return standby_unavailable();
+        };
         if host.entry == EntryPoint::Remote && !grant.allow_remote {
             if lock
                 .audit_security("remote_access_denied", Some(id), Some(grant.employee), None)
@@ -205,7 +242,22 @@ where
             }
             return problem(StatusCode::FORBIDDEN, "Разрешено только чтение.");
         };
-        action(&lock, &acl, id, grant.employee, !grant.read_only)
+        let mut response = action(
+            &lock,
+            &acl,
+            id,
+            grant.employee,
+            !grant.read_only,
+            &host.mode,
+        );
+        if response.status().is_success()
+            && let Some(deadline) = deadline
+        {
+            response
+                .headers_mut()
+                .insert("x-godovoy-standby-until", HeaderValue::from(deadline));
+        }
+        response
     })
     .await
     .unwrap_or_else(|_| unavailable())
@@ -227,7 +279,7 @@ async fn state(
         host,
         headers,
         false,
-        move |lock, acl, id, employee, edit| match lock.data() {
+        move |lock, acl, id, employee, edit, mode| match lock.data() {
             Ok(data) => {
                 if lock
                     .audit_security("state_requested", Some(id), Some(employee), None)
@@ -235,7 +287,12 @@ async fn state(
                 {
                     return unavailable();
                 }
-                Json(actions::state(&data, acl, query.year, employee, edit)).into_response()
+                let response =
+                    Json(actions::state(&data, acl, query.year, employee, edit)).into_response();
+                if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                    return standby_unavailable();
+                }
+                response
             }
             Err(_) => unavailable(),
         },
@@ -243,7 +300,7 @@ async fn state(
     .await
 }
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
-    with_auth(host, headers, false, |_, _, _, _, _| {
+    with_auth(host, headers, false, |_, _, _, _, _, _| {
         StatusCode::NO_CONTENT.into_response()
     })
     .await
@@ -264,7 +321,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
         host,
         headers,
         true,
-        move |lock, acl, credential, employee, _| {
+        move |lock, acl, credential, employee, _, mode| {
             let Ok(cmd) = serde_json::from_slice::<Command>(&body) else {
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
             };
@@ -299,6 +356,9 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                         return unavailable();
                     }
                     record(&mut data.audit, kind, credential, employee, Some(event));
+                    if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                        return standby_unavailable();
+                    }
                     match lock.save_data(&data) {
                         Ok(()) => StatusCode::NO_CONTENT.into_response(),
                         Err(_) => unavailable(),
@@ -342,11 +402,15 @@ pub async fn serve(
     port: u16,
     origin: Option<String>,
     entry: Option<EntryPoint>,
+    standby: bool,
 ) -> Fallible<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let addr = listener.local_addr()?;
     let origin = origin.unwrap_or_else(|| format!("http://{addr}"));
-    let host = Host::new(vault, &origin, entry)?;
+    let mut host = Host::new(vault, &origin, entry)?;
+    if standby {
+        host.enable_standby()?;
+    }
     let scope = match host.entry {
         EntryPoint::Office => "офисный",
         EntryPoint::Remote => "внешний",
@@ -465,6 +529,82 @@ mod tests {
             "date":"2028-02-29","yearly":true,"preparationDays":30,"checklist":[{"title":"Список","daysBefore":10}]})
         }
     }
+    #[tokio::test]
+    async fn standby_epoch_blocks_both_primary_entries_and_keeps_office_edits_and_revocations() {
+        let mut f = Fixture::new();
+        let new_host =
+            |entry| Host::new(f.vault.clone(), "https://calendar.test", Some(entry)).unwrap();
+        let mut standby = new_host(EntryPoint::Office);
+        let mut remote = new_host(EntryPoint::Remote);
+        assert!(standby.enable_standby().is_err());
+        let window = f.vault.lock().unwrap().begin_standby(10).unwrap();
+        assert!(remote.enable_standby().is_err());
+        standby.enable_standby().unwrap();
+        let remote = router(remote);
+        for app in [f.app.clone(), remote] {
+            for (path, method) in [
+                ("/v1/session", Method::GET),
+                ("/v1/state?year=2028", Method::GET),
+                ("/v1/command", Method::POST),
+            ] {
+                let request = Request::builder()
+                    .uri(path)
+                    .method(method)
+                    .header(header::HOST, "calendar.test")
+                    .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(f.create().to_string()))
+                    .unwrap();
+                let response = app.clone().oneshot(request).await.unwrap();
+                assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+                assert_eq!(response.headers()["x-godovoy-standby"], "unavailable");
+            }
+        }
+        let primary = std::mem::replace(&mut f.app, router(standby));
+        let request = Request::builder()
+            .uri("/v1/session")
+            .header(header::HOST, "calendar.test")
+            .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+            .body(Body::empty())
+            .unwrap();
+        let response = f.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(
+            response.headers()["x-godovoy-standby-until"]
+                .to_str()
+                .unwrap(),
+            window.deadline.to_string()
+        );
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let saved = f.state().await;
+        f.vault.lock().unwrap().end_standby().unwrap();
+        assert_eq!(
+            f.request("/v1/session", &f.key, None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let old_standby = std::mem::replace(&mut f.app, primary);
+        assert_eq!(f.state().await, saved);
+        let (_, _, other) = f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        f.vault.lock().unwrap().begin_standby(2).unwrap();
+        f.app = old_standby;
+        assert_eq!(
+            f.request("/v1/session", &other, None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        let mut next = new_host(EntryPoint::Office);
+        next.enable_standby().unwrap();
+        f.app = router(next);
+        f.vault.lock().unwrap().revoke(f.credential).unwrap();
+        assert_eq!(
+            f.request("/v1/session", &f.key, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(
+            f.request("/v1/session", &other, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
     #[tokio::test]
     async fn entry_policy_is_fixed_by_the_host_and_shared_vault_grants_apply_on_each_request() {
         use godovoy_plan::storage::online::GrantPermissions;

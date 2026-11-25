@@ -310,3 +310,68 @@ fn revoke_all_after_restore_is_atomic_repeatable_and_preserves_assignments() {
         2
     );
 }
+
+#[test]
+fn standby_cli_preserves_window_rejects_corruption_and_allows_emergency_revocation() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("central");
+    assert!(cli("init", &dir, &["Офис"]).status.success());
+    let issued = cli("grant", &dir, &["Анна"]);
+    let token = String::from_utf8(issued.stdout).unwrap();
+    let id = token.lines().last().unwrap().split_once('.').unwrap().0;
+    for invalid in ["0", "1441", "-1", "1.5"] {
+        assert!(
+            !cli("standby-begin", &dir, &["--minutes", invalid])
+                .status
+                .success()
+        );
+    }
+    let first = cli("standby-begin", &dir, &["--minutes", "1"]);
+    assert!(first.status.success());
+    assert_eq!(
+        first.stdout,
+        cli("standby-begin", &dir, &["--minutes", "1440"]).stdout
+    );
+    let status = cli("status", &dir, &[]);
+    assert!(
+        String::from_utf8(status.stdout)
+            .unwrap()
+            .contains(String::from_utf8(first.stdout).unwrap().trim())
+    );
+    assert!(!cli("grant", &dir, &["Борис"]).status.success());
+    let marker = dir.join("online-standby-v1.json");
+    let good = fs::read(&marker).unwrap();
+    for bad in ["{", "null", r#"{"deadline":0}"#] {
+        fs::write(&marker, bad).unwrap();
+        assert!(
+            !cli("standby-begin", &dir, &["--minutes", "30"])
+                .status
+                .success()
+        );
+        assert!(!cli("standby-end", &dir, &[]).status.success());
+        assert!(!cli("grant", &dir, &["Борис"]).status.success());
+        assert!(!cli("status", &dir, &[]).status.success());
+    }
+    fs::remove_file(&marker).unwrap();
+    assert!(
+        !cli("standby-begin", &dir, &["--minutes", "30"])
+            .status
+            .success()
+    );
+    assert!(!cli("standby-end", &dir, &[]).status.success());
+    assert!(!cli("status", &dir, &[]).status.success());
+    assert!(cli("revoke", &dir, &[id]).status.success());
+    assert!(cli("revoke-all", &dir, &[]).status.success());
+    fs::write(&marker, good).unwrap();
+    assert!(cli("standby-end", &dir, &[]).status.success());
+    assert!(cli("standby-end", &dir, &[]).status.success());
+    assert!(cli("grant", &dir, &["Борис"]).status.success());
+    let log = fs::read_dir(&dir)
+        .unwrap()
+        .map(|p| p.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let log = fs::read_to_string(log).unwrap();
+    assert_eq!(log.matches("standby_begin_requested").count(), 1);
+    assert_eq!(log.matches("standby_end_requested").count(), 1);
+}

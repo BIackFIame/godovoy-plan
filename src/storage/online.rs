@@ -1,6 +1,9 @@
 //! Separate storage format for the authoritative host. It has no P2P keys or routes.
 #[path = "online_audit.rs"]
 mod security_audit;
+#[path = "online_standby.rs"]
+mod standby;
+pub use standby::StandbyWindow;
 
 use super::{
     CALENDAR_MESSAGE_LIMIT, check_profile_file, random_bytes, save, validate_profile_access,
@@ -242,6 +245,9 @@ impl LockedVault<'_> {
         permissions: GrantPermissions,
     ) -> Fallible<(Id, Id, String)> {
         let mut access = self.access()?;
+        if self.standby_window()?.is_some() {
+            return Err("Выдача ключей приостановлена до завершения резервного режима.".into());
+        }
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
             return Err("Введите имя сотрудника (1–80 символов).".into());

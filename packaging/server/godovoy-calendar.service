@@ -1,0 +1,23 @@
+[Unit]
+Description=Godovoy Plan office calendar (cluster-managed)
+After=network.target
+AssertPathIsMountPoint=/srv/godovoy/volume
+
+[Service]
+Type=exec
+User=godovoy
+Group=godovoy
+EnvironmentFile=/etc/godovoy/office.env
+ExecStart=/usr/local/libexec/godovoy-office
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/srv/godovoy/volume/calendar
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=

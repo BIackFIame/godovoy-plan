@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.5.44"
+version = "0.5.45"
 edition = "2024"
 default-run = "godovoy-plan"
 rust-version = "1.94"
@@ -19,11 +19,28 @@ required-features = ["desktop"]
 [[bin]]
 name = "godovoy-online"
 path = "src/bin/godovoy-online.rs"
+required-features = ["server"]
+
+[[test]]
+name = "api"
 required-features = ["desktop"]
+
+[[test]]
+name = "api_scenarios"
+required-features = ["desktop"]
+
+[[test]]
+name = "import_cross_year"
+required-features = ["desktop"]
+
+[[test]]
+name = "online_vault"
+required-features = ["server"]
 
 [features]
 default = ["desktop"]
-desktop = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+server = ["dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
+desktop = ["server", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
 
 [dependencies]
 curve25519-dalek = { version = "4", default-features = false }

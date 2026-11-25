@@ -6,6 +6,7 @@
     const monthLabel = new Intl.DateTimeFormat("ru", {month: "long", year: "numeric", timeZone: "UTC"});
     const dateLabel = new Intl.DateTimeFormat("ru", {day: "numeric", month: "short", timeZone: "UTC"});
     const fullDate = new Intl.DateTimeFormat("ru", {day: "numeric", month: "long", year: "numeric", timeZone: "UTC"});
+    const deadlineLabel = new Intl.DateTimeFormat("ru", {day: "numeric", month: "short", hour: "2-digit", minute: "2-digit", timeZoneName: "short"});
     const isoDate = (value) => new Date(value + "T12:00:00Z");
     const prompts = {
         login: "Введите личный ключ, который вам выдал администратор календаря.",
@@ -44,6 +45,15 @@
         return node;
     }
     function notice(message) { el("feedback").textContent = message; }
+    function standbyNotice(until) {
+        const node = el("standby-status");
+        if (until === (node.dataset.until || "")) return;
+        node.dataset.until = until;
+        node.hidden = !until;
+        node.textContent = until
+            ? "Работа на резервном сервере до " + deadlineLabel.format(new Date(Number(until) * 1000)) + "."
+            : "";
+    }
     function closeSheet() {
         if (el("sheet").open) el("sheet").close();
         el("sheet-body").replaceChildren();
@@ -72,6 +82,7 @@
         lastVerified = 0;
         lastLoaded = 0;
         state = null;
+        standbyNotice("");
         el("workspace").hidden = true;
         closeSheet();
         el("sheet-body").inert = false;
@@ -116,6 +127,10 @@
                     : prompts.denied);
                 throw new Problem();
             }
+            if (response.status === 503 && response.headers.get("x-godovoy-standby") === "unavailable") {
+                clearWorkspace(writing ? prompts.uncertain : "Календарь временно недоступен. Дождитесь возврата основного сервера и войдите снова.");
+                throw new Problem();
+            }
             if (!response.ok) {
                 if (response.status >= 500 || body === undefined) throw new Error("Connection unavailable");
                 const problem = await response.json();
@@ -128,6 +143,8 @@
             }
             const result = data ? await response.json() : null;
             if (epoch !== generation || document.hidden) throw new Problem();
+            const until = response.headers.get("x-godovoy-standby-until") || "";
+            standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
             lastVerified = performance.now();
             return result;
         } catch (error) {

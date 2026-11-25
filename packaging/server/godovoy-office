@@ -1,0 +1,19 @@
+#!/bin/sh
+# Started by the cluster only after it has fenced the former owner, acquired
+# and mounted the current block volume. Manual failback clears standby first.
+set -eu
+vault=/srv/godovoy/volume/calendar
+server=/usr/local/bin/godovoy-online
+: "${GODOVOY_OFFICE_ORIGIN:?office HTTPS origin required}"
+case "$GODOVOY_OFFICE_ORIGIN" in
+    https://*) ;;
+    *) echo "GODOVOY_OFFICE_ORIGIN must use HTTPS" >&2; exit 2 ;;
+esac
+case "${GODOVOY_NODE_ROLE:-}" in
+    primary)
+        exec "$server" serve "$vault" --access office --origin "$GODOVOY_OFFICE_ORIGIN" ;;
+    standby)
+        "$server" standby-begin "$vault" --minutes "${GODOVOY_STANDBY_MINUTES:?duration required}"
+        exec "$server" serve "$vault" --access office --origin "$GODOVOY_OFFICE_ORIGIN" --standby ;;
+    *) echo "GODOVOY_NODE_ROLE must be primary or standby" >&2; exit 2 ;;
+esac

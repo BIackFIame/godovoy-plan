@@ -4,6 +4,7 @@ mod actions;
 #[path = "../online/host.rs"]
 mod host;
 
+use chrono::{DateTime, SecondsFormat, Utc};
 use godovoy_plan::{
     Fallible,
     model::{Calendar, Id},
@@ -14,7 +15,22 @@ use godovoy_plan::{
 };
 use std::{env, path::Path};
 
-const HELP: &str = "godovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online serve DIR [--port 45838] [--origin https://calendar.example] [--access office|remote]";
+const HELP: &str = "godovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
+fn describe_window(window: godovoy_plan::storage::online::StandbyWindow) {
+    let deadline =
+        DateTime::<Utc>::from_timestamp(window.deadline, 0).expect("validated standby deadline");
+    let state = if window.active_at(Utc::now().timestamp()) {
+        "открыто"
+    } else {
+        "заблокировано"
+    };
+    println!(
+        "Резервное окно {}: {}, до {} (UTC).",
+        window.id,
+        state,
+        deadline.to_rfc3339_opts(SecondsFormat::Secs, true)
+    );
+}
 fn main() {
     if let Err(e) = run() {
         eprintln!("Ошибка: {e}");
@@ -63,14 +79,19 @@ fn run() -> Fallible<()> {
             let mut port = None;
             let mut origin = None;
             let mut entry = None;
-            for flag in options.chunks(2) {
-                match flag {
-                    [arg, n] if arg == "--port" && port.is_none() => port = Some(n.parse::<u16>()?),
-                    [arg, value] if arg == "--origin" && origin.is_none() => {
-                        origin = Some(value.to_owned())
+            let mut standby = false;
+            let mut iter = options.iter();
+            while let Some(flag) = iter.next() {
+                match flag.as_str() {
+                    "--standby" if !standby => standby = true,
+                    "--port" if port.is_none() => {
+                        port = Some(iter.next().ok_or(HELP)?.parse::<u16>()?)
                     }
-                    [arg, value] if arg == "--access" && entry.is_none() => {
-                        entry = Some(match value.as_str() {
+                    "--origin" if origin.is_none() => {
+                        origin = Some(iter.next().ok_or(HELP)?.to_owned())
+                    }
+                    "--access" if entry.is_none() => {
+                        entry = Some(match iter.next().ok_or(HELP)?.as_str() {
                             "office" => host::EntryPoint::Office,
                             "remote" => host::EntryPoint::Remote,
                             _ => return Err(HELP.into()),
@@ -82,7 +103,13 @@ fn run() -> Fallible<()> {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(host::serve(vault, port.unwrap_or(45838), origin, entry))?;
+                .block_on(host::serve(
+                    vault,
+                    port.unwrap_or(45838),
+                    origin,
+                    entry,
+                    standby,
+                ))?;
         }
         ("grant", [name, options @ ..]) => {
             let mut employee = None;
@@ -116,10 +143,22 @@ fn run() -> Fallible<()> {
             let count = vault.lock()?.revoke_all()?;
             println!("Отозвано ключей: {count}.");
         }
+        ("standby-begin", [flag, minutes]) if flag == "--minutes" => {
+            describe_window(vault.lock()?.begin_standby(minutes.parse()?)?);
+        }
+        ("standby-end", []) => {
+            vault.lock()?.end_standby()?;
+            println!("Резервное окно закрыто. Разрешён основной режим.");
+        }
         ("status", []) => {
             let lock = vault.lock()?;
             let acl = lock.access()?;
             println!("Календарь: {}", acl.name.escape_debug());
+            if let Some(window) = lock.standby_status()? {
+                describe_window(window);
+            } else {
+                println!("Основной режим.");
+            }
             for (id, name) in acl.employees {
                 println!("Сотрудник {id}: {}", name.escape_debug());
             }

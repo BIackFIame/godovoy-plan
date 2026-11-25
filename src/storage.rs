@@ -18,7 +18,7 @@ use crate::{
 
 mod access;
 mod generations;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "server")]
 pub mod online;
 use access::{check_directory as check_private_directory, validate_profile_access};
 mod backup;
