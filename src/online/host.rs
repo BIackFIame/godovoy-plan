@@ -414,6 +414,9 @@ async fn state(
         return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
     }
     let views = host.views.clone();
+    let accept_delta = headers
+        .get("x-godovoy-delta")
+        .is_some_and(|v| v == "event-v1");
     let condition: Vec<_> = headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
@@ -430,7 +433,7 @@ async fn state(
             };
             let today = chrono::Local::now().date_naive();
             let parallel_audit = data.byte_len() >= 128 * 1024 && condition.is_empty();
-            let prepare = || views.response(id, context, today, data, &condition);
+            let prepare = || views.response(id, context, today, data, &condition, accept_delta);
             let audit = || lock.audit_security("state_requested", Some(id), Some(employee), None);
             let result = if parallel_audit {
                 std::thread::scope(|scope| {
@@ -454,6 +457,11 @@ async fn state(
             };
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
+            }
+            if response.headers().contains_key("x-godovoy-delta-base")
+                && chrono::Local::now().date_naive() != today
+            {
+                return unavailable();
             }
             response
         },
@@ -518,13 +526,14 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             let receipt = receipt.and_then(|(base, year, event)| {
                 let context = actions::ViewContext::new(acl, year, employee, can_edit);
                 let source = conditional::Views::input_hasher(credential, &context, today).ok()?;
-                let original = source.clone().chain_update(&raw).finalize().into();
+                let before = conditional::InputHasher::digest(&raw).into();
+                let original = conditional::Views::source_key(&source, before);
                 let tag = views.lookup(&original).ok().flatten().or_else(|| {
                     views
                         .view_tag(credential, &context.render(&data, today))
                         .ok()
                 })?;
-                (tag.as_bytes() == base.as_bytes()).then_some((year, source, event))
+                (tag.as_bytes() == base.as_bytes()).then_some((year, source, event, before))
             });
             drop(raw);
             if let Some(response) =
@@ -533,19 +542,28 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                 views.restore_after_failure(original);
                 return response;
             }
-            let Some((year, source, event)) = receipt else {
+            let Some((year, source, event, before)) = receipt else {
                 return match lock.save_data(&data) {
-                    Ok(()) => StatusCode::NO_CONTENT.into_response(),
+                    Ok(()) => {
+                        views.transition(None);
+                        StatusCode::NO_CONTENT.into_response()
+                    }
                     Err(_) => {
                         views.restore_after_failure(original);
                         unavailable()
                     }
                 };
             };
-            let Ok(key) = lock.save_data_hashed(&data, source) else {
+            let Ok(after) = lock.save_data_hashed(&data, conditional::InputHasher::new()) else {
                 views.restore_after_failure(original);
                 return unavailable();
             };
+            let key = conditional::Views::source_key(&source, after);
+            views.transition(Some(conditional::EventTransition {
+                before,
+                after,
+                event,
+            }));
             drop(original);
             if chrono::Local::now().date_naive() != today {
                 return StatusCode::NO_CONTENT.into_response();

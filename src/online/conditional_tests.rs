@@ -18,6 +18,129 @@ mod conditional_tests {
             .unwrap()
     }
 
+    async fn poll(f: &Fixture, year: i32, key: &str, tag: &str) -> Response {
+        let request = Request::builder()
+            .uri(format!("/v1/state?year={year}"))
+            .header(header::HOST, "calendar.test")
+            .header(header::AUTHORIZATION, format!("Bearer {key}"))
+            .header(header::IF_NONE_MATCH, tag)
+            .header("x-godovoy-delta", "event-v1")
+            .body(Body::empty())
+            .unwrap();
+        f.app.clone().oneshot(request).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn colleague_poll_rebuilds_only_its_own_representation_and_rejects_stale_bases() {
+        let f = Fixture::new();
+        let (grant, _, reader) = f.vault.lock().unwrap().grant("Обзор", None, true).unwrap();
+        let (_, personal, restricted) = f.vault.lock().unwrap().grant("Свои", None, true).unwrap();
+        f.vault
+            .lock()
+            .unwrap()
+            .set_employee_scope(personal, true)
+            .unwrap();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let (writer, own) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let (base, mut prior) = snapshot(get(&f, 2028, &reader, &[]).await).await;
+        let (limited, empty) = snapshot(get(&f, 2028, &restricted, &[]).await).await;
+        assert!(empty["events"].as_array().unwrap().is_empty());
+        let id = &own["events"][0]["id"];
+        let note = |before: &str, after: &str| json!({"op":"note","eventId":id,"year":2028,"base":before,"text":after});
+        let ack = save_with_tag(&f, &f.key, &writer, &note("", "у коллеги")).await;
+        let writer2 = ack.headers()["x-godovoy-state-tag"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        assert_unchanged(poll(&f, 2028, &restricted, &limited).await, &limited).await;
+        let resp = poll(&f, 2028, &reader, &base).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.headers()["x-godovoy-delta-base"], base);
+        assert!(!resp.headers().contains_key(header::ETAG));
+        let reader2 = resp.headers()["x-godovoy-state-tag"]
+            .to_str()
+            .unwrap()
+            .to_owned();
+        let patch: Value =
+            serde_json::from_slice(&to_bytes(resp.into_body(), 65536).await.unwrap()).unwrap();
+        assert_eq!(patch["id"], *id);
+        for key in ["events", "tasks"] {
+            let rows = prior[key].as_array_mut().unwrap();
+            rows.retain(|r| r["id"] != *id);
+            for change in patch[key].as_array().unwrap() {
+                rows.insert(
+                    change["index"].as_u64().unwrap() as usize,
+                    change["event"].clone(),
+                );
+            }
+        }
+        assert_eq!(
+            snapshot(get(&f, 2028, &reader, &[]).await).await,
+            (reader2.clone(), prior)
+        );
+        for resp in [
+            poll(&f, 2028, &reader, &writer).await,
+            poll(&f, 2029, &reader, &base).await,
+            get(&f, 2028, &reader, &[&base]).await,
+        ] {
+            assert_eq!(resp.status(), StatusCode::OK);
+            assert!(!resp.headers().contains_key("x-godovoy-delta-base"));
+        }
+        let second = save_with_tag(&f, &f.key, &writer2, &note("у коллеги", "следующая")).await;
+        assert_eq!(second.status(), StatusCode::OK);
+        let (fresh, year) = snapshot(poll(&f, 2028, &reader, &base).await).await;
+        assert_eq!(year["events"][0]["note"], "следующая");
+        let delta = poll(&f, 2028, &reader, &reader2).await;
+        assert_eq!(delta.headers()["x-godovoy-state-tag"], fresh);
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    russia: true,
+                    allow_free_text: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let (_, filtered) = snapshot(poll(&f, 2028, &reader, &reader2).await).await;
+        assert_eq!(filtered["events"][0]["note"], "");
+        f.vault.lock().unwrap().revoke(grant).unwrap();
+        let denied = poll(&f, 2028, &reader, &reader2).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(!denied.headers().contains_key("x-godovoy-delta-base"));
+    }
+
+    #[tokio::test]
+    async fn external_replacement_with_identical_stat_invalidates_colleague_delta() {
+        let f = Fixture::new();
+        let (_, _, reader) = f.vault.lock().unwrap().grant("Обзор", None, true).unwrap();
+        let mut event = f.create();
+        event["title"] = json!("original title");
+        assert_eq!(f.cmd(event).await, StatusCode::NO_CONTENT);
+        let (writer, own) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let (base, _) = snapshot(get(&f, 2028, &reader, &[]).await).await;
+        let ack=save_with_tag(&f,&f.key,&writer,&json!({"op":"note","eventId":own["events"][0]["id"],"year":2028,"base":"","text":"новая"})).await;
+        assert_eq!(ack.status(), StatusCode::OK);
+        let path = f._tmp.path().join("host/online-calendar-v1.json");
+        let stamp = path.metadata().unwrap().modified().unwrap();
+        let original = std::fs::read_to_string(&path).unwrap();
+        let changed = original.replace("original title", "external title");
+        assert_ne!(changed, original);
+        assert_eq!(changed.len(), original.len());
+        std::fs::write(&path, changed).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(stamp)
+            .unwrap();
+        assert_eq!(path.metadata().unwrap().modified().unwrap(), stamp);
+        let (_, full) = snapshot(poll(&f, 2028, &reader, &base).await).await;
+        assert_eq!(full["events"][0]["title"], "external title");
+    }
+
     async fn snapshot(response: Response) -> (String, Value) {
         assert_eq!(response.status(), StatusCode::OK);
         let tag = response.headers()[header::ETAG]
@@ -31,7 +154,10 @@ mod conditional_tests {
     async fn assert_unchanged(response: Response, tag: &str) {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()[header::ETAG], tag);
-        assert_eq!(response.headers()[header::VARY], "Authorization");
+        assert_eq!(
+            response.headers()[header::VARY],
+            "Authorization, X-Godovoy-Delta, If-None-Match"
+        );
         assert!(
             response.headers()[header::CACHE_CONTROL]
                 .to_str()
@@ -468,12 +594,26 @@ mod conditional_tests {
                     today,
                     lock.open_data().unwrap(),
                     conditions,
+                    true,
                 )
                 .unwrap()
         };
         let before = NaiveDate::from_ymd_opt(2027, 12, 31).unwrap();
         let (old_tag, old) = snapshot(render(before, &[])).await;
         assert_eq!(old["tasks"], json!([]));
+        // A genuine one-file transition is known, but the client's base did
+        // not cover the new local date. The task entering its window needs a full response.
+        let path = f._tmp.path().join("host/online-calendar-v1.json");
+        let mut raw = std::fs::read(&path).unwrap();
+        let before_raw = conditional::InputHasher::digest(&raw).into();
+        raw.push(b' ');
+        std::fs::write(&path, &raw).unwrap();
+        let event = *lock.data().unwrap().calendar.plans.keys().next().unwrap();
+        views.transition(Some(conditional::EventTransition {
+            before: before_raw,
+            after: conditional::InputHasher::digest(&raw).into(),
+            event,
+        }));
         let condition = [HeaderValue::from_str(&old_tag).unwrap()];
         let (new_tag, new) = snapshot(render(before.succ_opt().unwrap(), &condition)).await;
         assert_ne!(new_tag, old_tag);

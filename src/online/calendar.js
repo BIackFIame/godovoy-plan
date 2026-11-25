@@ -125,7 +125,10 @@
                 headers["X-Godovoy-Base"] = receipt.tag;
                 headers["X-Godovoy-Year"] = String(receipt.year);
             }
-            if (validator) headers["If-None-Match"] = validator;
+            if (validator) {
+                headers["If-None-Match"] = validator;
+                headers["X-Godovoy-Delta"] = "event-v1";
+            }
             const response = await fetch(path, {
                 method: body === undefined ? "GET" : "POST",
                 body: body === undefined ? undefined : JSON.stringify(body),
@@ -193,6 +196,10 @@
             standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
             lastVerified = performance.now();
             if (hasReceipt) return {value: result, tag: response.headers.get("x-godovoy-state-tag")};
+            const base = response.headers.get("x-godovoy-delta-base");
+            if (data && base !== null) {
+                return {value: result, base, tag: response.headers.get("x-godovoy-state-tag")};
+            }
             return data ? {value: result, tag, unchanged} : null;
         } catch (error) {
             if (!(error instanceof Problem) && epoch === generation) {
@@ -207,14 +214,25 @@
 
     async function load(year = currentYear) {
         const sequence = ++requestNumber;
-        const response = await api("/v1/state?year=" + year, {data: true, validator: year === currentYear ? stateTag : null});
+        const prior = state;
+        const validator = year === currentYear ? stateTag : null;
+        const path = "/v1/state?year=" + year;
+        let response = await api(path, {data: true, validator});
         if (sequence !== requestNumber) throw new Problem();
+        if (response.base !== undefined) {
+            if (prior && state === prior && stateTag === validator && currentYear === year &&
+                response.base === validator && response.tag !== validator &&
+                (response.value?.events?.length || response.value?.tasks?.length) &&
+                applyReceipt(response, response.value?.id, year)) return;
+            response = await api(path, {data: true});
+            if (sequence !== requestNumber) throw new Problem();
+        }
         if (response.unchanged) {
             lastLoaded = performance.now();
             return;
         }
         const next = response.value;
-        if (!next || next.year !== year || !Array.isArray(next.events) || !Array.isArray(next.employees) || !Array.isArray(next.tasks)) {
+        if (response.base !== undefined || !next || next.year !== year || !Array.isArray(next.events) || !Array.isArray(next.employees) || !Array.isArray(next.tasks)) {
             clearWorkspace("Компьютер компании вернул несовместимую версию календаря.");
             throw new Problem();
         }
@@ -566,21 +584,44 @@
 
     function applyReceipt(reply, id, year) {
         const receipt = reply?.value;
-        if (!receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
-        function replaceRows(previous, changes) {
+        const uuid = value => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
+        const date = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+        const count = value => Number.isSafeInteger(value) && value >= 0;
+        function validEvent(event) {
+            if (event?.id !== id || !Number.isInteger(event.year) || event.year < 1900 || event.year > 9999 ||
+                typeof event.title !== "string" || typeof event.note !== "string" || typeof event.description !== "string" ||
+                !Object.hasOwn(categories, event.category) || !date(event.date) || !date(event.preparationDate) ||
+                !count(event.preparationDays) || typeof event.yearly !== "boolean" ||
+                !(event.ownerId === null || uuid(event.ownerId)) || typeof event.revision !== "string" ||
+                !/^\d+:[a-f0-9-]{36}$/.test(event.revision) || !Array.isArray(event.checklist) ||
+                (state.assignedOnly && event.ownerId !== state.employeeId) ||
+                (state.allowFreeText === false && (event.note !== "" || event.description !== ""))) return false;
+            const ids = new Set();
+            for (const task of event.checklist) {
+                if (!uuid(task?.id) || ids.has(task.id) || typeof task.title !== "string" ||
+                    typeof task.done !== "boolean" || !count(task.daysBefore) || !date(task.dueDate)) return false;
+                ids.add(task.id);
+            }
+            return true;
+        }
+        if (!uuid(id) || !receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
+        function replaceRows(previous, changes, annual) {
             if (!Array.isArray(changes)) return null;
+            if (annual && changes.length > 1) return null;
+            const years = new Set();
             const rows = previous.filter(event => event.id !== id);
             let lastIndex = -1;
             for (const change of changes) {
                 if (!Number.isInteger(change?.index) || change.index <= lastIndex || change.index > rows.length ||
-                    change.event?.id !== id || !Number.isInteger(change.event.year) || !Array.isArray(change.event.checklist)) return null;
+                    !validEvent(change.event) || (annual && change.event.year !== year) || years.has(change.event.year)) return null;
+                years.add(change.event.year);
                 rows.splice(change.index, 0, change.event);
                 lastIndex = change.index;
             }
             return rows;
         }
-        const events = replaceRows(state.events, receipt.events);
-        const tasks = replaceRows(state.tasks, receipt.tasks);
+        const events = replaceRows(state.events, receipt.events, true);
+        const tasks = replaceRows(state.tasks, receipt.tasks, false);
         if (!events || !tasks) return false;
         const previous = visibleEvents();
         state = {...state, events, tasks};

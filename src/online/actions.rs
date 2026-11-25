@@ -97,6 +97,8 @@ struct Employee<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct ViewContext<'a> {
+    #[serde(skip)]
+    pub(crate) policy_revision: u64,
     workspace_name: &'a str,
     employee_id: Id,
     employees: Vec<Employee<'a>>,
@@ -134,6 +136,12 @@ pub(crate) struct ChangedEvent<'v, 'a> {
     tasks: Vec<ChangedRow<'v, 'a>>,
 }
 
+impl ChangedEvent<'_, '_> {
+    pub(crate) fn has_visible_rows(&self) -> bool {
+        !self.events.is_empty() || !self.tasks.is_empty()
+    }
+}
+
 impl<'a> CalendarView<'a> {
     pub(crate) fn changed_event(&self, id: Id) -> ChangedEvent<'_, 'a> {
         fn rows<'v, 'a>(events: &'v [EventView<'a>], id: Id) -> Vec<ChangedRow<'v, 'a>> {
@@ -168,6 +176,7 @@ impl<'a> ViewContext<'a> {
             .map(|(&id, name)| Employee { id, name })
             .collect();
         Self {
+            policy_revision: acl.protection().revision,
             workspace_name: &acl.name,
             employee_id: employee,
             employees,

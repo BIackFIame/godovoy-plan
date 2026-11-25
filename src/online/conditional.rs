@@ -39,12 +39,32 @@ struct DecodedSource {
     public_rows: Option<PublicRows>,
 }
 
+impl DecodedSource {
+    fn load(slot: &mut Option<Self>, bytes: Vec<u8>) -> Fallible<&mut Self> {
+        // Every caller holds the vault lock. Compare its current full source exactly;
+        // the returned validator and personalized fields are always computed for this credential.
+        if slot.as_ref().is_some_and(|source| source.bytes == bytes) {
+            // Release the duplicate source before allocating the response and event rows.
+            drop(bytes);
+        } else {
+            *slot = None;
+            let calendar = serde_json::from_slice(&bytes)?;
+            *slot = Some(DecodedSource {
+                bytes,
+                calendar,
+                public_rows: None,
+            });
+        }
+        slot.as_mut().ok_or_else(|| "Не удалось прочитать календарь.".into())
+    }
+}
+
 type InputDigest = [u8; 32];
 // Apple Silicon provides SHA-256 instructions on every supported device.
 #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-type InputHasher = sha2::Sha256;
+pub(super) type InputHasher = sha2::Sha256;
 #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-type InputHasher = Blake2b<U32>;
+pub(super) type InputHasher = Blake2b<U32>;
 
 #[derive(Copy, Clone, Eq, PartialEq)]
 struct ReadHint {
@@ -66,7 +86,15 @@ struct Entry {
     hint: Option<ReadHint>,
 }
 
+#[derive(Clone, Copy)]
+pub(super) struct EventTransition {
+    pub before: InputDigest,
+    pub after: InputDigest,
+    pub event: Id,
+}
+
 pub(super) struct Views {
+    transition: Mutex<Option<EventTransition>>,
     nonce: Id,
     source: Mutex<Option<DecodedSource>>,
     entries: Mutex<VecDeque<Entry>>,
@@ -75,6 +103,7 @@ pub(super) struct Views {
 impl Default for Views {
     fn default() -> Self {
         Self {
+            transition: Mutex::default(),
             nonce: Id::new_v4(),
             source: Mutex::default(),
             entries: Mutex::new(VecDeque::new()),
@@ -83,15 +112,14 @@ impl Default for Views {
 }
 
 impl Views {
-    pub(super) fn input(
-        credential: Id,
-        context: &ViewContext<'_>,
-        today: NaiveDate,
-        data: &[u8],
-    ) -> Fallible<InputDigest> {
-        let mut source = Self::input_hasher(credential, context, today)?;
-        source.update(data);
-        Ok(source.finalize().into())
+    pub(super) fn transition(&self, change: Option<EventTransition>) {
+        if let Ok(mut slot) = self.transition.lock() {
+            *slot = change;
+        }
+    }
+
+    pub(super) fn source_key(context: &InputHasher, raw: InputDigest) -> InputDigest {
+        context.clone().chain_update(raw).finalize().into()
     }
 
     pub(super) fn input_hasher(
@@ -102,6 +130,7 @@ impl Views {
         let mut source = InputHasher::new();
         source.update(credential.as_bytes());
         source.update(today.num_days_from_ce().to_be_bytes());
+        source.update(context.policy_revision.to_be_bytes());
         serde_json::to_writer(&mut source, context)?;
         Ok(source)
     }
@@ -232,21 +261,7 @@ impl Views {
     ) -> Fallible<Vec<u8>> {
         let mut body = Vec::with_capacity(expected_len.unwrap_or(0));
         let mut entry = self.source.lock().map_err(|_| "Ошибка чтения календаря.")?;
-        // Every caller holds the vault lock. Compare its current full source exactly;
-        // the returned validator and personalized fields are always computed for this credential.
-        if entry.as_ref().is_some_and(|source| source.bytes == bytes) {
-            // Release the duplicate source before allocating the response and event rows.
-            drop(bytes);
-        } else {
-            *entry = None;
-            let calendar = serde_json::from_slice(&bytes)?;
-            *entry = Some(DecodedSource {
-                bytes,
-                calendar,
-                public_rows: None,
-            });
-        }
-        let source = entry.as_mut().ok_or("Не удалось прочитать календарь.")?;
+        let source = DecodedSource::load(&mut entry, bytes)?;
         // A restricted request always follows its normal row filter. A second unrestricted
         // read of the same year and text policy may reuse the shared event array.
         let public_key = context.public_rows_key();
@@ -285,6 +300,7 @@ impl Views {
         today: NaiveDate,
         mut file: CalendarFile<'_>,
         condition: &[HeaderValue],
+        accept_delta: bool,
     ) -> Fallible<Response> {
         // This internal fingerprint may change when another employee edits a private
         // event. Only the digest of the caller's rendered representation leaves the host.
@@ -295,6 +311,7 @@ impl Views {
         });
         // A matching hint only chooses streaming. Every 304 still verifies the full
         // file, current credential, permissions, local date and rendered-view tag.
+        let scope = Self::input_hasher(credential, &context, today)?;
         if let ([condition], Some(hint)) = (condition, hint) {
             let candidate = self
                 .entries
@@ -304,18 +321,18 @@ impl Views {
                 .rev()
                 .find(|entry| entry.hint == Some(hint) && entry.view.tag == condition)
                 .map(|entry| entry.digest);
-            if let Some(expected) = candidate {
-                let source = Self::input_hasher(credential, &context, today)?;
-                if file.fingerprint(source)? == expected {
-                    return Ok(tagged(
-                        StatusCode::NOT_MODIFIED.into_response(),
-                        condition.clone(),
-                    ));
-                }
+            if let Some(expected) = candidate
+                && Self::source_key(&scope, file.fingerprint(InputHasher::new())?) == expected
+            {
+                return Ok(tagged(
+                    StatusCode::NOT_MODIFIED.into_response(),
+                    condition.clone(),
+                ));
             }
         }
         let data = file.into_bytes()?;
-        let key = Self::input(credential, &context, today, &data)?;
+        let raw = InputHasher::digest(&data).into();
+        let key = Self::source_key(&scope, raw);
         let known = self.lookup_and_refresh(&key, hint)?;
         if let Some(view) = &known
             && matches_tag(condition, &view.tag)
@@ -324,6 +341,54 @@ impl Views {
                 StatusCode::NOT_MODIFIED.into_response(),
                 view.tag.clone(),
             ));
+        }
+        if accept_delta && let [base] = condition {
+            let transition = self.transition.lock().ok().and_then(|last| *last);
+            if let Some(change) = transition
+                && change.after == raw
+                && let Some(previous) = self.lookup(&Self::source_key(&scope, change.before))?
+                && previous == *base
+            {
+                let mut cached;
+                let local;
+                let calendar = if (MIN_SHARED_SOURCE..=MAX_SHARED_SOURCE).contains(&data.len()) {
+                    cached = self.source.lock().map_err(|_| "Ошибка чтения календаря.")?;
+                    &DecodedSource::load(&mut cached, data)?.calendar
+                } else {
+                    *self.source.lock().map_err(|_| "Ошибка чтения календаря.")? = None;
+                    local = serde_json::from_slice(&data)?;
+                    drop(data);
+                    &local
+                };
+                let view = context.render(calendar, today);
+                let tag = match &known {
+                    Some(view) => view.tag.clone(),
+                    None => self.view_tag(credential, &view)?,
+                };
+                self.remember(key, tag.clone())?;
+                if tag == previous {
+                    return Ok(tagged(StatusCode::NOT_MODIFIED.into_response(), tag));
+                }
+                let receipt = view.changed_event(change.event);
+                if receipt.has_visible_rows() {
+                    let mut response = axum::Json(receipt).into_response();
+                    response
+                        .headers_mut()
+                        .insert("x-godovoy-delta-base", previous);
+                    response.headers_mut().insert("x-godovoy-state-tag", tag);
+                    response
+                        .headers_mut()
+                        .insert(header::VARY, HeaderValue::from_static(VARY));
+                    return Ok(response);
+                }
+                // Absence is ambiguous for an adjacent-year task. Send this
+                // employee's complete representation without naming a hidden event.
+                let body = serde_json::to_vec(&view)?;
+                return Ok(tagged(
+                    ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
+                    tag,
+                ));
+            }
         }
         let expected_len = known.as_ref().and_then(|view| view.body_len);
         // Keep the parsed document and rows alive through validator generation on a
@@ -375,11 +440,13 @@ impl Views {
     }
 }
 
+const VARY: &str = "Authorization, X-Godovoy-Delta, If-None-Match";
+
 fn tagged(mut response: Response, tag: HeaderValue) -> Response {
     response.headers_mut().insert(header::ETAG, tag);
     response
         .headers_mut()
-        .insert(header::VARY, HeaderValue::from_static("Authorization"));
+        .insert(header::VARY, HeaderValue::from_static(VARY));
     response
 }
 
@@ -536,7 +603,7 @@ mod tests {
             let expected = serde_json::to_vec(&ctx().render(&data, date)).unwrap();
             std::fs::write(path.join("online-calendar-v1.json"), bytes).unwrap();
             let response = views
-                .response(employee, ctx(), date, lock.open_data().unwrap(), &[])
+                .response(employee, ctx(), date, lock.open_data().unwrap(), &[], false)
                 .unwrap();
             let actual = runtime
                 .block_on(axum::body::to_bytes(
