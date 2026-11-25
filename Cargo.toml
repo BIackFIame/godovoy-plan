@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.5.48"
+version = "0.5.49"
 edition = "2024"
 default-run = "godovoy-plan"
 rust-version = "1.94"

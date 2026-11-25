@@ -269,6 +269,34 @@ impl OnlineVault {
         })
     }
 }
+// Atomically reject symlinks/reparse points and special files when opening a payload.
+fn open_regular(path: &Path) -> Fallible<(File, fs::Metadata)> {
+    let mut opts = OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        opts.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
+    }
+    let file = opts.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err("Ожидался обычный файл хранилища.".into());
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if metadata.file_attributes() & 0x400 != 0 {
+            return Err("Файл содержит точку повторной обработки.".into());
+        }
+    }
+    Ok((file, metadata))
+}
 fn sync_directory(directory: &Path) -> Fallible<()> {
     #[cfg(unix)]
     File::open(directory)?.sync_all()?;
@@ -277,13 +305,17 @@ fn sync_directory(directory: &Path) -> Fallible<()> {
     Ok(())
 }
 impl LockedVault<'_> {
-    fn read<T: DeserializeOwned>(&self, name: &str, limit: usize) -> Fallible<T> {
+    fn open_bounded(&self, name: &str, limit: usize) -> Fallible<(File, usize)> {
         let path = self.directory.join(name);
-        check_profile_file(&path)?;
-        let file = File::open(path)?;
-        if file.metadata()?.len() > limit as u64 {
+        let (file, metadata) = open_regular(&path)?;
+        let size = metadata.len();
+        if size > limit as u64 {
             return Err("Хранилище превышает допустимый размер.".into());
         }
+        Ok((file, size as usize))
+    }
+    fn read<T: DeserializeOwned>(&self, name: &str, limit: usize) -> Fallible<T> {
+        let (file, _) = self.open_bounded(name, limit)?;
         Ok(serde_json::from_reader(std::io::BufReader::new(
             file.take(limit as u64 + 1),
         ))?)
@@ -340,6 +372,16 @@ impl LockedVault<'_> {
     }
     pub fn data(&self) -> Fallible<Data> {
         self.read(DATA, DATA_LIMIT)
+    }
+    /// Read the exact bytes used for both the conditional view fingerprint and decoding.
+    pub fn data_bytes(&self) -> Fallible<Vec<u8>> {
+        let (file, size) = self.open_bounded(DATA, DATA_LIMIT)?;
+        let mut bytes = Vec::with_capacity(size);
+        file.take(DATA_LIMIT as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() > DATA_LIMIT {
+            return Err("Хранилище превышает допустимый размер.".into());
+        }
+        Ok(bytes)
     }
     pub fn save_data(&self, data: &Data) -> Fallible<()> {
         data.calendar.validate()?;

@@ -1,4 +1,4 @@
-use chrono::{Datelike, Local, NaiveDate};
+use chrono::{Datelike, NaiveDate};
 use godovoy_plan::{
     model::{Category, Event, Id, Occurrence, Record, Revision, Task, YearChange},
     planning::personal_events,
@@ -85,7 +85,7 @@ struct Employee<'a> {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-pub(crate) struct CalendarView<'a> {
+pub(crate) struct ViewContext<'a> {
     workspace_name: &'a str,
     employee_id: Id,
     employees: Vec<Employee<'a>>,
@@ -93,50 +93,57 @@ pub(crate) struct CalendarView<'a> {
     allow_free_text: bool,
     assigned_only: bool,
     year: i32,
+}
+
+#[derive(Serialize)]
+pub(crate) struct CalendarView<'a> {
+    #[serde(flatten)]
+    context: ViewContext<'a>,
     events: Vec<EventView<'a>>,
     tasks: Vec<EventView<'a>>,
 }
 
-pub fn state<'a>(
-    data: &'a Data,
-    acl: &'a Access,
-    year: i32,
-    employee: Id,
-    can_edit: bool,
-) -> CalendarView<'a> {
-    let allow_free_text = acl.protection().settings.free_text_allowed();
-    let assigned_only = acl.assigned_only.contains(&employee);
-    let active = acl
-        .grants
-        .values()
-        .map(|g| g.employee)
-        .collect::<BTreeSet<_>>();
-    let employees = acl
-        .employees
-        .iter()
-        .filter(|(id, _)| active.contains(id) && (!assigned_only || **id == employee))
-        .map(|(&id, name)| Employee { id, name })
-        .collect();
-    let visible = |e| occurrence(data, e, allow_free_text);
-    let mut events: Vec<_> = data
-        .calendar
-        .occurrences(year)
-        .filter(|e| !assigned_only || assigned_to(data, *e, employee))
-        .collect();
-    events.sort_unstable_by_key(|e| (e.date, e.id));
-    CalendarView {
-        workspace_name: &acl.name,
-        employee_id: employee,
-        employees,
-        can_edit,
-        allow_free_text,
-        assigned_only,
-        year,
-        events: events.into_iter().map(visible).collect(),
-        tasks: personal_events(&data.calendar, Local::now().date_naive(), employee)
-            .into_iter()
-            .map(visible)
-            .collect(),
+impl<'a> ViewContext<'a> {
+    pub(crate) fn new(acl: &'a Access, year: i32, employee: Id, can_edit: bool) -> Self {
+        let assigned_only = acl.assigned_only.contains(&employee);
+        let active = acl
+            .grants
+            .values()
+            .map(|g| g.employee)
+            .collect::<BTreeSet<_>>();
+        let employees = acl
+            .employees
+            .iter()
+            .filter(|(id, _)| active.contains(id) && (!assigned_only || **id == employee))
+            .map(|(&id, name)| Employee { id, name })
+            .collect();
+        Self {
+            workspace_name: &acl.name,
+            employee_id: employee,
+            employees,
+            can_edit,
+            allow_free_text: acl.protection().settings.free_text_allowed(),
+            assigned_only,
+            year,
+        }
+    }
+
+    pub(crate) fn render(self, data: &'a Data, today: NaiveDate) -> CalendarView<'a> {
+        let visible = |e| occurrence(data, e, self.allow_free_text);
+        let mut events: Vec<_> = data
+            .calendar
+            .occurrences(self.year)
+            .filter(|e| !self.assigned_only || assigned_to(data, *e, self.employee_id))
+            .collect();
+        events.sort_unstable_by_key(|e| (e.date, e.id));
+        CalendarView {
+            events: events.into_iter().map(visible).collect(),
+            tasks: personal_events(&data.calendar, today, self.employee_id)
+                .into_iter()
+                .map(visible)
+                .collect(),
+            context: self,
+        }
     }
 }
 

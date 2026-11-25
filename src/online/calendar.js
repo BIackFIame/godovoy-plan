@@ -27,6 +27,7 @@
     let mode = "all";
     let limit = 80;
     let state = null;
+    let stateTag = null;
     let writing = false;
     let loginPending = false;
     let secure = false;
@@ -82,6 +83,7 @@
         lastVerified = 0;
         lastLoaded = 0;
         state = null;
+        stateTag = null;
         standbyNotice("");
         el("workspace").hidden = true;
         closeSheet();
@@ -103,7 +105,7 @@
     }
 
     class Problem extends Error {}
-    async function api(path, {body, data = false} = {}) {
+    async function api(path, {body, data = false, validator = null} = {}) {
         const epoch = generation;
         if (!credential || document.hidden) throw new Problem();
         const controller = new AbortController();
@@ -112,6 +114,7 @@
         try {
             const headers = {Authorization: "Bearer " + credential};
             if (body !== undefined) headers["Content-Type"] = "application/json";
+            if (validator) headers["If-None-Match"] = validator;
             const response = await fetch(path, {
                 method: body === undefined ? "GET" : "POST",
                 body: body === undefined ? undefined : JSON.stringify(body),
@@ -122,9 +125,17 @@
             const restriction = response.headers.get("x-godovoy-access");
             const textPolicy = response.headers.get("x-godovoy-allow-free-text");
             const scope = response.headers.get("x-godovoy-assigned-only");
-            const scopeChanged = response.ok && state && (scope === "true" || scope === "false") &&
+            const tag = response.headers.get("etag");
+            const unchanged = response.status === 304;
+            // Proxies may weaken the ETag on a compressed response.
+            if (unchanged && (!data || !validator || tag?.replace(/^W\//, "") !== validator.replace(/^W\//, "") ||
+                (scope !== "true" && scope !== "false") || (textPolicy !== "true" && textPolicy !== "false"))) {
+                throw new Error("Unexpected conditional calendar response");
+            }
+            const authorized = response.ok || unchanged;
+            const scopeChanged = authorized && state && (scope === "true" || scope === "false") &&
                 (state.assignedOnly === true) !== (scope === "true");
-            const textChanged = response.ok && state && (textPolicy === "true" || textPolicy === "false") &&
+            const textChanged = authorized && state && (textPolicy === "true" || textPolicy === "false") &&
                 (state.allowFreeText !== false) !== (textPolicy === "true");
             if (scopeChanged || textChanged || (response.status === 403 &&
                 (restriction === "free-text-disabled" || restriction === "assigned-only"))) {
@@ -153,22 +164,22 @@
                 clearWorkspace(writing ? prompts.uncertain : "Календарь временно недоступен. Дождитесь возврата основного сервера и войдите снова.");
                 throw new Problem();
             }
-            if (!response.ok) {
+            if (!authorized) {
                 if (response.status >= 500 || body === undefined) throw new Error("Connection unavailable");
                 const problem = await response.json();
                 if (epoch !== generation || document.hidden) throw new Problem();
                 throw new Problem(typeof problem.error === "string" ? problem.error : "Компьютер компании отклонил изменение.");
             }
-            if (data ? response.status !== 200 || !/^application\/json(?:;|$)/i.test(response.headers.get("Content-Type") || "")
+            if (data ? !unchanged && (response.status !== 200 || !/^application\/json(?:;|$)/i.test(response.headers.get("Content-Type") || ""))
                      : response.status !== 204) {
                 throw new Error("Unexpected response from calendar host");
             }
-            const result = data ? await response.json() : null;
+            const result = data && !unchanged ? await response.json() : null;
             if (epoch !== generation || document.hidden) throw new Problem();
             const until = response.headers.get("x-godovoy-standby-until") || "";
             standbyNotice(/^\d{1,11}$/.test(until) ? until : "");
             lastVerified = performance.now();
-            return result;
+            return data ? {value: result, tag, unchanged} : null;
         } catch (error) {
             if (!(error instanceof Problem) && epoch === generation) {
                 clearWorkspace(writing ? prompts.uncertain : prompts.disconnected);
@@ -182,13 +193,19 @@
 
     async function load(year = currentYear) {
         const sequence = ++requestNumber;
-        const next = await api("/v1/state?year=" + year, {data: true});
+        const response = await api("/v1/state?year=" + year, {data: true, validator: year === currentYear ? stateTag : null});
         if (sequence !== requestNumber) throw new Problem();
-        if (!Array.isArray(next.events) || !Array.isArray(next.employees) || !Array.isArray(next.tasks)) {
+        if (response.unchanged) {
+            lastLoaded = performance.now();
+            return;
+        }
+        const next = response.value;
+        if (!next || next.year !== year || !Array.isArray(next.events) || !Array.isArray(next.employees) || !Array.isArray(next.tasks)) {
             clearWorkspace("Компьютер компании вернул несовместимую версию календаря.");
             throw new Problem();
         }
         state = next;
+        stateTag = /^(?:W\/)?"[!#-~]{1,128}"$/.test(response.tag || "") ? response.tag : null;
         currentYear = year;
         lastLoaded = performance.now();
         el("gate").hidden = true;
@@ -518,8 +535,11 @@
         const epoch = generation;
         heartbeatRunning = true;
         try {
-            await api("/v1/session");
-            if (performance.now() - lastLoaded > 60000 && !el("sheet").open && !writing) await load();
+            if (performance.now() - lastLoaded > 60000 && !el("sheet").open && !writing) {
+                await load();
+            } else {
+                await api("/v1/session");
+            }
         } catch { /* api applies the lock policy. */ }
         finally { if (generation === epoch) heartbeatRunning = false; }
     }, 3000);

@@ -1,5 +1,7 @@
 #[path = "admission.rs"]
 mod admission;
+#[path = "conditional.rs"]
+mod conditional;
 #[path = "mcp.rs"]
 mod mcp;
 #[path = "standby.rs"]
@@ -52,6 +54,7 @@ pub struct Host {
     operations: Arc<Semaphore>,
     discovery: Arc<Mutex<Discovery>>,
     new_checks: Arc<Semaphore>,
+    views: Arc<conditional::Views>,
 }
 impl Host {
     pub fn new(vault: OnlineVault, origin: &str, entry: Option<EntryPoint>) -> Fallible<Self> {
@@ -90,6 +93,7 @@ impl Host {
             operations: Arc::new(Semaphore::new(16)),
             discovery: Arc::new(Mutex::new(Discovery::new(Instant::now()))),
             new_checks: Arc::new(Semaphore::new(4)),
+            views: Default::default(),
         })
     }
     fn enable_standby(&mut self) -> Fallible<()> {
@@ -319,7 +323,9 @@ where
         }
         drop(new_check);
         let mut response = action(&lock, &acl, id, employee, !read_only, &host.mode);
-        if response.status().is_success() {
+        let verified =
+            response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED;
+        if verified {
             let scope = if acl.assigned_only.contains(&employee) {
                 "true"
             } else {
@@ -338,9 +344,7 @@ where
                 HeaderValue::from_static(enabled),
             );
         }
-        if response.status().is_success()
-            && let Some(deadline) = deadline
-        {
+        if verified && let Some(deadline) = deadline {
             response
                 .headers_mut()
                 .insert("x-godovoy-standby-until", HeaderValue::from(deadline));
@@ -363,27 +367,36 @@ async fn state(
     if !(1900..=9999).contains(&query.year) {
         return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
     }
+    let views = host.views.clone();
+    let condition: Vec<_> = headers
+        .get_all(header::IF_NONE_MATCH)
+        .iter()
+        .cloned()
+        .collect();
     with_auth(
         host,
         headers,
         GrantPurpose::Employee,
         false,
-        move |lock, acl, id, employee, edit, mode| match lock.data() {
-            Ok(data) => {
-                if lock
-                    .audit_security("state_requested", Some(id), Some(employee), None)
-                    .is_err()
-                {
-                    return unavailable();
-                }
-                let response =
-                    Json(actions::state(&data, acl, query.year, employee, edit)).into_response();
-                if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
-                    return standby_unavailable();
-                }
-                response
+        move |lock, acl, id, employee, edit, mode| {
+            let context = actions::ViewContext::new(acl, query.year, employee, edit);
+            let Ok(data) = lock.data_bytes() else {
+                return unavailable();
+            };
+            let today = chrono::Local::now().date_naive();
+            let Ok(response) = views.response(id, context, today, data, &condition) else {
+                return unavailable();
+            };
+            if lock
+                .audit_security("state_requested", Some(id), Some(employee), None)
+                .is_err()
+            {
+                return unavailable();
             }
-            Err(_) => unavailable(),
+            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                return standby_unavailable();
+            }
+            response
         },
     )
     .await
@@ -598,6 +611,8 @@ mod tests {
     use serde_json::{Value, json};
     use tempfile::TempDir;
     use tower::ServiceExt;
+
+    include!("conditional_tests.rs");
 
     struct Fixture {
         _tmp: TempDir,

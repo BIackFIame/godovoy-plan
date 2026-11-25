@@ -40,38 +40,15 @@ struct Manifest {
 }
 
 pub(super) fn private_file(path: &Path) -> Fallible<File> {
-    let mut opts = OpenOptions::new();
-    opts.read(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        opts.custom_flags(0x00200000); // FILE_FLAG_OPEN_REPARSE_POINT
-    }
-    let file = opts.open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.is_file() {
-        return Err("Ожидался обычный файл хранилища.".into());
-    }
+    let (file, _metadata) = super::open_regular(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if metadata.nlink() != 1
-            || metadata.mode() & 0o077 != 0
-            || metadata.uid() != rustix::process::geteuid().as_raw()
+        if _metadata.nlink() != 1
+            || _metadata.mode() & 0o077 != 0
+            || _metadata.uid() != rustix::process::geteuid().as_raw()
         {
             return Err("Файл должен быть закрытым, принадлежать текущему пользователю и не иметь других ссылок.".into());
-        }
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::MetadataExt;
-        if metadata.file_attributes() & 0x400 != 0 {
-            return Err("Копия содержит точку повторной обработки.".into());
         }
     }
     Ok(file)
