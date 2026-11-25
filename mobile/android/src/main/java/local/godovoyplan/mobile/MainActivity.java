@@ -19,6 +19,10 @@ import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 import android.text.InputType;
+import android.text.SpannableString;
+import android.text.Spanned;
+import android.text.style.ForegroundColorSpan;
+import android.text.style.RelativeSizeSpan;
 import android.view.Gravity;
 import android.view.View;
 import android.view.ViewGroup;
@@ -40,6 +44,8 @@ public final class MainActivity extends Activity {
                           CAT_NAMES = {"Акции", "Партнёры", "Команда", "Операции"};
     private static final DateTimeFormatter DISPLAY =
             DateTimeFormatter.ofPattern("d MMMM yyyy", new Locale("ru"));
+    private static final DateTimeFormatter SHORT_DEADLINE =
+            DateTimeFormatter.ofPattern("d MMMM", DISPLAY.getLocale());
     private final Handler clock = new Handler(Looper.getMainLooper());
     private CalendarApplication app;
     private LinearLayout root, body;
@@ -807,6 +813,45 @@ public final class MainActivity extends Activity {
         body.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
         list.setSelectionFromTop(firstVisible, topOffset);
     }
+    private CheckBox checklistItem(JSONObject task, LocalDate today) {
+        String title = str(task, "title");
+        String date = str(task, "dueDate");
+        boolean done = task.optBoolean("done");
+        boolean urgent = false;
+        int color = MUTED;
+        String deadline = "Срок · " + date;
+        try {
+            LocalDate due = LocalDate.parse(date);
+            String when = due.format(due.getYear() == today.getYear() ? SHORT_DEADLINE : DISPLAY);
+            if (!done && due.isBefore(today)) {
+                deadline = "Просрочено · " + when;
+                urgent = true;
+                color = 0xffa03327;
+            } else if (!done && due.equals(today)) {
+                deadline = "Сегодня · " + when;
+                urgent = true;
+                color = 0xff885000;
+            } else {
+                deadline = done ? "Срок · " + when : "До " + when;
+            }
+        } catch (java.time.format.DateTimeParseException ignored) {
+            // Keep the supplied deadline visible if a newer core uses an unfamiliar date.
+        }
+        // Keep the whole deadline together when it wraps at a large font scale.
+        String dateLabel = deadline.replace(' ', '\u00a0');
+        SpannableString label = new SpannableString(title + (urgent ? "\n" : "\u2002") + dateLabel);
+        int start = title.length() + 1;
+        label.setSpan(new RelativeSizeSpan(0.87f), start, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        label.setSpan(new ForegroundColorSpan(color), start, label.length(), Spanned.SPAN_EXCLUSIVE_EXCLUSIVE);
+        CheckBox check = new CheckBox(this);
+        check.setTextColor(done ? MUTED : INK);
+        check.setText(label);
+        check.setContentDescription(title + ". " + deadline);
+        check.setChecked(done);
+        check.setMinHeight(dp(48));
+        return check;
+    }
+
     private void detail(JSONObject e) {
         LinearLayout form = scroller();
         ScrollView scroll = (ScrollView) form.getParent();
@@ -828,11 +873,9 @@ public final class MainActivity extends Activity {
         List<JSONObject> tasks = items(array(e, "checklist"));
         if (!tasks.isEmpty()) {
             label(form, "Чек-лист", 19);
+            LocalDate today = LocalDate.now();
             for (JSONObject task : tasks) {
-                CheckBox check = new CheckBox(this);
-                check.setText(str(task, "title") + "  ·  " + pretty(str(task, "dueDate")));
-                check.setChecked(task.optBoolean("done"));
-                check.setMinHeight(dp(48));
+                CheckBox check = checklistItem(task, today);
                 form.addView(check);
                 if (!taskToReveal.isEmpty() && taskToReveal.equals(str(task, "id"))) target = check;
                 check.setOnClickListener(v -> {
