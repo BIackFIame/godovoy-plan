@@ -28,6 +28,11 @@ struct PublicRows {
     json: Option<Box<RawValue>>,
 }
 
+pub(super) struct OriginalSource {
+    bytes: Vec<u8>,
+    public_rows: Option<PublicRows>,
+}
+
 struct DecodedSource {
     bytes: Vec<u8>,
     calendar: Data,
@@ -182,6 +187,40 @@ impl Views {
             writer.flush()?;
         }
         Self::tag(digest)
+    }
+
+    pub(super) fn data_for_write(
+        &self,
+        bytes: &[u8],
+    ) -> serde_json::Result<(Data, Option<OriginalSource>)> {
+        // The vault lock stays held throughout this command. Current file bytes,
+        // not metadata or an ETag, decide if an owned document can be reused.
+        let prior = self.source.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(source) = prior
+            && source.bytes == bytes
+        {
+            let original = OriginalSource {
+                bytes: source.bytes,
+                public_rows: source.public_rows,
+            };
+            return Ok((source.calendar, Some(original)));
+        }
+        serde_json::from_slice(bytes).map(|data| (data, None))
+    }
+
+    pub(super) fn restore_after_failure(&self, original: Option<OriginalSource>) {
+        // A rejected command can already have changed its in-memory Data.
+        // Only the original, verified source can repopulate the read cache.
+        if let Some(OriginalSource { bytes, public_rows }) = original
+            && let Ok(calendar) = serde_json::from_slice(&bytes)
+            && let Ok(mut slot) = self.source.lock()
+        {
+            *slot = Some(DecodedSource {
+                bytes,
+                calendar,
+                public_rows,
+            });
+        }
     }
 
     fn encode_shared_body(
@@ -415,6 +454,51 @@ mod tests {
         views.remember([255; 32], tag).unwrap();
         assert!(views.lookup(&digest).unwrap().is_none());
     }
+    #[test]
+    fn commands_consume_only_the_matching_decoded_source() {
+        let employee = Id::new_v4();
+        let document = |name| {
+            serde_json::to_vec(&serde_json::json!({
+                "calendar":{"members":{employee.to_string():{
+                    "revision":{"sequence":1,"device":employee},"value":name
+                }},"plans":{}},
+                "audit":[]
+            }))
+            .unwrap()
+        };
+        let initial = document("Anna");
+        let changed = document("Olga");
+        assert_eq!(initial.len(), changed.len());
+        let views = Views::default();
+        let warm = || {
+            *views.source.lock().unwrap() = Some(DecodedSource {
+                calendar: serde_json::from_slice(&initial).unwrap(),
+                bytes: initial.clone(),
+                public_rows: None,
+            });
+        };
+        for (bytes, name) in [(&initial, "Anna"), (&changed, "Olga")] {
+            warm();
+            let (mut data, original) = views.data_for_write(bytes).unwrap();
+            assert_eq!(data.calendar.members[&employee].value, name);
+            assert!(views.source.lock().unwrap().is_none());
+            data.calendar.members.get_mut(&employee).unwrap().value = "Unsaved".into();
+            views.restore_after_failure(original);
+            let cache = views.source.lock().unwrap();
+            if bytes == &initial {
+                assert_eq!(
+                    cache.as_ref().unwrap().calendar.calendar.members[&employee].value,
+                    "Anna"
+                );
+            } else {
+                assert!(cache.is_none());
+            }
+        }
+        warm();
+        assert!(views.data_for_write(b"{").is_err());
+        assert!(views.source.lock().unwrap().is_none());
+    }
+
     #[test]
     fn shared_year_rows_respect_current_source_employee_and_text_policy() {
         use godovoy_plan::storage::online::Access;

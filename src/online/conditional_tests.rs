@@ -55,6 +55,112 @@ mod conditional_tests {
         f.app.clone().oneshot(req).await.unwrap()
     }
 
+    fn shared_source(f: &Fixture) -> (std::path::PathBuf, Vec<u8>) {
+        let path = f._tmp.path().join("host/online-calendar-v1.json");
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Valid trailing whitespace places this ordinary event inside the cache size range.
+        bytes.resize(160 * 1024, b' ');
+        std::fs::write(&path, &bytes).unwrap();
+        (path, bytes)
+    }
+
+    #[tokio::test]
+    async fn failed_cached_note_preserves_the_file_and_other_readers_year() {
+        let f = Fixture::new();
+        let (_, _, other) = f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let (path, bytes) = shared_source(&f);
+        let (tag, own) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let (other_tag, prior) = snapshot(get(&f, 2028, &other, &[]).await).await;
+        let command = json!({"op":"note", "eventId":own["events"][0]["id"],
+            "year":2028, "base":"", "text":"Не сохранять"});
+
+        // Rejection by the mandatory audit happens after mutation of the working Data.
+        let journal = f._tmp.path().join("host").join(format!(
+            "security-{}.jsonl",
+            chrono::Utc::now().format("%Y-%m")
+        ));
+        let intact = std::fs::read(&journal).unwrap();
+        std::fs::write(&journal, b"unfinished synthetic record").unwrap();
+        assert_eq!(
+            save_with_tag(&f, &f.key, &tag, &command).await.status(),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        std::fs::write(journal, intact).unwrap();
+
+        assert_unchanged(get(&f, 2028, &f.key, &[&tag]).await, &tag).await;
+        assert_eq!(
+            snapshot(get(&f, 2028, &other, &[]).await).await,
+            (other_tag, prior)
+        );
+        assert_eq!(
+            save_with_tag(&f, &f.key, &tag, &command).await.status(),
+            StatusCode::OK
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_atomic_save_cannot_publish_a_working_note_from_cache() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let f = Fixture::new();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let (path, bytes) = shared_source(&f);
+        let (tag, prior) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let root = path.parent().unwrap();
+        let permissions = std::fs::metadata(root).unwrap().permissions();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        // Privileged test processes can still write to a read-only directory.
+        let can_stage = tempfile::NamedTempFile::new_in(root).is_ok();
+        let command = json!({"op":"note", "eventId":prior["events"][0]["id"],
+            "year":2028,"base":"","text":"Новая запись"});
+        let result = save_with_tag(&f, &f.key, &tag, &command).await.status();
+        if !can_stage {
+            assert_eq!(result, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!(f.cmd(command).await, StatusCode::SERVICE_UNAVAILABLE);
+        }
+        std::fs::set_permissions(root, permissions).unwrap();
+        let (_, current) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        if can_stage {
+            assert_eq!(result, StatusCode::OK);
+            assert_eq!(current["events"][0]["note"], "Новая запись");
+        } else {
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+            assert_eq!(current, prior);
+            let journal = root.join(format!(
+                "security-{}.jsonl",
+                chrono::Utc::now().format("%Y-%m")
+            ));
+            assert!(
+                std::fs::read_to_string(journal)
+                    .unwrap()
+                    .contains("note_requested")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn revocation_denies_cached_note_with_valid_previous_tag() {
+        let f = Fixture::new();
+        let (_, _, other) = f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let (path, bytes) = shared_source(&f);
+        let (tag, own) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let (_, prior) = snapshot(get(&f, 2028, &other, &[]).await).await;
+        let command = json!({"op":"note", "eventId":own["events"][0]["id"],
+            "year":2028, "base":"", "text":"После отзыва"});
+
+        f.vault.lock().unwrap().revoke(f.credential).unwrap();
+        let denied = save_with_tag(&f, &f.key, &tag, &command).await;
+        assert_eq!(denied.status(), StatusCode::UNAUTHORIZED);
+        assert!(!denied.headers().contains_key("x-godovoy-state-tag"));
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+        let (_, current) = snapshot(get(&f, 2028, &other, &[]).await).await;
+        assert_eq!(current["events"], prior["events"]);
+    }
+
     #[tokio::test]
     async fn matching_size_and_timestamp_still_require_current_calendar_bytes() {
         let f = Fixture::new();
