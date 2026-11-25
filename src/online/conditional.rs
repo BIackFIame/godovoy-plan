@@ -707,6 +707,7 @@ mod tests {
                 calendar: serde_json::from_slice(&initial).unwrap(),
                 bytes: initial.clone(),
                 public_rows: None,
+                overview_digest: None,
             });
         };
         for (bytes, name) in [(&initial, "Anna"), (&changed, "Olga")] {
