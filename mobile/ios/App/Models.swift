@@ -43,6 +43,9 @@ struct GPEvent: Equatable, Decodable, Identifiable {
     let ownerId, employeeId: String?
     let checklist: [GPTask]
     let revision: String
+    var nextOpenTask: GPTask? {
+        checklist.lazy.filter { !$0.done }.min { $0.dueDate < $1.dueDate }
+    }
     var month: Int { Int(date.dropFirst(5).prefix(2)) ?? 0 }
 }
 /// The wheel counts the whole year while the list follows the month and search filters.

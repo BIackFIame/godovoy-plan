@@ -706,11 +706,24 @@ public final class MainActivity extends Activity {
             year = y;
         }
     }
+    private static JSONObject nextOpenTask(JSONObject event) {
+        JSONArray tasks = event.optJSONArray("checklist");
+        JSONObject earliest = null;
+        for (int i = 0; tasks != null && i < tasks.length(); i++) {
+            JSONObject task = tasks.optJSONObject(i);
+            if (task == null || task.optBoolean("done")) continue;
+            if (earliest == null || str(task, "dueDate").compareTo(str(earliest, "dueDate")) < 0)
+                earliest = task;
+        }
+        return earliest;
+    }
+
     private void displayRows(List<Row> rows, View header) {
         list = new ListView(this);
         list.setDividerHeight(0);
         if (header != null)
             list.addHeaderView(header, null, false);
+        final boolean preparation = section.equals("Задачи");
         list.setAdapter(new BaseAdapter() {
             public int getCount() {
                 return rows.size();
@@ -745,7 +758,15 @@ public final class MainActivity extends Activity {
                 TextView title = (TextView) cell.getChildAt(0), sub = (TextView) cell.getChildAt(1);
                 title.setText(row.title);
                 String subtitle = row.sub;
-                if (row.event != null) {
+                if (row.event != null && preparation) {
+                    JSONObject task = nextOpenTask(row.event);
+                    if (task == null) {
+                        subtitle = "Дата события · " + pretty(str(row.event, "date"));
+                    } else {
+                        title.setText(str(task, "title"));
+                        subtitle = "Срок · " + pretty(str(task, "dueDate")) + "\n" + row.title;
+                    }
+                } else if (row.event != null) {
                     String who = owner(str(row.event, "employeeId"));
                     String date = pretty(str(row.event, "date"));
                     subtitle = who.isEmpty() ? date : date + "  ·  " + who;

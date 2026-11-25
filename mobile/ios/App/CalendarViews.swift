@@ -46,14 +46,30 @@ struct CalendarView: View {
 }
 struct EventLink: View {
     let event: GPEvent
-    var body: some View { NavigationLink { DetailView(id: event.id, year: event.year) } label: { VStack(alignment: .leading, spacing: 4) { Text(event.title).font(.headline); Text(GPDate.label(event.date)).font(.subheadline).foregroundStyle(.secondary) } } }
+    var showsPreparation = false
+
+    var body: some View {
+        NavigationLink { DetailView(id: event.id, year: event.year) } label: {
+            VStack(alignment: .leading, spacing: 4) {
+                if showsPreparation, let task = event.nextOpenTask {
+                    Text(task.title).font(.headline)
+                    Text("Срок · \(GPDate.label(task.dueDate))").font(.subheadline)
+                    Text(event.title).font(.subheadline).foregroundStyle(.secondary)
+                } else {
+                    Text(event.title).font(.headline)
+                    Text(showsPreparation ? "Дата события · \(GPDate.label(event.date))" : GPDate.label(event.date))
+                        .font(.subheadline).foregroundStyle(.secondary)
+                }
+            }
+        }
+    }
 }
 struct TasksView: View {
     @EnvironmentObject var model: CalendarModel
     var body: some View {
         List {
             if let state = model.state {
-                Section("Подготовка") { if state.tasks.isEmpty { Text("На сегодня задач нет").foregroundStyle(.secondary) }; ForEach(state.tasks, id: \.selfKey) { EventLink(event: $0) } }
+                Section("Подготовка") { if state.tasks.isEmpty { Text("На сегодня задач нет").foregroundStyle(.secondary) }; ForEach(state.tasks, id: \.selfKey) { EventLink(event: $0, showsPreparation: true) } }
                 Section("Напоминания") {
                     if state.reminders.isEmpty { Text("Напоминаний пока нет").foregroundStyle(.secondary) }
                     ForEach(state.reminders.indices, id: \.self) { index in
