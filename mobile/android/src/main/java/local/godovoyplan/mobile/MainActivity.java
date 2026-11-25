@@ -539,7 +539,9 @@ public final class MainActivity extends Activity {
             pad(b, 0, 0);
             b.setTextColor(section.equals(tab) ? BLUE : MUTED);
             b.setSelected(section.equals(tab));
-            fill(nav, b);
+            b.setMinWidth(dp(48));
+            b.setMinimumWidth(dp(48));
+            nav.addView(b, new LinearLayout.LayoutParams(-2, -2, 1));
         }
         root.addView(nav);
     }
