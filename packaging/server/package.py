@@ -14,7 +14,8 @@ import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
 DOCS = ("SERVER.md", "ONLINE.md", "ONLINE-API.md", "DATA-PROTECTION.md")
-LINUX_EXAMPLES = ("godovoy-calendar.service", "godovoy-office", "office.env.example")
+LINUX_EXAMPLES = ("godovoy-calendar.service", "godovoy-office", "office.env.example",
+                  "godovoy-backup.service", "godovoy-backup.timer")
 PLATFORMS = {
     "linux-x64": ("Linux-x64", ["x86_64-unknown-linux-musl"]),
     "linux-arm64": ("Linux-ARM64", ["aarch64-unknown-linux-musl"]),

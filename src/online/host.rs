@@ -100,6 +100,13 @@ fn standby_unavailable() -> Response {
 fn problem(status: StatusCode, message: &str) -> Response {
     (status, Json(json!({"error":message}))).into_response()
 }
+fn protection_denied(message: &str, code: &'static str) -> Response {
+    let mut response = problem(StatusCode::FORBIDDEN, message);
+    response
+        .headers_mut()
+        .insert("x-godovoy-access", HeaderValue::from_static(code));
+    response
+}
 fn unavailable() -> Response {
     problem(
         StatusCode::SERVICE_UNAVAILABLE,
@@ -217,6 +224,21 @@ where
             }
             return standby_unavailable();
         };
+        let settings = acl.protection().settings;
+        if host.entry == EntryPoint::Remote && !settings.remote_allowed() {
+            if lock
+                .audit_security(
+                    "protection_remote_denied",
+                    Some(id),
+                    Some(grant.employee),
+                    None,
+                )
+                .is_err()
+            {
+                return unavailable();
+            }
+            return protection_denied("Внешний вход отключён администратором.", "remote-disabled");
+        }
         if host.entry == EntryPoint::Remote && !grant.allow_remote {
             if lock
                 .audit_security("remote_access_denied", Some(id), Some(grant.employee), None)
@@ -250,6 +272,25 @@ where
             !grant.read_only,
             &host.mode,
         );
+        if response.status().is_success() {
+            let scope = if acl.assigned_only.contains(&grant.employee) {
+                "true"
+            } else {
+                "false"
+            };
+            response
+                .headers_mut()
+                .insert("x-godovoy-assigned-only", HeaderValue::from_static(scope));
+            let enabled = if settings.free_text_allowed() {
+                "true"
+            } else {
+                "false"
+            };
+            response.headers_mut().insert(
+                "x-godovoy-allow-free-text",
+                HeaderValue::from_static(enabled),
+            );
+        }
         if response.status().is_success()
             && let Some(deadline) = deadline
         {
@@ -325,9 +366,43 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             let Ok(cmd) = serde_json::from_slice::<Command>(&body) else {
                 return problem(StatusCode::BAD_REQUEST, "Недопустимый формат команды.");
             };
+            if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
+                if lock
+                    .audit_security(
+                        "protection_free_text_denied",
+                        Some(credential),
+                        Some(employee),
+                        None,
+                    )
+                    .is_err()
+                {
+                    return unavailable();
+                }
+                return protection_denied(
+                    "Описания и заметки отключены администратором.",
+                    "free-text-disabled",
+                );
+            }
             let Ok(mut data) = lock.data() else {
                 return unavailable();
             };
+            if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(&data, employee) {
+                if lock
+                    .audit_security(
+                        "employee_scope_denied",
+                        Some(credential),
+                        Some(employee),
+                        None,
+                    )
+                    .is_err()
+                {
+                    return unavailable();
+                }
+                return protection_denied(
+                    "Действие недоступно в персональном календаре.",
+                    "assigned-only",
+                );
+            }
             match actions::apply(cmd, &mut data, acl) {
                 Err(e) => problem(
                     if e.conflict {
@@ -417,6 +492,9 @@ pub async fn serve(
     };
     let app = router(host);
     eprintln!("Сервер слушает {addr}. Вход {scope}. Адрес клиента {origin}");
+    serve_listener(listener, app).await
+}
+pub(super) async fn serve_listener(listener: TcpListener, app: Router) -> Fallible<()> {
     let admissions = Arc::new(Semaphore::new(32));
     loop {
         let (socket, _) = listener.accept().await?;
@@ -529,6 +607,362 @@ mod tests {
             "date":"2028-02-29","yearly":true,"preparationDays":30,"checklist":[{"title":"Список","daysBefore":10}]})
         }
     }
+    #[tokio::test]
+    async fn protection_applies_to_existing_sessions_grants_and_minimizes_both_event_lists() {
+        use chrono::Datelike;
+        use godovoy_plan::storage::online::{GrantPermissions, ProtectionSettings};
+        let mut f = Fixture::new();
+        let today = chrono::Local::now().date_naive();
+        let year = today.year();
+        let query = format!("/v1/state?year={year}");
+        let (_, _, remote_key) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant_with_permissions(
+                "Анна",
+                Some(f.employee),
+                GrantPermissions {
+                    read_only: true,
+                    allow_remote: true,
+                },
+            )
+            .unwrap();
+        let mut values = f.create();
+        values["date"] = json!(today);
+        values["description"] = json!("private-description");
+        assert_eq!(f.cmd(values.clone()).await, StatusCode::NO_CONTENT);
+        let previous = f.request(&query, &f.key, None).await.1;
+        let event = &previous["events"][0];
+        let id = &event["id"];
+        assert_eq!(
+            f.cmd(json!({"op":"note","eventId":id,"year":year,"base":"","text":"private-note"}))
+                .await,
+            StatusCode::NO_CONTENT
+        );
+        let restricted = ProtectionSettings {
+            belarus: true,
+            ..Default::default()
+        };
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(0, restricted)
+            .unwrap();
+        assert!(
+            f.vault
+                .lock()
+                .unwrap()
+                .grant_with_permissions(
+                    "Борис",
+                    None,
+                    GrantPermissions {
+                        read_only: false,
+                        allow_remote: true
+                    }
+                )
+                .is_err()
+        );
+        let (_, state) = f.request(&query, &remote_key, None).await;
+        assert_eq!(state["canEdit"], false);
+        assert_eq!(state["allowFreeText"], false);
+        assert!(!state["tasks"].as_array().unwrap().is_empty());
+        for list in ["events", "tasks"] {
+            assert_eq!(state[list][0]["description"], "");
+            assert_eq!(state[list][0]["note"], "");
+        }
+        assert!(!state.to_string().contains("private-"));
+        f.vault.lock().unwrap().begin_standby(5).unwrap();
+        let mut standby = Host::new(
+            f.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Office),
+        )
+        .unwrap();
+        standby.enable_standby().unwrap();
+        let primary = std::mem::replace(&mut f.app, router(standby));
+        let request = Request::builder()
+            .uri("/v1/session")
+            .header(header::HOST, "calendar.test")
+            .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+            .body(Body::empty())
+            .unwrap();
+        let response = f.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(response.headers()["x-godovoy-allow-free-text"], "false");
+        assert!(response.headers().contains_key("x-godovoy-standby-until"));
+        assert!(
+            !f.request(&query, &f.key, None)
+                .await
+                .1
+                .to_string()
+                .contains("private-")
+        );
+        assert_eq!(f.cmd(values.clone()).await, StatusCode::FORBIDDEN);
+        f.vault.lock().unwrap().end_standby().unwrap();
+        f.app = primary;
+        assert_eq!(f.cmd(values.clone()).await, StatusCode::FORBIDDEN);
+        assert_eq!(
+            f.cmd(json!({"op":"note","eventId":id,"year":year,"base":"private-note","text":""}))
+                .await,
+            StatusCode::FORBIDDEN
+        );
+        values["op"] = json!("editEvent");
+        values["eventId"] = id.clone();
+        values["year"] = json!(year);
+        values["revision"] = event["revision"].clone();
+        values["scope"] = json!("year");
+        values["title"] = json!("Новое название");
+        values["description"] = json!("");
+        values["checklist"][0]["id"] = event["checklist"][0]["id"].clone();
+        assert_eq!(f.cmd(values).await, StatusCode::NO_CONTENT);
+        let remote = Host::new(
+            f.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Remote),
+        )
+        .unwrap();
+        let office = std::mem::replace(&mut f.app, router(remote));
+        for path in ["/v1/session", query.as_str(), "/v1/command"] {
+            let request = Request::builder()
+                .uri(path)
+                .method(if path.ends_with("command") {
+                    Method::POST
+                } else {
+                    Method::GET
+                })
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {remote_key}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("{}"))
+                .unwrap();
+            let response = f.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::FORBIDDEN);
+            assert_eq!(response.headers()["x-godovoy-access"], "remote-disabled");
+        }
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                1,
+                ProtectionSettings {
+                    russia: true,
+                    allow_remote: true,
+                    allow_free_text: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let restored = f.request(&query, &remote_key, None).await.1;
+        assert_eq!(restored["allowFreeText"], true);
+        assert_eq!(restored["events"][0]["title"], "Новое название");
+        assert_eq!(restored["events"][0]["description"], "private-description");
+        assert_eq!(restored["events"][0]["note"], "private-note");
+        assert_eq!(
+            f.request("/v1/command", &remote_key, Some(f.create()))
+                .await
+                .0,
+            StatusCode::FORBIDDEN
+        );
+        f.app = office;
+        assert_eq!(
+            f.request("/v1/session", &f.key, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+    }
+
+    #[tokio::test]
+    async fn restricted_employee_sees_and_updates_only_own_current_occurrences_on_every_key() {
+        use godovoy_plan::storage::online::ProtectionSettings;
+        let mut f = Fixture::new();
+        let (_, colleague, colleague_key) =
+            f.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        let (_, _, reader) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant("Анна", Some(f.employee), true)
+            .unwrap();
+        let mut owned = f.create();
+        owned["title"] = json!("mine");
+        assert_eq!(f.cmd(owned.clone()).await, StatusCode::NO_CONTENT);
+        let mut foreign = f.create();
+        foreign["title"] = json!("private-to-colleague");
+        foreign["ownerId"] = json!(colleague);
+        assert_eq!(f.cmd(foreign).await, StatusCode::NO_CONTENT);
+        let before = f.state().await;
+        let events = before["events"].as_array().unwrap();
+        let mine = events.iter().find(|e| e["title"] == "mine").unwrap();
+        let other = events
+            .iter()
+            .find(|e| e["title"] == "private-to-colleague")
+            .unwrap();
+        let check = |event: &Value| json!({"op":"check","eventId":event["id"],"taskId":event["checklist"][0]["id"],"year":2028,"done":true});
+        let note = |id: &Value, year| json!({"op":"note","eventId":id,"year":year,"text":"готово","base":""});
+        assert!(!before["assignedOnly"].as_bool().unwrap());
+        f.vault
+            .lock()
+            .unwrap()
+            .set_employee_scope(f.employee, true)
+            .unwrap();
+        let (_, _, future) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant("Анна", Some(f.employee), false)
+            .unwrap();
+        for key in [&f.key, &reader, &future] {
+            let state = f.request("/v1/state?year=2028", key, None).await.1;
+            assert_eq!(state["assignedOnly"], true);
+            assert_eq!(state["events"].as_array().unwrap().len(), 1);
+            assert_eq!(state["employees"].as_array().unwrap().len(), 1);
+            assert_eq!(state["employees"][0]["id"], json!(f.employee));
+            assert!(!state.to_string().contains("private-to-colleague"));
+            assert!(!state.to_string().contains(&colleague.to_string()));
+        }
+        assert_eq!(
+            f.request("/v1/state?year=2028", &colleague_key, None)
+                .await
+                .1["events"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2
+        );
+        assert_eq!(
+            f.request("/v1/command", &reader, Some(check(mine))).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(f.cmd(check(mine)).await, StatusCode::NO_CONTENT);
+        assert_eq!(f.cmd(note(&mine["id"], 2028)).await, StatusCode::NO_CONTENT);
+        let denied = f
+            .request("/v1/command", &future, Some(note(&other["id"], 2028)))
+            .await;
+        let unknown = f
+            .request(
+                "/v1/command",
+                &future,
+                Some(note(&json!(Id::new_v4()), 2028)),
+            )
+            .await;
+        assert_eq!(denied, unknown);
+        assert_eq!(denied.0, StatusCode::FORBIDDEN);
+        assert_eq!(f.cmd(check(other)).await, StatusCode::FORBIDDEN);
+        assert_eq!(f.cmd(owned.clone()).await, StatusCode::FORBIDDEN);
+        let mut change = owned.clone();
+        change["op"] = json!("editEvent");
+        change["eventId"] = mine["id"].clone();
+        change["year"] = json!(2028);
+        change["revision"] = mine["revision"].clone();
+        change["scope"] = json!("year");
+        change["ownerId"] = json!(colleague);
+        assert_eq!(f.cmd(change.clone()).await, StatusCode::FORBIDDEN);
+        let delete = json!({"op":"deleteEvent","eventId":mine["id"],"year":2028,"revision":mine["revision"],"scope":"future"});
+        assert_eq!(f.cmd(delete).await, StatusCode::FORBIDDEN);
+        // The shared editor reassigns just one occurrence. Other years stay accessible.
+        assert_eq!(
+            f.request("/v1/command", &colleague_key, Some(change))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        assert_eq!(f.cmd(note(&mine["id"], 2028)).await, StatusCode::FORBIDDEN);
+        assert_eq!(f.cmd(note(&mine["id"], 2029)).await, StatusCode::NO_CONTENT);
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    russia: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        f.vault.lock().unwrap().begin_standby(5).unwrap();
+        assert!(
+            f.vault
+                .lock()
+                .unwrap()
+                .set_employee_scope(f.employee, false)
+                .is_err()
+        );
+        let mut standby = Host::new(
+            f.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Office),
+        )
+        .unwrap();
+        standby.enable_standby().unwrap();
+        let primary = std::mem::replace(&mut f.app, router(standby));
+        let request = Request::builder()
+            .uri("/v1/session")
+            .header(header::HOST, "calendar.test")
+            .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+            .body(Body::empty())
+            .unwrap();
+        let response = f.app.clone().oneshot(request).await.unwrap();
+        assert_eq!(response.headers()["x-godovoy-assigned-only"], "true");
+        assert!(response.headers().contains_key("x-godovoy-standby-until"));
+        assert_eq!(f.state().await["events"], json!([]));
+        assert_eq!(f.cmd(note(&mine["id"], 2029)).await, StatusCode::FORBIDDEN);
+        f.vault.lock().unwrap().end_standby().unwrap();
+        f.app = primary;
+        f.vault
+            .lock()
+            .unwrap()
+            .set_employee_scope(f.employee, false)
+            .unwrap();
+        assert_eq!(f.state().await["events"].as_array().unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn editing_future_dates_under_minimization_preserves_hidden_year_and_template_descriptions()
+     {
+        use godovoy_plan::storage::online::ProtectionSettings;
+        let f = Fixture::new();
+        let mut fields = f.create();
+        fields["description"] = json!("future-only");
+        assert_eq!(f.cmd(fields.clone()).await, StatusCode::NO_CONTENT);
+        let event = f.state().await["events"][0].clone();
+        fields["op"] = json!("editEvent");
+        fields["scope"] = json!("year");
+        fields["eventId"] = event["id"].clone();
+        fields["year"] = json!(2028);
+        fields["revision"] = event["revision"].clone();
+        fields["checklist"][0]["id"] = event["checklist"][0]["id"].clone();
+        fields["description"] = json!("only-this-year");
+        assert_eq!(f.cmd(fields.clone()).await, StatusCode::NO_CONTENT);
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    russia: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        fields["revision"] = f.state().await["events"][0]["revision"].clone();
+        fields["scope"] = json!("future");
+        fields["description"] = json!("");
+        fields["title"] = json!("Updated");
+        assert_eq!(f.cmd(fields).await, StatusCode::NO_CONTENT);
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(1, ProtectionSettings::default())
+            .unwrap();
+        assert_eq!(
+            f.state().await["events"][0]["description"],
+            "only-this-year"
+        );
+        let future = f.request("/v1/state?year=2029", &f.key, None).await.1;
+        assert_eq!(future["events"][0]["description"], "future-only");
+        assert_eq!(future["events"][0]["title"], "Updated");
+    }
+
     #[tokio::test]
     async fn standby_epoch_blocks_both_primary_entries_and_keeps_office_edits_and_revocations() {
         let mut f = Fixture::new();

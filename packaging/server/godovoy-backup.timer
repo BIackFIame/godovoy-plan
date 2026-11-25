@@ -1,0 +1,10 @@
+[Unit]
+Description=Daily verified Godovoy Plan backup
+
+[Timer]
+OnCalendar=*-*-* 03:30:00
+Persistent=true
+Unit=godovoy-backup.service
+
+[Install]
+WantedBy=timers.target

@@ -1,6 +1,16 @@
 //! Separate storage format for the authoritative host. It has no P2P keys or routes.
+#[path = "online_evidence.rs"]
+mod evidence;
+#[path = "online_protection.rs"]
+mod protection;
 #[path = "online_audit.rs"]
 mod security_audit;
+#[path = "online_snapshot.rs"]
+mod snapshot;
+pub use protection::{ProtectionConflict, ProtectionSettings, ProtectionState};
+#[path = "online_operator.rs"]
+mod operator;
+pub use operator::{OperatorDetails, OperatorInput, OperatorRecord};
 #[path = "online_standby.rs"]
 mod standby;
 pub use standby::StandbyWindow;
@@ -17,7 +27,7 @@ use blake2::{Blake2s256, Digest};
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fs::{self, File, OpenOptions},
     io::Read,
     path::{Path, PathBuf},
@@ -71,9 +81,20 @@ pub struct GrantPermissions {
     pub allow_remote: bool,
 }
 #[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Access {
+    #[serde(
+        default,
+        deserialize_with = "protection::present",
+        skip_serializing_if = "Option::is_none"
+    )]
+    protection: Option<protection::StoredProtection>,
+    #[serde(default)]
+    pub operator: OperatorRecord,
     pub name: String,
     pub employees: BTreeMap<Id, String>,
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub assigned_only: BTreeSet<Id>,
     pub grants: BTreeMap<Id, Grant>,
     pub audit: VecDeque<Audit>,
 }
@@ -151,8 +172,11 @@ impl OnlineVault {
             audit: VecDeque::new(),
         };
         let access = Access {
+            protection: None,
+            operator: Default::default(),
             name,
             employees,
+            assigned_only: BTreeSet::new(),
             grants: BTreeMap::new(),
             audit: VecDeque::new(),
         };
@@ -213,7 +237,44 @@ impl LockedVault<'_> {
         ))?)
     }
     pub fn access(&self) -> Fallible<Access> {
-        self.read(ACCESS, ACCESS_LIMIT)
+        let mut acl: Access = self.read(ACCESS, ACCESS_LIMIT)?;
+        if acl
+            .assigned_only
+            .iter()
+            .any(|id| !acl.employees.contains_key(id))
+        {
+            return Err("Повреждена область доступа сотрудника.".into());
+        }
+        self.finish_protection(&mut acl)?;
+        Ok(acl)
+    }
+    pub fn set_employee_scope(&self, employee: Id, assigned_only: bool) -> Fallible<()> {
+        if self.standby_window()?.is_some() {
+            return Err(
+                "Область доступа можно изменить после завершения резервного режима.".into(),
+            );
+        }
+        let mut acl = self.access()?;
+        if !acl.employees.contains_key(&employee) {
+            return Err(OperatorInput.into());
+        }
+        let (changed, action) = if assigned_only {
+            (
+                acl.assigned_only.insert(employee),
+                "employee_scope_assigned_requested",
+            )
+        } else {
+            (
+                acl.assigned_only.remove(&employee),
+                "employee_scope_shared_requested",
+            )
+        };
+        if changed {
+            self.audit_security(action, None, Some(employee), None)?;
+            save(&self.directory.join(ACCESS), &acl, ACCESS_LIMIT)?;
+            sync_directory(self.directory)?;
+        }
+        Ok(())
     }
     pub fn data(&self) -> Fallible<Data> {
         self.read(DATA, DATA_LIMIT)
@@ -247,6 +308,10 @@ impl LockedVault<'_> {
         let mut access = self.access()?;
         if self.standby_window()?.is_some() {
             return Err("Выдача ключей приостановлена до завершения резервного режима.".into());
+        }
+        if permissions.allow_remote && !access.protection().settings.remote_allowed() {
+            self.audit_security("protection_remote_grant_denied", None, existing, None)?;
+            return Err("Внешний вход отключён политикой календаря.".into());
         }
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {

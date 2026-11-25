@@ -88,7 +88,7 @@ fn inspect_file(path: &Path) -> Fallible<()> {
 }
 
 #[cfg(target_os = "macos")]
-fn check_mac_acl(paths: &[std::path::PathBuf], ancestors: bool) -> Fallible<()> {
+pub(super) fn check_mac_acl(paths: &[std::path::PathBuf], ancestors: bool) -> Fallible<()> {
     use std::process::Command;
     for batch in paths.chunks(32) {
         // Numeric IDs, escaped filenames, ACL entries on following lines.

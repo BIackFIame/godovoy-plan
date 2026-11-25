@@ -1,5 +1,5 @@
 //! Monthly host audit. The caller holds the vault lock through the operation.
-use super::{Id, LockedVault, sync_directory};
+use super::{Id, LockedVault, ProtectionState, sync_directory};
 use crate::Fallible;
 use chrono::{SecondsFormat, Utc};
 use serde::Serialize;
@@ -15,6 +15,8 @@ struct SecurityRecord {
     credential: Option<Id>,
     employee: Option<Id>,
     object: Option<Id>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    protection: Option<ProtectionState>,
 }
 
 impl LockedVault<'_> {
@@ -24,6 +26,24 @@ impl LockedVault<'_> {
         credential: Option<Id>,
         employee: Option<Id>,
         object: Option<Id>,
+    ) -> Fallible<()> {
+        self.append_security(action, credential, employee, object, None)
+    }
+    pub(super) fn audit_protection(
+        &self,
+        action: &'static str,
+        change: Id,
+        policy: ProtectionState,
+    ) -> Fallible<()> {
+        self.append_security(action, None, None, Some(change), Some(policy))
+    }
+    fn append_security(
+        &self,
+        action: &'static str,
+        credential: Option<Id>,
+        employee: Option<Id>,
+        object: Option<Id>,
+        protection: Option<ProtectionState>,
     ) -> Fallible<()> {
         let now = Utc::now();
         let path = self
@@ -87,6 +107,7 @@ impl LockedVault<'_> {
             credential,
             employee,
             object,
+            protection,
         })?;
         entry.push(b'\n');
         file.write_all(&entry)?;

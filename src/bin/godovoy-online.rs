@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #[path = "../online/actions.rs"]
 mod actions;
+#[path = "../online/admin.rs"]
+mod admin;
 #[path = "../online/host.rs"]
 mod host;
 
@@ -15,7 +17,7 @@ use godovoy_plan::{
 };
 use std::{env, path::Path};
 
-const HELP: &str = "godovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
+const HELP: &str = "godovoy-online configure DIR [--backup-root PRIVATE_DIR]\ngodovoy-online protection-report DIR\ngodovoy-online backup DIR NEW_DEST\ngodovoy-online backup-verify BACKUP\ngodovoy-online backup-restore BACKUP NEW_DIR\ngodovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
 fn describe_window(window: godovoy_plan::storage::online::StandbyWindow) {
     let deadline =
         DateTime::<Utc>::from_timestamp(window.deadline, 0).expect("validated standby deadline");
@@ -33,7 +35,12 @@ fn describe_window(window: godovoy_plan::storage::online::StandbyWindow) {
 }
 fn main() {
     if let Err(e) = run() {
-        eprintln!("Ошибка: {e}");
+        let message = e.to_string();
+        if message == HELP {
+            eprintln!("Ошибка: {HELP}");
+        } else {
+            eprintln!("Ошибка: {}", godovoy_plan::terminal_message(&message));
+        }
         std::process::exit(1);
     }
 }
@@ -73,8 +80,60 @@ fn run() -> Fallible<()> {
         println!("Центральный календарь создан. Выдайте персональные ключи командой grant.");
         return Ok(());
     }
+    match (op.as_str(), tail) {
+        ("backup-verify", []) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&OnlineVault::verify_backup(dir)?)?
+            );
+            return Ok(());
+        }
+        ("backup-restore", [dest]) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&OnlineVault::restore_backup(dir, Path::new(dest))?)?
+            );
+            return Ok(());
+        }
+        _ => {}
+    }
     let vault = OnlineVault::open(dir)?;
     match (op.as_str(), tail) {
+        ("configure", options) => {
+            let backup_root = match options {
+                [] => None,
+                [flag, path] if flag == "--backup-root" => {
+                    let path = Path::new(path);
+                    if !std::fs::symlink_metadata(path)?.is_dir() {
+                        return Err("Нужен существующий каталог для резервных копий.".into());
+                    }
+                    let path = path.canonicalize()?;
+                    if path.starts_with(dir.canonicalize()?) {
+                        return Err("Выберите отдельный каталог вне рабочего календаря.".into());
+                    }
+                    Some(path)
+                }
+                _ => return Err(HELP.into()),
+            };
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(admin::serve(vault, backup_root))?;
+        }
+        ("protection-report", []) => {
+            let lock = vault.lock()?;
+            lock.audit_security("operator_report_requested", None, None, None)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&lock.protection_report()?)?
+            );
+        }
+        ("backup", [dest]) => {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&vault.create_verified_backup(Path::new(dest))?)?
+            );
+        }
         ("serve", options) => {
             let mut port = None;
             let mut origin = None;

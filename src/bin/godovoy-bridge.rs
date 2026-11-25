@@ -84,7 +84,7 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("{}", godovoy_plan::terminal_message(&error.to_string()));
             ExitCode::FAILURE
         }
     }
@@ -234,7 +234,7 @@ fn run() -> Fallible<()> {
         if config.every.is_some()
             && let Err(error) = &result
         {
-            eprintln!("{error}");
+            eprintln!("{}", godovoy_plan::terminal_message(&error.to_string()));
         }
         let report_started = Instant::now();
         let _ = runtime.block_on(report_bridge_run(

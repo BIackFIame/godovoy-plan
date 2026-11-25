@@ -90,7 +90,7 @@ pub fn run(
             };
             desktop.start(initial);
             if let Some(error) = &desktop.issue {
-                eprintln!("{APP_NAME}: {error}");
+                eprintln!("{APP_NAME}: {}", godovoy_plan::terminal_message(error));
             }
             if starts_minimized {
                 context
@@ -588,7 +588,10 @@ impl eframe::App for Desktop {
         if let Some(app) = &mut self.app
             && let Err(error) = app.flush_local_drafts()
         {
-            eprintln!("{APP_NAME}: Не удалось сохранить локальные черновики. {error}");
+            eprintln!(
+                "{APP_NAME}: Не удалось сохранить локальные черновики. {}",
+                godovoy_plan::terminal_message(&error.to_string())
+            );
         }
     }
 

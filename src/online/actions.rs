@@ -8,15 +8,23 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::collections::BTreeSet;
 
-fn occurrence(data: &Data, e: Occurrence<'_>) -> Value {
+fn occurrence(data: &Data, e: Occurrence<'_>, allow_free_text: bool) -> Value {
     let event = e.event;
+    let description = if allow_free_text {
+        event.description.as_str()
+    } else {
+        ""
+    };
+    let note = if allow_free_text { e.note() } else { "" };
     let checklist=event.tasks.iter().map(|t|json!({"id":t.id,"title":t.title,"daysBefore":t.days_before,"dueDate":e.due(t),"done":e.checked(t.id)})).collect::<Vec<_>>();
-    json!({"id":e.id,"year":e.year,"title":event.title,"description":event.description,"category":event.category,
+    json!({"id":e.id,"year":e.year,"title":event.title,"description":description,"category":event.category,
         "date":e.date,"yearly":event.yearly,"ownerId":event.owner.map(|id|data.calendar.person_for(id)),
         "preparationDays":event.preparation_days,"preparationDate":e.preparation_date(),"checklist":checklist,
-        "note":e.note(),"revision":format!("{}:{}",e.revision.sequence,e.revision.operation)})
+        "note":note,"revision":format!("{}:{}",e.revision.sequence,e.revision.operation)})
 }
 pub fn state(data: &Data, acl: &Access, year: i32, employee: Id, can_edit: bool) -> Value {
+    let allow_free_text = acl.protection().settings.free_text_allowed();
+    let assigned_only = acl.assigned_only.contains(&employee);
     let active = acl
         .grants
         .values()
@@ -25,13 +33,13 @@ pub fn state(data: &Data, acl: &Access, year: i32, employee: Id, can_edit: bool)
     let employees = acl
         .employees
         .iter()
-        .filter(|(id, _)| active.contains(id))
+        .filter(|(id, _)| active.contains(id) && (!assigned_only || **id == employee))
         .map(|(id, name)| json!({"id":id,"name":name}))
         .collect::<Vec<_>>();
     let tasks = personal_events(&data.calendar, Local::now().date_naive(), employee);
-    json!({"workspaceName":acl.name,"employeeId":employee,"employees":employees,"canEdit":can_edit,"year":year,
-        "events":data.calendar.year(year).into_iter().map(|e|occurrence(data,e)).collect::<Vec<_>>(),
-        "tasks":tasks.into_iter().map(|e|occurrence(data,e)).collect::<Vec<_>>()})
+    json!({"workspaceName":acl.name,"employeeId":employee,"employees":employees,"canEdit":can_edit,"allowFreeText":allow_free_text,"assignedOnly":assigned_only,"year":year,
+        "events":data.calendar.year(year).into_iter().filter(|e| !assigned_only || assigned_to(data, *e, employee)).map(|e|occurrence(data,e,allow_free_text)).collect::<Vec<_>>(),
+        "tasks":tasks.into_iter().map(|e|occurrence(data,e,allow_free_text)).collect::<Vec<_>>()})
 }
 
 #[derive(Deserialize)]
@@ -98,7 +106,11 @@ impl Fields {
             .map_or(self.date, |e| e.event.date);
         let event = Event {
             title: self.title.trim().into(),
-            description: self.description,
+            description: if acl.protection().settings.free_text_allowed() {
+                self.description
+            } else {
+                old.map(|e| e.event.description.clone()).unwrap_or_default()
+            },
             category: self.category,
             date,
             yearly: self.yearly,
@@ -149,6 +161,35 @@ pub enum Command {
         done: bool,
     },
 }
+fn assigned_to(data: &Data, event: Occurrence<'_>, employee: Id) -> bool {
+    event
+        .event
+        .owner
+        .is_some_and(|owner| data.calendar.person_for(owner) == data.calendar.person_for(employee))
+}
+impl Command {
+    pub fn allowed_for_assignee(&self, data: &Data, employee: Id) -> bool {
+        match self {
+            Self::Check { event_id, year, .. } | Self::Note { event_id, year, .. } => {
+                (1900..=9999).contains(year)
+                    && data
+                        .calendar
+                        .follow_event(*event_id, *year)
+                        .is_some_and(|event| assigned_to(data, event, employee))
+            }
+            Self::CreateEvent { .. } | Self::EditEvent { .. } | Self::DeleteEvent { .. } => false,
+        }
+    }
+    pub fn uses_free_text(&self) -> bool {
+        match self {
+            Self::CreateEvent { fields } | Self::EditEvent { fields, .. } => {
+                !fields.description.is_empty()
+            }
+            Self::Note { .. } => true,
+            _ => false,
+        }
+    }
+}
 pub struct Rejection {
     pub message: &'static str,
     pub conflict: bool,
@@ -187,6 +228,7 @@ fn update(
     if format!("{}:{}", old.revision.sequence, old.revision.operation) != target.revision {
         return Err(stale());
     }
+    let preserve_override = old.overridden && !acl.protection().settings.free_text_allowed();
     let event = fields.map(|f| f.build(data, acl, Some(old))).transpose()?;
     let plan = data.calendar.plans.get_mut(&target.id).ok_or_else(stale)?;
     if event.as_ref().is_some_and(|e| e.yearly) && plan.imported_single_has_other_dates() {
@@ -198,10 +240,26 @@ fn update(
             plan.years.entry(target.year).or_default().change = Some(Record::new(stamp, change));
         }
         Scope::Future => {
+            let mut template = event;
+            let mut change = YearChange::UseTemplate;
+            if preserve_override && let Some(event) = &mut template {
+                let base_description = plan
+                    .templates
+                    .range(..=target.year)
+                    .next_back()
+                    .and_then(|(_, record)| record.value.as_ref())
+                    .map(|base| base.description.as_str())
+                    .unwrap_or("");
+                if base_description != event.description {
+                    // Keep the year's hidden exception without propagating it into future occurrences.
+                    change = YearChange::Edit(event.clone().into());
+                    event.description = base_description.to_owned();
+                }
+            }
             plan.templates
-                .insert(target.year, Record::new(stamp, event.map(Into::into)));
+                .insert(target.year, Record::new(stamp, template.map(Into::into)));
             if let Some(year) = plan.years.get_mut(&target.year) {
-                year.change = Some(Record::new(stamp, YearChange::UseTemplate));
+                year.change = Some(Record::new(stamp, change));
             }
         }
     }

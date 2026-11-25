@@ -375,3 +375,115 @@ fn standby_cli_preserves_window_rejects_corruption_and_allows_emergency_revocati
     assert_eq!(log.matches("standby_begin_requested").count(), 1);
     assert_eq!(log.matches("standby_end_requested").count(), 1);
 }
+
+#[test]
+fn protection_is_versioned_auditable_and_fail_closed_on_partial_or_damaged_storage() {
+    use godovoy_plan::storage::online::{ProtectionConflict, ProtectionSettings};
+    use serde_json::{Value, json};
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("central");
+    assert!(cli("init", &dir, &["Test"]).status.success());
+    let vault = OnlineVault::open(&dir).unwrap();
+    let lock = vault.lock().unwrap();
+    let acl = dir.join("online-access-v1.json");
+    let legacy: Value = serde_json::from_slice(&fs::read(&acl).unwrap()).unwrap();
+    assert!(!legacy.as_object().unwrap().contains_key("protection"));
+    assert_eq!(lock.protection().unwrap().revision, 0);
+    let policy = ProtectionSettings {
+        russia: true,
+        ..Default::default()
+    };
+    let first = lock.set_protection(0, policy).unwrap();
+    assert_eq!(first.revision, 1);
+    assert!(!first.settings.remote_allowed() && !first.settings.free_text_allowed());
+    assert!(
+        lock.set_protection(0, policy)
+            .unwrap_err()
+            .is::<ProtectionConflict>()
+    );
+    assert_eq!(lock.set_protection(1, policy).unwrap(), first);
+    let policy = ProtectionSettings {
+        russia: false,
+        belarus: true,
+        allow_free_text: true,
+        allow_remote: true,
+    };
+    let second = lock.set_protection(1, policy).unwrap();
+    assert_eq!(second.revision, 2);
+    assert!(second.settings.remote_allowed() && second.settings.free_text_allowed());
+    lock.begin_standby(5).unwrap();
+    assert!(
+        lock.set_protection(2, ProtectionSettings::default())
+            .is_err()
+    );
+    assert_eq!(lock.protection().unwrap(), second);
+    lock.end_standby().unwrap();
+    let journal = fs::read_dir(&dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+        .unwrap();
+    let logs: Vec<Value> = fs::read_to_string(&journal)
+        .unwrap()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect();
+    for state in [first, second] {
+        let done = logs
+            .iter()
+            .find(|e| e["action"] == "protection_applied" && e["protection"] == json!(state))
+            .unwrap();
+        assert!(logs.iter().any(|e| e["action"] == "protection_requested"
+            && e["object"] == done["object"]
+            && e["protection"] == done["protection"]));
+    }
+    let valid = fs::read(&acl).unwrap();
+    let pristine: Value = serde_json::from_slice(&valid).unwrap();
+    for path in [
+        "/protection/version",
+        "/protection/state/revision",
+        "/protection/state/settings/allowRemote",
+        "/protection",
+    ] {
+        let mut broken = pristine.clone();
+        *broken.pointer_mut(path).unwrap() = Value::Null;
+        fs::write(&acl, serde_json::to_vec(&broken).unwrap()).unwrap();
+        assert!(lock.access().is_err());
+    }
+    let mut broken = pristine.clone();
+    broken.as_object_mut().unwrap().remove("protection");
+    fs::write(&acl, serde_json::to_vec(&broken).unwrap()).unwrap();
+    assert!(lock.access().is_err());
+    fs::write(&acl, &valid).unwrap();
+    let pin = dir.join("online-protection-required-v1.json");
+    fs::remove_file(&pin).unwrap();
+    assert!(lock.access().is_err());
+    fs::write(&pin, "1").unwrap();
+    let mut pending = pristine;
+    pending["protection"]["pendingAudit"] = json!(true);
+    fs::write(&acl, serde_json::to_vec(&pending).unwrap()).unwrap();
+    let saved_log = fs::read(&journal).unwrap();
+    fs::write(&journal, b"partial").unwrap();
+    assert!(lock.protection().is_err());
+    fs::write(&journal, saved_log).unwrap();
+    assert_eq!(lock.protection().unwrap(), second);
+    assert_eq!(fs::read(&acl).unwrap(), valid);
+    let disabled = lock
+        .set_protection(2, ProtectionSettings::default())
+        .unwrap();
+    assert_eq!(disabled.revision, 3);
+    assert!(disabled.settings.free_text_allowed() && disabled.settings.remote_allowed());
+}
+
+#[cfg(unix)]
+#[test]
+fn diagnostics_keep_an_unusual_profile_name_on_one_line() {
+    let root = TempDir::new().unwrap();
+    let path = root.path().join("O'Connor & коллеги\nмай\t2026\u{202e}");
+    fs::write(&path, b"").unwrap();
+    let output = cli("status", &path, &[]);
+    assert!(!output.status.success());
+    let message = String::from_utf8(output.stderr).unwrap();
+    assert_eq!(message.lines().count(), 1);
+    assert!(message.contains(r"O'Connor & коллеги\nмай\t2026\u{202e}"));
+}

@@ -1,0 +1,18 @@
+[Unit]
+Description=Verified snapshot of Godovoy Plan to the mounted backup volume
+AssertPathIsMountPoint=/srv/godovoy/volume
+AssertPathIsMountPoint=/srv/godovoy/backup-volume
+AssertPathExists=/srv/godovoy/volume/calendar/online-access-v1.json
+
+[Service]
+Type=oneshot
+User=godovoy
+Group=godovoy
+UMask=0077
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ReadWritePaths=/srv/godovoy/volume/calendar /srv/godovoy/backup-volume/snapshots
+ExecStart=/bin/sh -ec 'exec /usr/local/bin/godovoy-online backup /srv/godovoy/volume/calendar "/srv/godovoy/backup-volume/snapshots/calendar-$(date -u +%%Y%%m%%dT%%H%%M%%SZ)"'

@@ -119,12 +119,30 @@
                 mode: "same-origin", redirect: "error", signal: controller.signal,
             });
             if (epoch !== generation || document.hidden) throw new Problem();
+            const restriction = response.headers.get("x-godovoy-access");
+            const textPolicy = response.headers.get("x-godovoy-allow-free-text");
+            const scope = response.headers.get("x-godovoy-assigned-only");
+            const scopeChanged = response.ok && state && (scope === "true" || scope === "false") &&
+                (state.assignedOnly === true) !== (scope === "true");
+            const textChanged = response.ok && state && (textPolicy === "true" || textPolicy === "false") &&
+                (state.allowFreeText !== false) !== (textPolicy === "true");
+            if (scopeChanged || textChanged || (response.status === 403 &&
+                (restriction === "free-text-disabled" || restriction === "assigned-only"))) {
+                let message = "Администратор закрыл описания и дневник. Названия событий и чек-листы доступны.";
+                if (textPolicy === "true") message = "Администратор разрешил описания и дневник.";
+                if (scopeChanged || restriction === "assigned-only") message = scope === "false"
+                    ? "Теперь вам доступен весь календарь." : "Теперь вам доступны только назначенные вам события.";
+                clearWorkspace(message, true);
+                const updated = generation;
+                load(currentYear).then(() => { if (updated === generation) notice(message); }).catch(() => {});
+                throw new Problem();
+            }
             if (response.status === 401 || response.status === 403) {
-                const officeOnly = response.status === 403 &&
-                    response.headers.get("x-godovoy-access") === "office-only";
-                clearWorkspace(officeOnly
-                    ? "Этот ключ действует только в офисе. Откройте внутренний адрес календаря или запросите удалённый доступ."
-                    : prompts.denied);
+                const messages = {
+                    "office-only": "Этот ключ действует только в офисе. Откройте внутренний адрес календаря или запросите удалённый доступ.",
+                    "remote-disabled": "Организация отключила удалённый вход. Подключитесь к офисной сети и откройте внутренний адрес календаря."
+                };
+                clearWorkspace(messages[restriction] || prompts.denied);
                 throw new Problem();
             }
             if (response.status === 503 && response.headers.get("x-godovoy-standby") === "unavailable") {
@@ -173,9 +191,10 @@
         el("logout").hidden = false;
         el("workspace").hidden = false;
         el("account").textContent = (ownerName(state.employeeId) || "Сотрудник") +
+            (state.assignedOnly ? " · Только назначенные события" : "") +
             (state.canEdit ? "" : " · Только чтение");
         el("calendar-name").textContent = state.workspaceName;
-        el("create").hidden = !state.canEdit;
+        el("create").hidden = !state.canEdit || state.assignedOnly === true;
         renderList();
     }
     function ownerName(id) {
@@ -242,7 +261,8 @@
         body.append(element("p", [fullDate.format(isoDate(event.date)), categories[event.category],
             event.yearly ? "Каждый год" : "", ownerName(event.ownerId)].filter(Boolean).join(" · "), "sub"));
         body.append(element("p", "Начало подготовки — " + fullDate.format(isoDate(event.preparationDate))));
-        if (event.description) body.append(element("p", event.description, "description"));
+        const freeText = state.allowFreeText !== false;
+        if (freeText && event.description) body.append(element("p", event.description, "description"));
         const tasks = section("Чек-лист");
         if (!event.checklist.length) tasks.append(element("p", "Пунктов пока нет.", "sub"));
         for (const task of event.checklist) {
@@ -262,12 +282,17 @@
             tasks.append(row);
         }
         body.append(tasks);
-        const notes = section("Дневник");
-        notes.append(element("p", event.note || "Записей пока нет.", event.note ? "description" : "sub"));
-        body.append(notes);
-        if (state.canEdit) {
+        if (freeText) {
+            const notes = section("Дневник");
+            notes.append(element("p", event.note || "Записей пока нет.", event.note ? "description" : "sub"));
+            body.append(notes);
+        } else {
+            body.append(element("p", "Организация отключила описания и дневник.", "sub"));
+        }
+        if (state.canEdit && (freeText || !state.assignedOnly)) {
             const actions = element("div", undefined, "actions");
-            actions.append(button("Запись в дневнике", () => noteEditor(event)), button("Изменить событие", () => editor(event)));
+            if (freeText) actions.append(button("Запись в дневнике", () => noteEditor(event)));
+            if (!state.assignedOnly) actions.append(button("Изменить событие", () => editor(event)));
             body.append(actions);
         }
     }
@@ -327,6 +352,7 @@
         });
     }
     function editor(event) {
+        if (!state?.canEdit || state.assignedOnly) return;
         const form = formFor(event ? "Изменить событие" : "Новое событие");
         const title = control(form, "Название", input("text", event?.title || ""));
         title.maxLength = 160;
@@ -349,7 +375,8 @@
         const repeat = element("label", undefined, "task");
         repeat.append(yearly, element("span", "Повторять каждый год"));
         form.append(repeat);
-        const description = control(form, "Описание", textArea(event?.description || ""));
+        const description = state.allowFreeText === false ? null : control(form, "Описание", textArea(event?.description || ""));
+        if (!description) form.append(element("p", "Организация отключила описания и дневник.", "sub"));
         const checklist = section("Чек-лист");
         const rows = element("div", undefined, "section");
         const drafted = new Map();
@@ -391,7 +418,7 @@
             }
             const command = {op: event ? "editEvent" : "createEvent", title: title.value.trim(), date: date.value,
                 yearly: yearly.checked, category: category.value, ownerId: owner.value || null,
-                preparationDays: prep.valueAsNumber, description: description.value, checklist: tasks};
+                preparationDays: prep.valueAsNumber, description: description?.value || "", checklist: tasks};
             if (event) Object.assign(command, target(event), {scope: scope?.value || "future", revision: event.revision});
             save(command, null, Number(date.value.slice(0, 4)));
         });
