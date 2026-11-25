@@ -4,8 +4,8 @@ use super::{Host, Mode, actions, commit_command, standby_unavailable, unavailabl
 use axum::{
     Json,
     body::Bytes,
-    extract::{OriginalUri, State},
-    http::{HeaderMap, StatusCode, header},
+    extract::State,
+    http::{HeaderMap, StatusCode, Uri, header},
     response::{IntoResponse, Response},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -326,7 +326,7 @@ fn accepts(headers: &HeaderMap, mime: &str) -> bool {
 
 pub(super) async fn handle(
     State(host): State<Host>,
-    OriginalUri(uri): OriginalUri,
+    uri: Uri,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
