@@ -131,6 +131,7 @@ impl Views {
         source.update(credential.as_bytes());
         source.update(today.num_days_from_ce().to_be_bytes());
         source.update(context.policy_revision.to_be_bytes());
+        source.update([u8::from(context.offer_overview)]);
         serde_json::to_writer(&mut source, context)?;
         Ok(source)
     }
@@ -208,14 +209,72 @@ impl Views {
         &self,
         credential: Id,
         view: &CalendarView<'_>,
+        today: NaiveDate,
     ) -> Fallible<HeaderValue> {
         let mut digest = self.tag_hasher(credential);
+        if view.is_overview() {
+            // A compact index and its details share an opaque snapshot tag.
+            // Bind it to authorized detail content while separating it from full JSON.
+            digest.update(b"overview-v1\0");
+            digest.update(today.num_days_from_ce().to_be_bytes());
+            digest.update(view.policy_revision().to_be_bytes());
+        }
         {
             let mut writer = BufWriter::new(&mut digest);
             serde_json::to_writer(&mut writer, view)?;
             writer.flush()?;
         }
         Self::tag(digest)
+    }
+
+    fn with_source<T>(
+        &self,
+        bytes: Vec<u8>,
+        read: impl FnOnce(&Data) -> Fallible<T>,
+    ) -> Fallible<T> {
+        let mut cached = self.source.lock().map_err(|_| "Ошибка чтения календаря.")?;
+        if (MIN_SHARED_SOURCE..=MAX_SHARED_SOURCE).contains(&bytes.len()) {
+            return read(&DecodedSource::load(&mut cached, bytes)?.calendar);
+        }
+        *cached = None;
+        drop(cached);
+        let data = serde_json::from_slice(&bytes)?;
+        drop(bytes);
+        read(&data)
+    }
+
+    pub(super) fn detail(
+        &self,
+        credential: Id,
+        context: ViewContext<'_>,
+        today: NaiveDate,
+        file: CalendarFile<'_>,
+        base: HeaderValue,
+        target: (Id, i32),
+    ) -> Fallible<Response> {
+        let bytes = file.into_bytes()?;
+        let key = Self::source_key(
+            &Self::input_hasher(credential, &context, today)?,
+            InputHasher::digest(&bytes).into(),
+        );
+        let known = self.lookup(&key)?;
+        self.with_source(bytes, |data| {
+            let view = context.render(data, today);
+            if !view.is_overview()
+                || match known {
+                    Some(tag) => tag != base,
+                    None => self.view_tag(credential, &view, today)? != base,
+                }
+            {
+                return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+            }
+            let Some(event) = view.event(target.0, target.1) else {
+                return Ok(StatusCode::NOT_FOUND.into_response());
+            };
+            let mut response = json_body(serde_json::to_vec(event)?);
+            response.headers_mut().insert("x-godovoy-state-tag", base);
+            Ok(response)
+        })
     }
 
     pub(super) fn data_for_write(
@@ -349,46 +408,59 @@ impl Views {
                 && let Some(previous) = self.lookup(&Self::source_key(&scope, change.before))?
                 && previous == *base
             {
-                let mut cached;
-                let local;
-                let calendar = if (MIN_SHARED_SOURCE..=MAX_SHARED_SOURCE).contains(&data.len()) {
-                    cached = self.source.lock().map_err(|_| "Ошибка чтения календаря.")?;
-                    &DecodedSource::load(&mut cached, data)?.calendar
-                } else {
-                    *self.source.lock().map_err(|_| "Ошибка чтения календаря.")? = None;
-                    local = serde_json::from_slice(&data)?;
-                    drop(data);
-                    &local
-                };
-                let view = context.render(calendar, today);
-                let tag = match &known {
-                    Some(view) => view.tag.clone(),
-                    None => self.view_tag(credential, &view)?,
-                };
-                self.remember(key, tag.clone())?;
-                if tag == previous {
-                    return Ok(tagged(StatusCode::NOT_MODIFIED.into_response(), tag));
-                }
-                let receipt = view.changed_event(change.event);
-                if receipt.has_visible_rows() {
-                    let mut response = axum::Json(receipt).into_response();
-                    response
-                        .headers_mut()
-                        .insert("x-godovoy-delta-base", previous);
-                    response.headers_mut().insert("x-godovoy-state-tag", tag);
-                    response
-                        .headers_mut()
-                        .insert(header::VARY, HeaderValue::from_static(VARY));
-                    return Ok(response);
-                }
-                // Absence is ambiguous for an adjacent-year task. Send this
-                // employee's complete representation without naming a hidden event.
-                let body = serde_json::to_vec(&view)?;
-                return Ok(tagged(
-                    ([(header::CONTENT_TYPE, "application/json")], body).into_response(),
-                    tag,
-                ));
+                return self.with_source(data, |calendar| {
+                    let view = context.render(calendar, today);
+                    let tag = match &known {
+                        Some(view) => view.tag.clone(),
+                        None => self.view_tag(credential, &view, today)?,
+                    };
+                    self.remember(key, tag.clone())?;
+                    if tag == previous {
+                        return Ok(tagged(StatusCode::NOT_MODIFIED.into_response(), tag));
+                    }
+                    let receipt = view.changed_event(change.event);
+                    if receipt.has_visible_rows() {
+                        let mut response = if view.is_overview() {
+                            json_body(view.encode_change(change.event, None)?)
+                        } else {
+                            axum::Json(receipt).into_response()
+                        };
+                        response
+                            .headers_mut()
+                            .insert("x-godovoy-delta-base", previous);
+                        response.headers_mut().insert("x-godovoy-state-tag", tag);
+                        response
+                            .headers_mut()
+                            .insert(header::VARY, HeaderValue::from_static(VARY));
+                        return Ok(response);
+                    }
+                    // Absence is ambiguous for an adjacent-year task. Send this
+                    // employee's complete representation without naming a hidden event.
+                    render_state(&view, tag)
+                });
             }
+        }
+        if context.offer_overview {
+            return self.with_source(data, |calendar| {
+                let view = context.render(calendar, today);
+                let tag = match known {
+                    Some(view) => view.tag,
+                    None => self.view_tag(credential, &view, today)?,
+                };
+                self.store(
+                    key,
+                    CachedView {
+                        tag: tag.clone(),
+                        body_len: None,
+                    },
+                    hint,
+                )?;
+                if matches_tag(condition, &tag) {
+                    Ok(tagged(StatusCode::NOT_MODIFIED.into_response(), tag))
+                } else {
+                    render_state(&view, tag)
+                }
+            });
         }
         let expected_len = known.as_ref().and_then(|view| view.body_len);
         // Keep the parsed document and rows alive through validator generation on a
@@ -440,7 +512,22 @@ impl Views {
     }
 }
 
-const VARY: &str = "Authorization, X-Godovoy-Delta, If-None-Match";
+const VARY: &str = "Authorization, X-Godovoy-Delta, X-Godovoy-View, If-None-Match";
+
+pub(super) fn json_body(body: Vec<u8>) -> Response {
+    ([(header::CONTENT_TYPE, "application/json")], body).into_response()
+}
+
+fn render_state(view: &CalendarView<'_>, tag: HeaderValue) -> Fallible<Response> {
+    let mut response = json_body(view.encode()?);
+    if view.is_overview() {
+        // Intermediaries may weaken a compressed representation's HTTP ETag.
+        response
+            .headers_mut()
+            .insert("x-godovoy-state-tag", tag.clone());
+    }
+    Ok(tagged(response, tag))
+}
 
 fn tagged(mut response: Response, tag: HeaderValue) -> Response {
     response.headers_mut().insert(header::ETAG, tag);

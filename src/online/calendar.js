@@ -25,6 +25,7 @@
     let lastVerified = 0;
     let lastLoaded = 0;
     let requestNumber = 0;
+    let detailNumber = 0;
     let heartbeatRunning = false;
     let heartbeatTimer = null;
     let leaseTimer = null;
@@ -34,6 +35,7 @@
     let limit = 80;
     let state = null;
     let stateTag = null;
+    let overviewEnabled = true;
     let writing = false;
     let loginPending = false;
     let secure = false;
@@ -62,6 +64,7 @@
             : "";
     }
     function closeSheet() {
+        detailNumber++;
         const dialog = el("sheet");
         const origin = dialog.dataset.origin;
         delete dialog.dataset.origin;
@@ -128,7 +131,7 @@
             Math.max(0, lastVerified + leaseMs - performance.now()));
     }
 
-    async function api(path, {body, data = false, validator = null, receipt = null, read = null, head = false} = {}) {
+    async function api(path, {body, data = false, validator = null, receipt = null, read = null, head = false, detailBase = null} = {}) {
         const epoch = generation;
         if (!credential || document.hidden) throw new Problem();
         const started = performance.now();
@@ -139,6 +142,10 @@
         try {
             const headers = {Authorization: "Bearer " + credential};
             if (body !== undefined) headers["Content-Type"] = "application/json";
+            if (overviewEnabled && (path.startsWith("/v1/state?") || path === "/v1/command")) {
+                headers["X-Godovoy-View"] = "overview-v1";
+            }
+            if (detailBase) headers["If-Match"] = detailBase;
             if (receipt) {
                 headers["X-Godovoy-Base"] = receipt.tag;
                 headers["X-Godovoy-Year"] = String(receipt.year);
@@ -202,6 +209,7 @@
                 clearWorkspace(writing ? prompts.uncertain : "Календарь временно недоступен. Дождитесь возврата основного сервера и войдите снова.");
                 throw new Problem();
             }
+            if (detailBase && (response.status === 412 || response.status === 404)) return {stale: true};
             if (!authorized) {
                 if (response.status >= 500 || body === undefined) throw new Error("Connection unavailable");
                 const problem = await response.json();
@@ -219,7 +227,7 @@
                 throw new Error("Unexpected response from calendar host");
             }
             const base = response.headers.get("x-godovoy-delta-base");
-            const viewTag = base === null ? tag : response.headers.get("x-godovoy-state-tag");
+            const viewTag = response.headers.get("x-godovoy-state-tag") || tag;
             // Only an authenticated, versioned calendar body may outlive the short request timeout.
             const extended = read && !head && expectJson && validTag(viewTag);
             if (extended) {
@@ -275,6 +283,11 @@
         for (let attempt = 0; attempt < 2; attempt++) {
             response = await api(path, {data: true, validator: attempt === 0 ? validator : null, read});
             if (number !== requestNumber) throw new Problem();
+            if (overviewEnabled && response.value?.overview === true && !/^"[0-9a-f]{64}"$/.test(response.tag || "")) {
+                overviewEnabled = false;
+                response = null;
+                continue;
+            }
             if (response.slow) {
                 if (!state) el("gate-status").textContent = "Проверяем актуальность календаря…";
                 const proof = await api(path, {data: true, validator: response.tag, read, head: true});
@@ -300,7 +313,11 @@
             return;
         }
         const next = response.value;
-        if (response.base !== undefined || !next || next.year !== year || !Array.isArray(next.events) || !Array.isArray(next.employees) || !Array.isArray(next.tasks)) {
+        if (response.base !== undefined || !next || next.year !== year || !Array.isArray(next.events) ||
+            !Array.isArray(next.employees) || !Array.isArray(next.tasks) ||
+            (next.overview === true && !(/^"[0-9a-f]{64}"$/.test(response.tag || "") &&
+                next.events.every(row => validOverview(row, false)) &&
+                next.tasks.every(row => validOverview(row, true))))) {
             clearWorkspace("Компьютер компании вернул несовместимую версию календаря.");
             throw new Problem();
         }
@@ -319,12 +336,14 @@
         return state?.employees.find((person) => person.id === id)?.name || "";
     }
     function visibleEvents() { return mode === "all" ? state.events : state.tasks; }
-    function showProgress(counter, checklist) {
-        const done = checklist.reduce((count, task) => count + Number(task.done), 0);
-        const label = done + "/" + checklist.length;
+    function taskCount(event) { return event.checklist?.length ?? event.total; }
+    function showProgress(counter, event) {
+        const done = event.completed ?? event.checklist.reduce((count, task) => count + Number(task.done), 0);
+        const total = taskCount(event);
+        const label = done + "/" + total;
         if (counter.textContent === label) return;
         counter.textContent = label;
-        counter.setAttribute("aria-label", "Выполнено " + done + " из " + checklist.length);
+        counter.setAttribute("aria-label", "Выполнено " + done + " из " + total);
     }
     function localDay() {
         const now = new Date();
@@ -333,8 +352,8 @@
     }
     function personalRows(events) {
         return events.map(event => {
-            let next = null;
-            for (const task of event.checklist) {
+            let next = event.next || null;
+            for (const task of event.checklist || []) {
                 if (!task.done && (!next || task.dueDate < next.dueDate)) next = task;
             }
             return {event, next, due: next?.dueDate || event.date};
@@ -391,7 +410,7 @@
                 const item = element("li");
                 const open = button("", () => {
                     el("sheet").dataset.origin = open.id;
-                    detail(entry ? event : visibleEvents()[i], entry?.next?.id);
+                    openCard(entry ? event : visibleEvents()[i], entry?.next?.id);
                 }, entry ? "event personal" : "event");
                 open.id = (entry ? "personal-" : "annual-") + event.id + "-" + event.year;
                 const stamp = element("time", dateLabel.format(date), "date");
@@ -409,10 +428,10 @@
                         [categories[event.category], ownerName(event.ownerId)].filter(Boolean).join(" · "), "sub"));
                 }
                 open.append(summary);
-                if (!entry && event.checklist.length) {
+                if (!entry && taskCount(event)) {
                     const counter = element("span", "", "count");
                     counter.id = "progress-" + i;
-                    showProgress(counter, event.checklist);
+                    showProgress(counter, event);
                     open.append(counter);
                 }
                 item.append(open);
@@ -443,6 +462,43 @@
         return block;
     }
     function target(event) { return {eventId: event.id, year: event.year}; }
+    function currentEvent(row) {
+        return state?.events.find(e => e.id === row.id && e.year === row.year) ||
+            state?.tasks.find(e => e.id === row.id && e.year === row.year);
+    }
+    async function openCard(row, taskId, mayReload = true) {
+        if (!row || !state) return;
+        if (!state.overview) { detail(row, taskId); return; }
+        const request = ++detailNumber;
+        const year = currentYear, tag = stateTag, epoch = generation;
+        const sameSheet = () => request === detailNumber && epoch === generation &&
+            currentYear === year && el("sheet").open && !document.hidden;
+        const loading = element("p", "Загружаем карточку…", "sub");
+        loading.setAttribute("role", "status");
+        sheet(row.title).append(loading);
+        try {
+            const path = "/v1/event?year=" + year + "&eventYear=" + row.year + "&id=" + encodeURIComponent(row.id);
+            const reply = await api(path, {data: true, detailBase: tag});
+            if (!sameSheet()) return;
+            if (reply.stale || stateTag !== tag) {
+                if (!mayReload) { closeSheet(); return; }
+                if (stateTag === tag) await load(year);
+                if (!sameSheet()) return;
+                const fresh = currentEvent(row);
+                if (fresh) await openCard(fresh, taskId, false);
+                else closeSheet();
+                return;
+            }
+            if (reply.tag !== tag || reply.value?.year !== row.year ||
+                !validFullEvent(reply.value, row.id, row.ownerId)) {
+                clearWorkspace("Компьютер компании вернул несовместимую карточку.");
+                return;
+            }
+            detail(reply.value, taskId);
+        } catch {
+            if (sameSheet()) closeSheet();
+        }
+    }
     function detail(event, taskId) {
         let focusTarget;
         const body = sheet(event.title);
@@ -648,37 +704,46 @@
             if (before === after) continue;
             if (before.id !== after.id || before.year !== after.year || before.date !== after.date ||
                 before.title !== after.title || before.category !== after.category || before.ownerId !== after.ownerId ||
-                before.checklist.length !== after.checklist.length) return renderList();
+                taskCount(before) !== taskCount(after)) return renderList();
             const counter = document.getElementById("progress-" + i);
-            if (counter) showProgress(counter, after.checklist);
+            if (counter) showProgress(counter, after);
         }
+    }
+
+    const uuid = value => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
+    const date = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
+    const count = value => Number.isSafeInteger(value) && value >= 0;
+    function validRow(event) {
+        return uuid(event?.id) && Number.isInteger(event.year) && event.year >= 1900 && event.year <= 9999 &&
+            typeof event.title === "string" && Object.hasOwn(categories, event.category) && date(event.date) &&
+            (event.ownerId === null || uuid(event.ownerId));
+    }
+    function validOverview(event, personal) {
+        return validRow(event) && count(event.completed) && count(event.total) && event.completed <= event.total &&
+            !Object.hasOwn(event, "note") && !Object.hasOwn(event, "description") && !Object.hasOwn(event, "checklist") &&
+            (event.next === undefined || (personal && uuid(event.next?.id) &&
+                typeof event.next.title === "string" && date(event.next.dueDate)));
+    }
+    function validFullEvent(event, id, owner) {
+        if (!validRow(event) || event.id !== id || typeof event.note !== "string" || typeof event.description !== "string" ||
+            !date(event.preparationDate) || !count(event.preparationDays) || typeof event.yearly !== "boolean" ||
+            typeof event.revision !== "string" || !/^\d+:[a-f0-9-]{36}$/.test(event.revision) ||
+            !Array.isArray(event.checklist) || (state.assignedOnly && event.ownerId !== owner) ||
+            (state.allowFreeText === false && (event.note !== "" || event.description !== ""))) return false;
+        const ids = new Set();
+        for (const task of event.checklist) {
+            if (!uuid(task?.id) || ids.has(task.id) || typeof task.title !== "string" ||
+                typeof task.done !== "boolean" || !count(task.daysBefore) || !date(task.dueDate)) return false;
+            ids.add(task.id);
+        }
+        return true;
     }
 
     function applyReceipt(reply, id, year) {
         const receipt = reply?.value;
-        const uuid = value => typeof value === "string" && /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/.test(value);
-        const date = value => typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value);
-        const count = value => Number.isSafeInteger(value) && value >= 0;
         // Assigned-only rows in the authenticated snapshot use the resolved person ID.
         // A grant may still name one of that person's older device IDs.
         const assignedOwner = state.events[0]?.ownerId ?? state.tasks[0]?.ownerId ?? state.employeeId;
-        function validEvent(event) {
-            if (event?.id !== id || !Number.isInteger(event.year) || event.year < 1900 || event.year > 9999 ||
-                typeof event.title !== "string" || typeof event.note !== "string" || typeof event.description !== "string" ||
-                !Object.hasOwn(categories, event.category) || !date(event.date) || !date(event.preparationDate) ||
-                !count(event.preparationDays) || typeof event.yearly !== "boolean" ||
-                !(event.ownerId === null || uuid(event.ownerId)) || typeof event.revision !== "string" ||
-                !/^\d+:[a-f0-9-]{36}$/.test(event.revision) || !Array.isArray(event.checklist) ||
-                (state.assignedOnly && event.ownerId !== assignedOwner) ||
-                (state.allowFreeText === false && (event.note !== "" || event.description !== ""))) return false;
-            const ids = new Set();
-            for (const task of event.checklist) {
-                if (!uuid(task?.id) || ids.has(task.id) || typeof task.title !== "string" ||
-                    typeof task.done !== "boolean" || !count(task.daysBefore) || !date(task.dueDate)) return false;
-                ids.add(task.id);
-            }
-            return true;
-        }
         if (!uuid(id) || !receipt || receipt.id !== id || receipt.year !== year || !/^"[0-9a-f]{64}"$/.test(reply.tag || "")) return false;
         function replaceRows(previous, changes, annual) {
             if (!Array.isArray(changes)) return null;
@@ -687,10 +752,13 @@
             const rows = previous.filter(event => event.id !== id);
             let lastIndex = -1;
             for (const change of changes) {
+                const event = change?.event;
+                const valid = state.overview ? validOverview(event, !annual) && event.id === id &&
+                    (!state.assignedOnly || event.ownerId === assignedOwner) : validFullEvent(event, id, assignedOwner);
                 if (!Number.isInteger(change?.index) || change.index <= lastIndex || change.index > rows.length ||
-                    !validEvent(change.event) || (annual && change.event.year !== year) || years.has(change.event.year)) return null;
-                years.add(change.event.year);
-                rows.splice(change.index, 0, change.event);
+                    !valid || (annual && event.year !== year) || years.has(event.year)) return null;
+                years.add(event.year);
+                rows.splice(change.index, 0, event);
                 lastIndex = change.index;
             }
             return rows;
@@ -722,15 +790,21 @@
             const reply = await api("/v1/command", {body: command, receipt});
             if (epoch !== generation || document.hidden) return;
             writing = false;
-            if (!receipt || state !== prior || stateTag !== receipt.tag || !applyReceipt(reply, command.eventId, year)) {
+            const applied = receipt && state === prior && stateTag === receipt.tag && applyReceipt(reply, command.eventId, year);
+            if (!applied) {
                 await load(year);
             }
             if (epoch !== generation) return;
-            const fresh = reopen && (state.events.find(e => e.id === reopen.id && e.year === reopen.year) ||
-                state.tasks.find(e => e.id === reopen.id && e.year === reopen.year));
+            const fresh = reopen && currentEvent(reopen);
             if (fresh) {
                 el("sheet-body").inert = false;
-                detail(fresh, command.op === "check" ? command.taskId : undefined);
+                const task = command.op === "check" ? command.taskId : undefined;
+                const updated = applied && reply.value?.detail;
+                if (state.overview && updated?.year === fresh.year && validFullEvent(updated, fresh.id, fresh.ownerId)) {
+                    detail(updated, task);
+                } else {
+                    await openCard(fresh, task);
+                }
             }
             else closeSheet();
             notice("Изменение сохранено на компьютере компании.");

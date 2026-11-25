@@ -99,6 +99,8 @@ struct Employee<'a> {
 pub(crate) struct ViewContext<'a> {
     #[serde(skip)]
     pub(crate) policy_revision: u64,
+    #[serde(skip)]
+    pub(crate) offer_overview: bool,
     workspace_name: &'a str,
     employee_id: Id,
     employees: Vec<Employee<'a>>,
@@ -129,6 +131,101 @@ struct ChangedRow<'v, 'a> {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct NextTask<'a> {
+    id: Id,
+    title: &'a str,
+    due_date: NaiveDate,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct OverviewRow<'a> {
+    id: Id,
+    year: i32,
+    title: &'a str,
+    date: NaiveDate,
+    category: Category,
+    owner_id: Option<Id>,
+    completed: usize,
+    total: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next: Option<NextTask<'a>>,
+}
+
+impl<'a> OverviewRow<'a> {
+    fn from_event(event: &EventView<'a>, personal: bool) -> Self {
+        let occurrence = event.checklist.0;
+        let mut completed = 0;
+        let mut next: Option<NextTask<'_>> = None;
+        for task in &occurrence.event.tasks {
+            if occurrence.checked(task.id) {
+                completed += 1;
+            } else if personal {
+                let due_date = occurrence.due(task);
+                if next
+                    .as_ref()
+                    .is_none_or(|previous| due_date < previous.due_date)
+                {
+                    next = Some(NextTask {
+                        id: task.id,
+                        title: &task.title,
+                        due_date,
+                    });
+                }
+            }
+        }
+        Self {
+            id: event.id,
+            year: event.year,
+            title: event.title,
+            date: event.date,
+            category: event.category,
+            owner_id: event.owner_id,
+            completed,
+            total: occurrence.event.tasks.len(),
+            next,
+        }
+    }
+}
+
+struct OverviewRows<'v, 'a>(&'v [EventView<'a>], bool);
+impl Serialize for OverviewRows<'_, '_> {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_seq(
+            self.0
+                .iter()
+                .map(|row| OverviewRow::from_event(row, self.1)),
+        )
+    }
+}
+
+#[derive(Serialize)]
+struct Overview<'v, 'a> {
+    #[serde(flatten)]
+    context: &'v ViewContext<'a>,
+    overview: bool,
+    events: OverviewRows<'v, 'a>,
+    tasks: OverviewRows<'v, 'a>,
+}
+
+#[derive(Serialize)]
+struct OverviewChange<'v, 'a> {
+    id: Id,
+    year: i32,
+    events: Vec<OverviewChangeRow<'a>>,
+    tasks: Vec<OverviewChangeRow<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'v EventView<'a>>,
+}
+
+#[derive(Serialize)]
+struct OverviewChangeRow<'a> {
+    index: usize,
+    event: OverviewRow<'a>,
+}
+
+#[derive(Serialize)]
 pub(crate) struct ChangedEvent<'v, 'a> {
     id: Id,
     year: i32,
@@ -143,6 +240,64 @@ impl ChangedEvent<'_, '_> {
 }
 
 impl<'a> CalendarView<'a> {
+    pub(crate) fn is_overview(&self) -> bool {
+        // A check or a note can add/remove personal tasks without changing the
+        // number of annual rows. The representation therefore stays stable for deltas.
+        self.context.offer_overview && self.events.len() >= 80
+    }
+
+    pub(crate) fn policy_revision(&self) -> u64 {
+        self.context.policy_revision
+    }
+
+    pub(crate) fn event(&self, id: Id, year: i32) -> Option<&EventView<'a>> {
+        self.events
+            .iter()
+            .chain(&self.tasks)
+            .find(|event| event.id == id && event.year == year)
+    }
+
+    pub(crate) fn encode(&self) -> serde_json::Result<Vec<u8>> {
+        if self.is_overview() {
+            serde_json::to_vec(&Overview {
+                context: &self.context,
+                overview: true,
+                events: OverviewRows(&self.events, false),
+                tasks: OverviewRows(&self.tasks, true),
+            })
+        } else {
+            serde_json::to_vec(self)
+        }
+    }
+
+    pub(crate) fn encode_change(
+        &self,
+        id: Id,
+        detail_year: Option<i32>,
+    ) -> serde_json::Result<Vec<u8>> {
+        if !self.is_overview() {
+            return serde_json::to_vec(&self.changed_event(id));
+        }
+        let rows = |events: &[EventView<'a>], personal| {
+            events
+                .iter()
+                .enumerate()
+                .filter(|(_, row)| row.id == id)
+                .map(|(index, row)| OverviewChangeRow {
+                    index,
+                    event: OverviewRow::from_event(row, personal),
+                })
+                .collect()
+        };
+        serde_json::to_vec(&OverviewChange {
+            id,
+            year: self.context.year,
+            events: rows(&self.events, false),
+            tasks: rows(&self.tasks, true),
+            detail: detail_year.and_then(|year| self.event(id, year)),
+        })
+    }
+
     pub(crate) fn changed_event(&self, id: Id) -> ChangedEvent<'_, 'a> {
         fn rows<'v, 'a>(events: &'v [EventView<'a>], id: Id) -> Vec<ChangedRow<'v, 'a>> {
             events
@@ -177,6 +332,7 @@ impl<'a> ViewContext<'a> {
             .collect();
         Self {
             policy_revision: acl.protection().revision,
+            offer_overview: false,
             workspace_name: &acl.name,
             employee_id: employee,
             employees,
@@ -185,6 +341,11 @@ impl<'a> ViewContext<'a> {
             assigned_only,
             year,
         }
+    }
+
+    pub(crate) fn offer_overview(mut self, offer: bool) -> Self {
+        self.offer_overview = offer && !self.assigned_only;
+        self
     }
 
     pub(crate) fn public_rows_key(&self) -> Option<PublicYear> {

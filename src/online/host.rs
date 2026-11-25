@@ -405,6 +405,21 @@ where
 struct Year {
     year: i32,
 }
+fn overview_requested(headers: &HeaderMap) -> bool {
+    let mut values = headers.get_all("x-godovoy-view").iter();
+    values.next().is_some_and(|value| value == "overview-v1") && values.next().is_none()
+}
+
+fn exact_tag(value: &HeaderValue) -> bool {
+    value.to_str().ok().is_some_and(|text| {
+        text.strip_prefix('"')
+            .and_then(|t| t.strip_suffix('"'))
+            .is_some_and(|digest| {
+                digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+    })
+}
+
 async fn state(
     State(host): State<Host>,
     headers: HeaderMap,
@@ -414,6 +429,7 @@ async fn state(
         return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
     }
     let views = host.views.clone();
+    let offer_overview = overview_requested(&headers);
     let accept_delta = headers
         .get("x-godovoy-delta")
         .is_some_and(|v| v == "event-v1");
@@ -427,7 +443,8 @@ async fn state(
         headers,
         AuthOperation::View,
         move |lock, acl, id, employee, edit, mode| {
-            let context = actions::ViewContext::new(acl, query.year, employee, edit);
+            let context = actions::ViewContext::new(acl, query.year, employee, edit)
+                .offer_overview(offer_overview);
             let Ok(data) = lock.open_data() else {
                 return unavailable();
             };
@@ -468,6 +485,76 @@ async fn state(
     )
     .await
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventDetail {
+    year: i32,
+    event_year: i32,
+    id: Id,
+}
+
+async fn event_detail(
+    State(host): State<Host>,
+    headers: HeaderMap,
+    Query(query): Query<EventDetail>,
+) -> Response {
+    if !(1900..=9999).contains(&query.year) || !(1900..=9999).contains(&query.event_year) {
+        return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
+    }
+    let base = {
+        let mut values = headers.get_all(header::IF_MATCH).iter();
+        values
+            .next()
+            .filter(|value| exact_tag(value) && values.next().is_none())
+            .cloned()
+    };
+    let views = host.views.clone();
+    with_auth(
+        host,
+        headers,
+        AuthOperation::View,
+        move |lock, acl, credential, employee, edit, mode| {
+            let Some(base) = base else {
+                return problem(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "Обновите год перед открытием карточки.",
+                );
+            };
+            let context =
+                actions::ViewContext::new(acl, query.year, employee, edit).offer_overview(true);
+            let Ok(data) = lock.open_data() else {
+                return unavailable();
+            };
+            let today = chrono::Local::now().date_naive();
+            let Ok(response) = views.detail(
+                credential,
+                context,
+                today,
+                data,
+                base,
+                (query.id, query.event_year),
+            ) else {
+                return unavailable();
+            };
+            if lock
+                .audit_security("state_requested", Some(credential), Some(employee), None)
+                .is_err()
+            {
+                return unavailable();
+            }
+            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                return standby_unavailable();
+            }
+            if chrono::Local::now().date_naive() != today {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            response
+        },
+    )
+    .await
+}
+
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
     with_auth(
         host,
@@ -496,6 +583,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
         );
     }
     let views = host.views.clone();
+    let offer_overview = overview_requested(&headers);
     let receipt = headers
         .get("x-godovoy-base")
         .zip(headers.get("x-godovoy-year"))
@@ -521,9 +609,16 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             };
             let today = chrono::Local::now().date_naive();
             let receipt = receipt.and_then(|(base, year)| match &cmd {
-                Command::Check { event_id, .. } | Command::Note { event_id, .. } => {
-                    Some((base, year, *event_id))
+                Command::Check {
+                    event_id,
+                    year: detail_year,
+                    ..
                 }
+                | Command::Note {
+                    event_id,
+                    year: detail_year,
+                    ..
+                } => Some((base, year, *event_id, *detail_year)),
                 _ => None,
             });
             let Ok(raw) = lock.data_bytes() else {
@@ -532,17 +627,24 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             let Ok((mut data, original)) = views.data_for_write(&raw) else {
                 return unavailable();
             };
-            let receipt = receipt.and_then(|(base, year, event)| {
-                let context = actions::ViewContext::new(acl, year, employee, can_edit);
+            let receipt = receipt.and_then(|(base, year, event, detail_year)| {
+                let context = actions::ViewContext::new(acl, year, employee, can_edit)
+                    .offer_overview(offer_overview);
                 let source = conditional::Views::input_hasher(credential, &context, today).ok()?;
                 let before = conditional::InputHasher::digest(&raw).into();
                 let original = conditional::Views::source_key(&source, before);
                 let tag = views.lookup(&original).ok().flatten().or_else(|| {
                     views
-                        .view_tag(credential, &context.render(&data, today))
+                        .view_tag(credential, &context.render(&data, today), today)
                         .ok()
                 })?;
-                (tag.as_bytes() == base.as_bytes()).then_some((year, source, event, before))
+                (tag.as_bytes() == base.as_bytes()).then_some((
+                    year,
+                    source,
+                    event,
+                    detail_year,
+                    before,
+                ))
             });
             drop(raw);
             if let Some(response) =
@@ -551,7 +653,7 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
                 views.restore_after_failure(original);
                 return response;
             }
-            let Some((year, source, event, before)) = receipt else {
+            let Some((year, source, event, detail_year, before)) = receipt else {
                 return match lock.save_data(&data) {
                     Ok(()) => {
                         views.transition(None);
@@ -583,15 +685,19 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             {
                 return unavailable();
             }
-            let context = actions::ViewContext::new(acl, year, employee, can_edit);
+            let context = actions::ViewContext::new(acl, year, employee, can_edit)
+                .offer_overview(offer_overview);
             let view = context.render(&data, today);
-            let Ok(tag) = views.view_tag(credential, &view) else {
+            let Ok(tag) = views.view_tag(credential, &view, today) else {
                 return unavailable();
             };
             if views.remember(key, tag.clone()).is_err() {
                 return unavailable();
             }
-            let mut reply = Json(view.changed_event(event)).into_response();
+            let Ok(receipt) = view.encode_change(event, Some(detail_year)) else {
+                return unavailable();
+            };
+            let mut reply = conditional::json_body(receipt);
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
             }
@@ -706,6 +812,7 @@ pub fn router(host: Host) -> Router {
         .route("/mcp", post(mcp::handle))
         .route("/v1/session", get(session))
         .route("/v1/state", get(state))
+        .route("/v1/event", get(event_detail))
         .route("/v1/command", post(command))
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn_with_state(host.clone(), headers))

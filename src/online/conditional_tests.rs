@@ -181,12 +181,131 @@ mod conditional_tests {
         (tag, serde_json::from_slice(&bytes).unwrap())
     }
 
+    #[tokio::test]
+    async fn overview_detail_is_bound_to_the_visible_year_snapshot() {
+        let f = Fixture::new();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let event = {
+            let lock = f.vault.lock().unwrap();
+            let mut data = lock.data().unwrap();
+            let (&id, plan) = data.calendar.plans.first_key_value().unwrap();
+            let plan = plan.clone();
+            for _ in 0..79 {
+                data.calendar.plans.insert(Id::new_v4(), plan.clone());
+            }
+            lock.save_data(&data).unwrap();
+            id
+        };
+        let (_, _, other) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant("Читатель", None, true)
+            .unwrap();
+        let index = || async {
+            let built = Request::builder()
+                .uri("/v1/state?year=2028")
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {}", f.key))
+                .header("x-godovoy-view", "overview-v1")
+                .body(Body::empty())
+                .unwrap();
+            snapshot(f.app.clone().oneshot(built).await.unwrap()).await
+        };
+        async fn detail(f: &Fixture, event: Id, key: &str, tag: &str) -> Response {
+            let built = Request::builder()
+                .uri(format!("/v1/event?year=2028&eventYear=2028&id={event}"))
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .header(header::IF_MATCH, tag)
+                .body(Body::empty())
+                .unwrap();
+            f.app.clone().oneshot(built).await.unwrap()
+        }
+        let (legacy, old) = snapshot(get(&f, 2028, &f.key, &[]).await).await;
+        let (tag, overview) = index().await;
+        assert_ne!(legacy, tag);
+        assert_eq!(overview["overview"], true);
+        assert_eq!(overview["events"].as_array().unwrap().len(), 80);
+        assert!(overview["events"][0].get("checklist").is_none());
+        assert_eq!(
+            detail(&f, event, &other, &tag).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        assert_eq!(
+            detail(&f, event, &f.key, &legacy).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let card = detail(&f, event, &f.key, &tag).await;
+        assert_eq!(card.status(), StatusCode::OK);
+        assert_eq!(card.headers()["x-godovoy-state-tag"], tag);
+        assert_eq!(
+            serde_json::from_slice::<Value>(&to_bytes(card.into_body(), 65_536).await.unwrap())
+                .unwrap(),
+            *old["events"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|row| row["id"] == event.to_string())
+                .unwrap()
+        );
+        assert_eq!(
+            f.cmd(
+                json!({"op":"note","eventId":event,"year":2028,"base":"","text":"Отдельная запись"})
+            )
+            .await,
+            StatusCode::NO_CONTENT
+        );
+        let (fresh, summaries) = index().await;
+        assert_ne!(fresh, tag);
+        assert_eq!(overview, summaries);
+        assert_eq!(
+            detail(&f, event, &f.key, &tag).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    russia: true,
+                    allow_free_text: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            detail(&f, event, &f.key, &fresh).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+        let (restricted, _) = index().await;
+        let card = detail(&f, event, &f.key, &restricted).await;
+        assert_eq!(card.status(), StatusCode::OK);
+        let value: Value =
+            serde_json::from_slice(&to_bytes(card.into_body(), 65_536).await.unwrap()).unwrap();
+        assert_eq!(value["note"], "");
+        assert_eq!(value["description"], "");
+        f.vault
+            .lock()
+            .unwrap()
+            .set_employee_scope(f.employee, true)
+            .unwrap();
+        let (_, personal) = index().await;
+        assert_eq!(personal["events"].as_array().unwrap().len(), 80);
+        assert!(personal.get("overview").is_none());
+        assert_eq!(
+            detail(&f, event, &f.key, &restricted).await.status(),
+            StatusCode::PRECONDITION_FAILED
+        );
+    }
+
     async fn assert_unchanged(response: Response, tag: &str) {
         assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
         assert_eq!(response.headers()[header::ETAG], tag);
         assert_eq!(
             response.headers()[header::VARY],
-            "Authorization, X-Godovoy-Delta, If-None-Match"
+            "Authorization, X-Godovoy-Delta, X-Godovoy-View, If-None-Match"
         );
         assert!(
             response.headers()[header::CACHE_CONTROL]
