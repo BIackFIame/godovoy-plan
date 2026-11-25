@@ -56,12 +56,24 @@ impl Baselines {
     }
 
     fn confirm_with(&self, scope: PeerScope, digest: [u8; 32], revision: impl FnOnce() -> u64) {
-        if self.known(scope, digest).is_some() {
-            return;
+        // A canonical digest identifies the same revision for every recipient.
+        // Only the peer that confirmed it receives a new baseline entry below.
+        let mut confirmed_revision = None;
+        if let Ok(entries) = self.entries.lock() {
+            for entry in entries.iter().rev() {
+                if entry.digest == digest
+                    && entry.scope.workspace == scope.workspace
+                    && entry.scope.generation == scope.generation
+                {
+                    if entry.scope.device == scope.device {
+                        return;
+                    }
+                    confirmed_revision = Some(entry.revision);
+                }
+            }
         }
-        // Hashes and revision scans use immutable snapshots outside the cache lock.
-        // Racing confirmations can only cause the next exchange to use a full snapshot.
-        let revision = revision();
+        // Scan immutable data outside the lock on the first confirmation.
+        let revision = confirmed_revision.unwrap_or_else(revision);
         if let Ok(mut entries) = self.entries.lock() {
             entries.retain(|entry| entry.scope != scope);
             if entries.len() == MAX_PEERS {
@@ -340,6 +352,37 @@ mod tests {
         });
         cache.confirm_with(scope, [1; 32], || panic!("identical digest rescanned"));
         assert_eq!(cache.known(scope, [1; 32]), Some(7));
+    }
+
+    #[test]
+    fn revisions_are_shared_only_within_the_same_generation_after_confirmation() {
+        let cache = Baselines::default();
+        let first = PeerScope {
+            workspace: Id::new_v4(),
+            generation: 0,
+            device: Id::new_v4(),
+        };
+        let second = PeerScope {
+            device: Id::new_v4(),
+            ..first
+        };
+        let digest = [9; 32];
+        cache.confirm_with(first, digest, || 7);
+        assert_eq!(cache.known(second, digest), None);
+        cache.confirm_with(second, digest, || panic!("same digest was scanned again"));
+        assert_eq!(cache.known(second, digest), Some(7));
+        let next_generation = PeerScope {
+            generation: 1,
+            ..second
+        };
+        cache.confirm_with(next_generation, digest, || 11);
+        assert_eq!(cache.known(next_generation, digest), Some(11));
+        let other_workspace = PeerScope {
+            workspace: Id::new_v4(),
+            ..first
+        };
+        cache.confirm_with(other_workspace, digest, || 17);
+        assert_eq!(cache.known(other_workspace, digest), Some(17));
     }
 
     #[test]
