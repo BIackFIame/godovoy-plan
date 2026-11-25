@@ -1163,26 +1163,44 @@ impl App {
         }
         let date_width = 46.0;
         let row_height = 46.0;
-        let height = ui.available_height().max(140.0);
+        let available_height = ui.available_height();
+        let visible_rows = (available_height / row_height).floor().max(1.0) as usize;
+        let last_start = events.len().saturating_sub(visible_rows);
+        // At the end of the list egui clamps the offset to content height minus
+        // viewport height. A whole-row viewport keeps that boundary aligned.
+        let height = if last_start > 0 {
+            (visible_rows as f32 * row_height).min(available_height)
+        } else {
+            available_height
+        };
+        let list_id = "event-list";
         let mut scroll = ScrollArea::vertical()
-            .id_salt("event-list")
+            .id_salt(list_id)
             .max_height(height)
             .auto_shrink([false, false]);
-        let visible_rows = (height / row_height).floor().max(1.0) as usize;
         let month_start = |index: usize| {
             let month = events[index].date.month();
             events[..index].partition_point(|row| row.date.month() < month)
         };
-        if std::mem::take(&mut self.reveal_event)
-            && let Some(index) = events
-                .iter()
-                .position(|event| Some(event.id) == self.selected)
-        {
-            let first = month_start(index).max((index + 1).saturating_sub(visible_rows));
-            scroll = scroll.vertical_scroll_offset(first as f32 * row_height);
-        }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            if std::mem::take(&mut self.reveal_event)
+                && let Some(index) = events
+                    .iter()
+                    .position(|event| Some(event.id) == self.selected)
+            {
+                let first = month_start(index)
+                    .max((index + 1).saturating_sub(visible_rows))
+                    .min(last_start);
+                let id = ui.make_persistent_id(egui::Id::new(list_id));
+                // A deliberate reveal should stop an earlier drag's inertia.
+                if egui::scroll_area::State::load(ui.ctx(), id)
+                    .is_some_and(|state| state.velocity().y != 0.0)
+                {
+                    egui::scroll_area::State::default().store(ui.ctx(), id);
+                }
+                scroll = scroll.vertical_scroll_offset(first as f32 * row_height);
+            }
             scroll.show_rows(ui, row_height, events.len(), |ui, range| {
                 for event in &events[range] {
                     let active = self.selected == Some(event.id);
