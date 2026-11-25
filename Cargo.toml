@@ -50,7 +50,7 @@ axum = { optional = true, version = "0.8", default-features = false, features = 
 tower = { optional = true, version = "0.5", features = ["util"] }
 subtle = "2"
 tokio = { optional = true, version = "1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
-ureq = { optional = true, version = "3", default-features = false, features = ["native-tls", "json"] }
+ureq = { optional = true, version = "3", default-features = false, features = ["native-tls"] }
 base64 = "0.22"
 blake2 = "0.10"
 chacha20poly1305 = { version = "0.10", default-features = false }

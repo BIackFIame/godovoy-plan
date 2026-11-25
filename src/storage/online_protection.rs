@@ -4,7 +4,7 @@ use crate::Fallible;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, fs, io::ErrorKind};
 
-const REQUIRED: &str = "online-protection-required-v1.json";
+pub(super) const REQUIRED: &str = "online-protection-required-v1.json";
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

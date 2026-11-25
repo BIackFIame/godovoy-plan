@@ -14,6 +14,20 @@ fn setup() -> (TempDir, OnlineVault) {
 }
 
 #[test]
+fn journal_month_uses_utc_at_the_year_boundary() {
+    let journal = tempfile::NamedTempFile::new().unwrap();
+    fs::write(
+        journal.path(),
+        b"{\"at\":\"2027-01-01T01:00:00+02:00\",\"action\":\"grant_requested\"}\n",
+    )
+    .unwrap();
+    let month = |year, month| chrono::NaiveDate::from_ymd_opt(year, month, 1).unwrap();
+    assert!(validate_journal(journal.path(), month(2026, 12)).is_ok());
+    assert!(validate_journal(journal.path(), month(2027, 1)).is_err());
+    assert!(validate_journal(journal.path(), month(2027, 12)).is_err());
+}
+
+#[test]
 fn snapshot_includes_both_markers_and_renews_no_credentials() {
     let (temp, vault) = setup();
     let backup = temp.path().join("copy");

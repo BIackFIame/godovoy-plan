@@ -7,7 +7,7 @@ use super::{
 use super::super::access::{verify_profile_access, verify_staging_parent};
 use crate::Fallible;
 use blake2::{Blake2s256, Digest};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -21,8 +21,7 @@ use tempfile::{Builder, TempDir};
 const MANIFEST: &str = "backup-manifest-v1.json";
 const MANIFEST_LIMIT: usize = 512 * 1024;
 const MAX_PINNED_JOURNALS: usize = 64;
-const STANDBY: &str = "online-standby-v1.json";
-const PROTECTION: &str = "online-protection-required-v1.json";
+use super::{protection::REQUIRED as PROTECTION, standby::MARKER as STANDBY};
 
 #[derive(Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -195,7 +194,6 @@ fn publish(temp: TempDir, dest: &Path) -> Fallible<()> {
 
 fn validate_journal(path: &Path, month: chrono::NaiveDate) -> Fallible<()> {
     let mut reader = BufReader::new(private_file(path)?);
-    let month = month.format("%Y-%m").to_string();
     let mut line = Vec::new();
     loop {
         line.clear();
@@ -220,7 +218,7 @@ fn validate_journal(path: &Path, month: chrono::NaiveDate) -> Fallible<()> {
             _protection: Option<super::ProtectionState>,
         }
         let entry: Entry = serde_json::from_slice(&line)?;
-        if entry.at.format("%Y-%m").to_string() != month
+        if (entry.at.year(), entry.at.month()) != (month.year(), month.month())
             || entry.action.is_empty()
             || entry.action.len() > 128
         {

@@ -13,7 +13,7 @@ import tempfile
 import zipfile
 
 ROOT = Path(__file__).resolve().parents[2]
-DOCS = ("SERVER.md", "ONLINE.md", "ONLINE-API.md", "DATA-PROTECTION.md", "MCP.md")
+DOCS = ("SERVER.md", "ONLINE.md", "ONLINE-API.md", "API.md", "openapi.yaml", "DATA-PROTECTION.md", "MCP.md")
 LINUX_EXAMPLES = ("godovoy-calendar.service", "godovoy-office", "office.env.example",
                   "godovoy-backup.service", "godovoy-backup.timer")
 PLATFORMS = {

@@ -9,6 +9,5 @@ final class Core {
     static native long open(byte[] privatePath);
     static native byte[] openError();
     static native byte[] request(long handle, byte[] command);
-    static native void close(long handle);
     private Core() {}
 }

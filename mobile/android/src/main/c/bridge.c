@@ -8,7 +8,6 @@ extern uint8_t gp_valid_hosted_address(const uint8_t *, size_t);
 extern void *gp_open(const char *);
 extern char *gp_open_error(void);
 extern char *gp_request(void *, const char *);
-extern void gp_close(void *);
 extern void gp_string_free(char *);
 
 static char *copy_string(JNIEnv *env, jbyteArray value) {
@@ -63,12 +62,6 @@ JNIEXPORT jbyteArray JNICALL Java_local_godovoyplan_mobile_Core_request(JNIEnv *
     char *response = gp_request((void *)(intptr_t)handle, bytes);
     free(bytes);
     return response_bytes(env, response);
-}
-
-JNIEXPORT void JNICALL Java_local_godovoyplan_mobile_Core_close(JNIEnv *env, jclass cls, jlong handle) {
-    (void)env;
-    (void)cls;
-    if (handle) gp_close((void *)(intptr_t)handle);
 }
 
 JNIEXPORT jboolean JNICALL Java_local_godovoyplan_mobile_Core_validHostedAddress(JNIEnv *env, jclass cls, jbyteArray input) {

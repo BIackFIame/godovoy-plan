@@ -5,7 +5,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::{fs, io::ErrorKind};
 
-const MARKER: &str = "online-standby-v1.json";
+pub(super) const MARKER: &str = "online-standby-v1.json";
 const LIMIT: usize = 2048;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
