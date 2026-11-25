@@ -331,15 +331,15 @@ fn router(c: Console) -> Router {
     Router::new()
         .route(
             "/",
-            get(|headers| async move { crate::assets::ADMIN.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::ADMIN.serve(request.headers()) }),
         )
         .route(
             "/admin.js",
-            get(|headers| async move { crate::assets::ADMIN_JS.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::ADMIN_JS.serve(request.headers()) }),
         )
         .route(
             "/admin.css",
-            get(|headers| async move { crate::assets::ADMIN_CSS.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::ADMIN_CSS.serve(request.headers()) }),
         )
         .route("/v1/settings", get(settings).put(apply_settings))
         .route("/v1/operator", get(operator).put(apply_operator))

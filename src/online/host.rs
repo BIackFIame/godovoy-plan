@@ -660,15 +660,15 @@ pub fn router(host: Host) -> Router {
     Router::new()
         .route(
             "/",
-            get(|headers| async move { crate::assets::INDEX.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::INDEX.serve(request.headers()) }),
         )
         .route(
             "/calendar.js",
-            get(|headers| async move { crate::assets::CALENDAR_JS.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::CALENDAR_JS.serve(request.headers()) }),
         )
         .route(
             "/calendar.css",
-            get(|headers| async move { crate::assets::CALENDAR_CSS.serve(&headers) }),
+            get(|request: Request| async move { crate::assets::CALENDAR_CSS.serve(request.headers()) }),
         )
         .route("/mcp", post(mcp::handle))
         .route("/v1/session", get(session))
