@@ -58,7 +58,14 @@ pub fn record(
 pub struct Grant {
     pub employee: Id,
     pub read_only: bool,
+    #[serde(default)]
+    pub allow_remote: bool,
     digest: [u8; 32],
+}
+#[derive(Default)]
+pub struct GrantPermissions {
+    pub read_only: bool,
+    pub allow_remote: bool,
 }
 #[derive(Serialize, Deserialize)]
 pub struct Access {
@@ -219,6 +226,21 @@ impl LockedVault<'_> {
         existing: Option<Id>,
         read_only: bool,
     ) -> Fallible<(Id, Id, String)> {
+        self.grant_with_permissions(
+            name,
+            existing,
+            GrantPermissions {
+                read_only,
+                ..Default::default()
+            },
+        )
+    }
+    pub fn grant_with_permissions(
+        &self,
+        name: &str,
+        existing: Option<Id>,
+        permissions: GrantPermissions,
+    ) -> Fallible<(Id, Id, String)> {
         let mut access = self.access()?;
         let name = name.trim();
         if name.is_empty() || name.chars().count() > 80 || name.chars().any(char::is_control) {
@@ -252,12 +274,18 @@ impl LockedVault<'_> {
             id,
             Grant {
                 employee,
-                read_only,
+                read_only: permissions.read_only,
+                allow_remote: permissions.allow_remote,
                 digest: Blake2s256::digest(secret.as_bytes()).into(),
             },
         );
-        self.audit_security("grant_requested", Some(id), Some(employee), None)?;
-        record(&mut access.audit, "grant", id, employee, None);
+        let (request, action) = if permissions.allow_remote {
+            ("grant_remote_requested", "grant_remote")
+        } else {
+            ("grant_requested", "grant")
+        };
+        self.audit_security(request, Some(id), Some(employee), None)?;
+        record(&mut access.audit, action, id, employee, None);
         save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
         sync_directory(self.directory)?;
         Ok((id, employee, format!("{id}.{secret}")))

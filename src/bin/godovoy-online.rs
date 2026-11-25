@@ -7,11 +7,14 @@ mod host;
 use godovoy_plan::{
     Fallible,
     model::{Calendar, Id},
-    storage::{Store, online::OnlineVault},
+    storage::{
+        Store,
+        online::{GrantPermissions, OnlineVault},
+    },
 };
 use std::{env, path::Path};
 
-const HELP: &str = "godovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online serve DIR [--port 45838] [--origin https://calendar.example]";
+const HELP: &str = "godovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online serve DIR [--port 45838] [--origin https://calendar.example] [--access office|remote]";
 fn main() {
     if let Err(e) = run() {
         eprintln!("Ошибка: {e}");
@@ -59,11 +62,19 @@ fn run() -> Fallible<()> {
         ("serve", options) => {
             let mut port = None;
             let mut origin = None;
+            let mut entry = None;
             for flag in options.chunks(2) {
                 match flag {
                     [arg, n] if arg == "--port" && port.is_none() => port = Some(n.parse::<u16>()?),
                     [arg, value] if arg == "--origin" && origin.is_none() => {
                         origin = Some(value.to_owned())
+                    }
+                    [arg, value] if arg == "--access" && entry.is_none() => {
+                        entry = Some(match value.as_str() {
+                            "office" => host::EntryPoint::Office,
+                            "remote" => host::EntryPoint::Remote,
+                            _ => return Err(HELP.into()),
+                        })
                     }
                     _ => return Err(HELP.into()),
                 }
@@ -71,22 +82,28 @@ fn run() -> Fallible<()> {
             tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()?
-                .block_on(host::serve(vault, port.unwrap_or(45838), origin))?;
+                .block_on(host::serve(vault, port.unwrap_or(45838), origin, entry))?;
         }
         ("grant", [name, options @ ..]) => {
             let mut employee = None;
-            let mut read_only = false;
+            let mut permissions = GrantPermissions::default();
             let mut iter = options.iter();
             while let Some(option) = iter.next() {
                 match option.as_str() {
                     "--employee-id" if employee.is_none() => {
                         employee = Some(iter.next().ok_or(HELP)?.parse::<Id>()?)
                     }
-                    "--read-only" if !read_only => read_only = true,
+                    "--read-only" if !permissions.read_only => permissions.read_only = true,
+                    "--allow-remote" if !permissions.allow_remote => {
+                        permissions.allow_remote = true
+                    }
                     _ => return Err(HELP.into()),
                 }
             }
-            let (id, employee, token) = vault.lock()?.grant(name, employee, read_only)?;
+            let (id, employee, token) =
+                vault
+                    .lock()?
+                    .grant_with_permissions(name, employee, permissions)?;
             println!(
                 "Сотрудник: {employee}\nID ключа для отзыва: {id}\nКлюч доступа (показывается один раз):\n{token}"
             );
@@ -108,12 +125,17 @@ fn run() -> Fallible<()> {
             }
             for (id, grant) in acl.grants {
                 println!(
-                    "Ключ {id}, сотрудник {}, {}",
+                    "Ключ {id}, сотрудник {}, {}, {}",
                     grant.employee,
                     if grant.read_only {
                         "чтение"
                     } else {
                         "редактирование"
+                    },
+                    if grant.allow_remote {
+                        "офис и внешний вход"
+                    } else {
+                        "только офис"
                     }
                 );
             }

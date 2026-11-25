@@ -109,7 +109,11 @@
             });
             if (epoch !== generation || document.hidden) throw new Problem();
             if (response.status === 401 || response.status === 403) {
-                clearWorkspace(prompts.denied);
+                const officeOnly = response.status === 403 &&
+                    response.headers.get("x-godovoy-access") === "office-only";
+                clearWorkspace(officeOnly
+                    ? "Этот ключ действует только в офисе. Откройте внутренний адрес календаря или запросите удалённый доступ."
+                    : prompts.denied);
                 throw new Problem();
             }
             if (!response.ok) {

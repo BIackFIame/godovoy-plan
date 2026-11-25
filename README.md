@@ -2,9 +2,9 @@
 
 Календарь для команд, у которых каждый год повторяются акции, встречи, отчёты и поздравления. Годовой круг показывает, что запланировано на ближайшие месяцы. У каждого события есть ответственный, дата начала подготовки и чек-лист со своими сроками.
 
-Компания выбирает, где хранить календарь. В автономном режиме сотрудники работают с локальными копиями и обмениваются изменениями. В режиме **Серверный календарь** рабочая копия хранится на одном компьютере компании. Сотрудникам нужна связь с этим компьютером по офисной сети, VPN или через интернет. Облачная учётная запись не требуется.
+В офисе вся команда может вести один календарь по локальной сети даже при отключении интернета. Рабочая копия хранится на одном включённом компьютере компании. Из дома или командировки тот же календарь доступен только сотрудникам с отдельным разрешением. Облачная учётная запись не требуется. Если нужен прямой обмен локальными копиями без постоянно включённого компьютера, выберите автономный режим.
 
-[Включить обязательную связь и выдать доступ](ONLINE.md) · [Требования к персональным данным в России и Беларуси](DATA-PROTECTION.md)
+[Настроить офисный и удалённый входы](ONLINE.md#один-календарь-для-офиса-и-удалённых-сотрудников) · [Условия обработки персональных данных](DATA-PROTECTION.md)
 
 ![Годовой круг и список событий. Справа открыт чек-лист новогоднего поздравления партнёрам.](review/v0.5/ux/after-calendar.png)
 
@@ -12,10 +12,10 @@
 
 | Устройство | Пакет и установка |
 |---|---|
-| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
-| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
-| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
-| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.43/GodovoyPlan-0.5.43-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
+| Windows 10 и новее | Выберите [x64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-Windows-x64.zip), [ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-Windows-ARM64.zip) или [x86](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-Windows-x86.zip). Распакуйте архив и запустите `godovoy-plan.exe`. Для большинства ПК с 64-разрядной Windows подходит x64. |
+| macOS, Apple Silicon и Intel | Распакуйте [универсальную сборку](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-macOS.zip) и переместите `GodovoyPlan.app` в «Программы». У сборки локальная подпись ad hoc, при первом запуске возможна проверка Gatekeeper. |
+| Android 8.0 и новее | Скачайте [APK](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-Android.apk) на телефон и откройте его для установки. В пакете ARM64, ARMv7 и x86-64. Эта версия подписана тестовым ключом. |
+| iPhone и iPad, от iOS 16 | [Проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.5.44/GodovoyPlan-0.5.44-iOS-Xcode.zip) содержит интерфейс SwiftUI и библиотеки Rust для устройства и симулятора ARM64. Для установки на устройство нужна сборка и подпись вашей команды Apple. Готового IPA в этом выпуске нет. |
 
 Все файлы выпуска и их контрольные суммы доступны в [GitHub Releases](https://github.com/BIackFIame/godovoy-plan/releases/latest).
 

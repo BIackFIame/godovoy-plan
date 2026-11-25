@@ -18,6 +18,67 @@ fn cli(action: &str, dir: &Path, more: &[&str]) -> Output {
         .output()
         .unwrap()
 }
+
+#[test]
+fn legacy_office_grant_and_new_remote_grant_for_one_employee_are_independent() {
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("shared");
+    assert!(cli("init", &dir, &["Календарь"]).status.success());
+    let office = cli("grant", &dir, &["Анна"]);
+    assert!(office.status.success());
+    let issued = String::from_utf8(office.stdout).unwrap();
+    let office = issued.lines().last().unwrap();
+    let id = office.split_once('.').unwrap().0;
+    let path = dir.join("online-access-v1.json");
+    let mut legacy: serde_json::Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    let grant = legacy["grants"][id].as_object_mut().unwrap();
+    assert_eq!(grant.remove("allow_remote"), Some(false.into()));
+    let employee = grant["employee"].as_str().unwrap().to_owned();
+    fs::write(&path, serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let remote = cli(
+        "grant",
+        &dir,
+        &[
+            "Анна",
+            "--allow-remote",
+            "--employee-id",
+            &employee,
+            "--read-only",
+        ],
+    );
+    assert!(remote.status.success());
+    let issued = String::from_utf8(remote.stdout).unwrap();
+    let remote = issued.lines().last().unwrap();
+    let vault = OnlineVault::open(&dir).unwrap();
+    let acl = vault.lock().unwrap().access().unwrap();
+    assert!(!acl.authorize(office).unwrap().1.allow_remote);
+    let (remote_id, grant) = acl.authorize(remote).unwrap();
+    assert!(grant.read_only && grant.allow_remote);
+    let status = cli("status", &dir, &[]);
+    assert!(status.status.success());
+    let status = String::from_utf8(status.stdout).unwrap();
+    assert!(
+        status
+            .lines()
+            .any(|l| l.contains(id) && l.contains("только офис"))
+    );
+    assert!(
+        status
+            .lines()
+            .any(|l| l.contains(&remote_id.to_string()) && l.contains("офис и внешний вход"))
+    );
+    assert!(!status.contains(remote) && !status.contains(office));
+    assert!(
+        !cli("grant", &dir, &["Анна", "--allow-remote", "--allow-remote"])
+            .status
+            .success()
+    );
+    assert!(
+        !cli("serve", &dir, &["--port", "0", "--access", "unknown"])
+            .status
+            .success()
+    );
+}
 #[test]
 fn migration_copies_calendar_only_and_requires_new_individual_grants() {
     let tmp = TempDir::new().unwrap();

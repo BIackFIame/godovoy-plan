@@ -23,18 +23,30 @@ use serde_json::json;
 use std::{net::Ipv4Addr, sync::Arc, time::Duration};
 use tokio::{net::TcpListener, sync::Semaphore};
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryPoint {
+    Office,
+    Remote,
+}
+
 #[derive(Clone)]
 pub struct Host {
     vault: OnlineVault,
     origin: String,
     authority: String,
+    entry: EntryPoint,
     operations: Arc<Semaphore>,
 }
 impl Host {
-    pub fn new(vault: OnlineVault, origin: &str) -> Fallible<Self> {
+    pub fn new(vault: OnlineVault, origin: &str, entry: Option<EntryPoint>) -> Fallible<Self> {
         let uri = origin.parse::<Uri>()?;
         let authority = uri.authority().ok_or("Нужен origin с именем узла.")?;
-        let local = matches!(authority.host(), "127.0.0.1" | "localhost");
+        let local = matches!(authority.host(), "127.0.0.1" | "localhost" | "[::1]");
+        let entry = entry.unwrap_or(if local {
+            EntryPoint::Office
+        } else {
+            EntryPoint::Remote
+        });
         let allowed_scheme =
             uri.scheme_str() == Some("https") || (local && uri.scheme_str() == Some("http"));
         if authority.as_str().contains('@')
@@ -49,11 +61,15 @@ impl Host {
                     .into(),
             );
         }
+        if entry == EntryPoint::Remote && uri.scheme_str() != Some("https") {
+            return Err("Для внешнего входа нужен явный --origin https://…".into());
+        }
         let origin = format!("{}://{}", uri.scheme_str().unwrap_or_default(), authority);
         Ok(Self {
             vault,
             origin,
             authority: authority.as_str().into(),
+            entry,
             operations: Arc::new(Semaphore::new(16)),
         })
     }
@@ -164,6 +180,22 @@ where
                 "Ключ недействителен или доступ отозван.",
             );
         };
+        if host.entry == EntryPoint::Remote && !grant.allow_remote {
+            if lock
+                .audit_security("remote_access_denied", Some(id), Some(grant.employee), None)
+                .is_err()
+            {
+                return unavailable();
+            }
+            let mut response = problem(
+                StatusCode::FORBIDDEN,
+                "Этот ключ действует только в офисной сети.",
+            );
+            response
+                .headers_mut()
+                .insert("x-godovoy-access", HeaderValue::from_static("office-only"));
+            return response;
+        }
         if write && grant.read_only {
             if lock
                 .audit_security("write_denied", Some(id), Some(grant.employee), None)
@@ -305,13 +337,22 @@ pub fn router(host: Host) -> Router {
         .layer(middleware::from_fn_with_state(host.clone(), headers))
         .with_state(host)
 }
-pub async fn serve(vault: OnlineVault, port: u16, origin: Option<String>) -> Fallible<()> {
+pub async fn serve(
+    vault: OnlineVault,
+    port: u16,
+    origin: Option<String>,
+    entry: Option<EntryPoint>,
+) -> Fallible<()> {
     let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await?;
     let addr = listener.local_addr()?;
     let origin = origin.unwrap_or_else(|| format!("http://{addr}"));
-    let host = Host::new(vault, &origin)?;
+    let host = Host::new(vault, &origin, entry)?;
+    let scope = match host.entry {
+        EntryPoint::Office => "офисный",
+        EntryPoint::Remote => "внешний",
+    };
     let app = router(host);
-    eprintln!("Сервер слушает {addr}. Адрес клиента {origin}");
+    eprintln!("Сервер слушает {addr}. Вход {scope}. Адрес клиента {origin}");
     let admissions = Arc::new(Semaphore::new(32));
     loop {
         let (socket, _) = listener.accept().await?;
@@ -364,7 +405,12 @@ mod tests {
             .unwrap();
             let (credential, employee, key) =
                 vault.lock().unwrap().grant("Анна", None, false).unwrap();
-            let host = Host::new(vault.clone(), "https://calendar.test").unwrap();
+            let host = Host::new(
+                vault.clone(),
+                "https://calendar.test",
+                Some(EntryPoint::Office),
+            )
+            .unwrap();
             Self {
                 _tmp: tmp,
                 vault,
@@ -419,6 +465,131 @@ mod tests {
             "date":"2028-02-29","yearly":true,"preparationDays":30,"checklist":[{"title":"Список","daysBefore":10}]})
         }
     }
+    #[tokio::test]
+    async fn entry_policy_is_fixed_by_the_host_and_shared_vault_grants_apply_on_each_request() {
+        use godovoy_plan::storage::online::GrantPermissions;
+        let mut f = Fixture::new();
+        for local in [
+            "http://127.0.0.1:45838",
+            "http://localhost",
+            "https://[::1]",
+        ] {
+            assert_eq!(
+                Host::new(f.vault.clone(), local, None).unwrap().entry,
+                EntryPoint::Office
+            );
+        }
+        assert!(
+            Host::new(
+                f.vault.clone(),
+                "http://127.0.0.1:45838",
+                Some(EntryPoint::Remote)
+            )
+            .is_err()
+        );
+        let (remote_id, _, remote_key) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant_with_permissions(
+                "Анна",
+                Some(f.employee),
+                GrantPermissions {
+                    read_only: false,
+                    allow_remote: true,
+                },
+            )
+            .unwrap();
+        let (_, _, reader) = f
+            .vault
+            .lock()
+            .unwrap()
+            .grant_with_permissions(
+                "Анна",
+                Some(f.employee),
+                GrantPermissions {
+                    read_only: true,
+                    allow_remote: true,
+                },
+            )
+            .unwrap();
+        assert_eq!(
+            f.request("/v1/session", &remote_key, None).await.0,
+            StatusCode::NO_CONTENT
+        );
+        let remote_host = Host::new(f.vault.clone(), "https://calendar.test", None).unwrap();
+        assert_eq!(remote_host.entry, EntryPoint::Remote);
+        let office = std::mem::replace(&mut f.app, router(remote_host));
+        for (url, body) in [
+            ("/v1/session", None),
+            ("/v1/state?year=2028", None),
+            ("/v1/command", Some(f.create())),
+        ] {
+            assert_eq!(f.request(url, &f.key, body).await.0, StatusCode::FORBIDDEN);
+        }
+        let session_status = |key: &str| {
+            let req = Request::builder()
+                .uri("/v1/session")
+                .header(header::HOST, "calendar.test")
+                .header("x-forwarded-for", "127.0.0.1")
+                .header("x-godovoy-access", "office")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            f.app.clone().oneshot(req)
+        };
+        let response = session_status(&f.key).await.unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(response.headers()["x-godovoy-access"], "office-only");
+        let response = session_status("invalid").await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert!(!response.headers().contains_key("x-godovoy-access"));
+        assert_eq!(
+            f.request("/v1/state?year=2028", &reader, None).await.0,
+            StatusCode::OK
+        );
+        assert_eq!(
+            f.request("/v1/command", &reader, Some(f.create())).await.0,
+            StatusCode::FORBIDDEN
+        );
+        assert_eq!(
+            f.request("/v1/command", &remote_key, Some(f.create()))
+                .await
+                .0,
+            StatusCode::NO_CONTENT
+        );
+        f.vault.lock().unwrap().revoke(remote_id).unwrap();
+        assert_eq!(
+            f.request("/v1/session", &remote_key, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        f.app = office;
+        assert_eq!(
+            f.request("/v1/session", &remote_key, None).await.0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(f.state().await["events"].as_array().unwrap().len(), 1);
+        let journal = std::fs::read_dir(f._tmp.path().join("host"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| p.extension().is_some_and(|ext| ext == "jsonl"))
+            .unwrap();
+        let journal = std::fs::read_to_string(journal).unwrap();
+        let denials: Vec<Value> = journal
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap())
+            .filter(|r| r["action"] == "remote_access_denied")
+            .collect();
+        assert_eq!(denials.len(), 4);
+        assert!(
+            denials
+                .iter()
+                .all(|r| r["credential"] == json!(f.credential)
+                    && r["employee"] == json!(f.employee))
+        );
+        assert!(!journal.contains(&f.key));
+    }
+
     #[tokio::test]
     async fn live_revoke_and_read_only_controls_are_checked_on_every_operation() {
         let f = Fixture::new();
@@ -547,7 +718,7 @@ mod tests {
         }
         let huge = json!({"op":"note","text":"x".repeat(150*1024)});
         assert_eq!(f.cmd(huge).await, StatusCode::PAYLOAD_TOO_LARGE);
-        assert!(Host::new(f.vault.clone(), "http://calendar.test").is_err());
-        assert!(Host::new(f.vault.clone(), "https://user@calendar.test").is_err());
+        assert!(Host::new(f.vault.clone(), "http://calendar.test", None).is_err());
+        assert!(Host::new(f.vault.clone(), "https://user@calendar.test", None).is_err());
     }
 }
