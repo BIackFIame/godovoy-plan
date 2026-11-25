@@ -252,19 +252,22 @@ impl Views {
         base: HeaderValue,
         target: (Id, i32),
     ) -> Fallible<Response> {
+        if !context.offer_overview {
+            return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+        }
         let bytes = file.into_bytes()?;
         let key = Self::source_key(
             &Self::input_hasher(credential, &context, today)?,
             InputHasher::digest(&bytes).into(),
         );
         let known = self.lookup(&key)?;
+        if known.as_ref().is_some_and(|tag| *tag != base) {
+            return Ok(StatusCode::PRECONDITION_FAILED.into_response());
+        }
         self.with_source(bytes, |data| {
             let view = context.render(data, today);
             if !view.is_overview()
-                || match known {
-                    Some(tag) => tag != base,
-                    None => self.view_tag(credential, &view, today)? != base,
-                }
+                || (known.is_none() && self.view_tag(credential, &view, today)? != base)
             {
                 return Ok(StatusCode::PRECONDITION_FAILED.into_response());
             }
@@ -443,20 +446,33 @@ impl Views {
         if context.offer_overview {
             return self.with_source(data, |calendar| {
                 let view = context.render(calendar, today);
-                let tag = match known {
-                    Some(view) => view.tag,
-                    None => self.view_tag(credential, &view, today)?,
+                let body = if view.is_overview() {
+                    None
+                } else {
+                    // The offered representation stayed full. Serialize it
+                    // once, as on the legacy path, and hash those same bytes.
+                    let expected_len = known.as_ref().and_then(|saved| saved.body_len);
+                    let mut body = Vec::with_capacity(expected_len.unwrap_or(0));
+                    serde_json::to_writer(&mut body, &view)?;
+                    Some(body)
+                };
+                let tag = match (known, &body) {
+                    (Some(view), _) => view.tag,
+                    (None, Some(body)) => Self::tag(self.tag_hasher(credential).chain_update(body))?,
+                    (None, None) => self.view_tag(credential, &view, today)?,
                 };
                 self.store(
                     key,
                     CachedView {
                         tag: tag.clone(),
-                        body_len: None,
+                        body_len: body.as_ref().map(Vec::len),
                     },
                     hint,
                 )?;
                 if matches_tag(condition, &tag) {
                     Ok(tagged(StatusCode::NOT_MODIFIED.into_response(), tag))
+                } else if let Some(body) = body {
+                    Ok(tagged(json_body(body), tag))
                 } else {
                     render_state(&view, tag)
                 }

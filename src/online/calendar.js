@@ -26,6 +26,7 @@
     let lastLoaded = 0;
     let requestNumber = 0;
     let detailNumber = 0;
+    let activeDetail = null;
     let heartbeatRunning = false;
     let heartbeatTimer = null;
     let leaseTimer = null;
@@ -64,6 +65,7 @@
             : "";
     }
     function closeSheet() {
+        cancelDetail();
         detailNumber++;
         const dialog = el("sheet");
         const origin = dialog.dataset.origin;
@@ -131,12 +133,14 @@
             Math.max(0, lastVerified + leaseMs - performance.now()));
     }
 
-    async function api(path, {body, data = false, validator = null, receipt = null, read = null, head = false, detailBase = null} = {}) {
+    async function api(path, {body, data = false, validator = null, receipt = null, read = null, head = false, detailRequest = null} = {}) {
         const epoch = generation;
         if (!credential || document.hidden) throw new Problem();
         const started = performance.now();
-        const current = () => epoch === generation && !document.hidden && (!read || read === activeRead && read.number === requestNumber);
-        const controller = read?.controller || new AbortController();
+        const current = () => epoch === generation && !document.hidden &&
+            (!read || read === activeRead && read.number === requestNumber) &&
+            (!detailRequest || detailRequest === activeDetail);
+        const controller = read?.controller || detailRequest?.controller || new AbortController();
         controllers.add(controller);
         let timeout = setTimeout(() => controller.abort(), requestMs);
         try {
@@ -145,7 +149,7 @@
             if (overviewEnabled && (path.startsWith("/v1/state?") || path === "/v1/command")) {
                 headers["X-Godovoy-View"] = "overview-v1";
             }
-            if (detailBase) headers["If-Match"] = detailBase;
+            if (detailRequest) headers["If-Match"] = detailRequest.tag;
             if (receipt) {
                 headers["X-Godovoy-Base"] = receipt.tag;
                 headers["X-Godovoy-Year"] = String(receipt.year);
@@ -209,11 +213,11 @@
                 clearWorkspace(writing ? prompts.uncertain : "Календарь временно недоступен. Дождитесь возврата основного сервера и войдите снова.");
                 throw new Problem();
             }
-            if (detailBase && (response.status === 412 || response.status === 404)) return {stale: true};
+            if (detailRequest && (response.status === 412 || response.status === 404)) return {stale: true};
             if (!authorized) {
                 if (response.status >= 500 || body === undefined) throw new Error("Connection unavailable");
                 const problem = await response.json();
-                if (epoch !== generation || document.hidden) throw new Problem();
+                if (!current()) throw new Problem();
                 throw new Problem(typeof problem.error === "string" ? problem.error : "Компьютер компании отклонил изменение.");
             }
             if (head && !unchanged) {
@@ -466,11 +470,19 @@
         return state?.events.find(e => e.id === row.id && e.year === row.year) ||
             state?.tasks.find(e => e.id === row.id && e.year === row.year);
     }
+    function cancelDetail() {
+        activeDetail?.controller.abort();
+        activeDetail = null;
+    }
+
     async function openCard(row, taskId, mayReload = true) {
+        cancelDetail();
         if (!row || !state) return;
         if (!state.overview) { detail(row, taskId); return; }
         const request = ++detailNumber;
         const year = currentYear, tag = stateTag, epoch = generation;
+        const pending = {tag, controller: new AbortController()};
+        activeDetail = pending;
         const sameSheet = () => request === detailNumber && epoch === generation &&
             currentYear === year && el("sheet").open && !document.hidden;
         const loading = element("p", "Загружаем карточку…", "sub");
@@ -478,7 +490,7 @@
         sheet(row.title).append(loading);
         try {
             const path = "/v1/event?year=" + year + "&eventYear=" + row.year + "&id=" + encodeURIComponent(row.id);
-            const reply = await api(path, {data: true, detailBase: tag});
+            const reply = await api(path, {data: true, detailRequest: pending});
             if (!sameSheet()) return;
             if (reply.stale || stateTag !== tag) {
                 if (!mayReload) { closeSheet(); return; }
@@ -497,6 +509,8 @@
             detail(reply.value, taskId);
         } catch {
             if (sameSheet()) closeSheet();
+        } finally {
+            if (activeDetail === pending) activeDetail = null;
         }
     }
     function detail(event, taskId) {
