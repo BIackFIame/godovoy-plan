@@ -5,7 +5,7 @@ on:
       tag:
         description: Тег выпуска
         required: true
-        default: v0.6.6
+        default: v0.6.7
       draft_id:
         description: Числовой ID черновика выпуска. Для опубликованного выпуска оставьте пустым.
         required: false

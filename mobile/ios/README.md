@@ -4,10 +4,10 @@
 
 ## Запустить приложение в симуляторе
 
-На Mac с Apple Silicon откройте Xcode → Open Developer Tool → Simulator и запустите один симулятор iPhone или iPad с iOS 16 или новее. Скачайте [приложение для симулятора ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.6/GodovoyPlan-0.6.6-iOS-Simulator-ARM64.zip) в отдельную папку. В терминале перейдите в эту папку и выполните команды.
+На Mac с Apple Silicon откройте Xcode → Open Developer Tool → Simulator и запустите один симулятор iPhone или iPad с iOS 16 или новее. Скачайте [приложение для симулятора ARM64](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.7/GodovoyPlan-0.6.7-iOS-Simulator-ARM64.zip) в отдельную папку. В терминале перейдите в эту папку и выполните команды.
 
 ```sh
-unzip GodovoyPlan-0.6.6-iOS-Simulator-ARM64.zip
+unzip GodovoyPlan-0.6.7-iOS-Simulator-ARM64.zip
 xcrun simctl install booted ./GodovoyPlan.app
 xcrun simctl launch booted local.godovoyplan.mobile
 ```
@@ -16,9 +16,9 @@ xcrun simctl launch booted local.godovoyplan.mobile
 
 ## Установить на iPhone или iPad
 
-[Сборка для устройства](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.6/GodovoyPlan-0.6.6-iOS-Unsigned-Device.zip) содержит приложение ARM64 для корпоративной подписи. ИТ-служба подписывает приложение сертификатом своей команды Apple с профилем подготовки (provisioning profile) для выбранного идентификатора приложения и способа распространения.
+[Сборка для устройства](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.7/GodovoyPlan-0.6.7-iOS-Unsigned-Device.zip) содержит приложение ARM64 для корпоративной подписи. ИТ-служба подписывает приложение сертификатом своей команды Apple с профилем подготовки (provisioning profile) для выбранного идентификатора приложения и способа распространения.
 
-Для установки через Xcode скачайте [проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.6/GodovoyPlan-0.6.6-iOS-Xcode.zip). В настройках цели GodovoyPlan откройте **Signing & Capabilities**, выберите свою **Team** и профиль подготовки. При включённом **Automatically manage signing** Xcode подберёт профиль для подключённого устройства.
+Для установки через Xcode скачайте [проект Xcode](https://github.com/BIackFIame/godovoy-plan/releases/download/v0.6.7/GodovoyPlan-0.6.7-iOS-Xcode.zip). В настройках цели GodovoyPlan откройте **Signing & Capabilities**, выберите свою **Team** и профиль подготовки. При включённом **Automatically manage signing** Xcode подберёт профиль для подключённого устройства.
 
 ## Сборка из проекта Xcode
 
