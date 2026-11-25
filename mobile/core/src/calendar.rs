@@ -153,20 +153,20 @@ pub(super) fn state(
                     return None;
                 }
                 let e = w.calendar.event(r.event, r.year)?;
-                let title = match r.kind {
+                let (title, task_id) = match r.kind {
                     Milestone::Task(id) => e
                         .event
                         .tasks
                         .iter()
                         .find(|t| t.id == id)
-                        .map(|t| format!("{} · {}", e.event.title, t.title))?,
-                    _ => e.event.title.clone(),
+                        .map(|t| (format!("{} · {}", e.event.title, t.title), Some(id)))?,
+                    _ => (e.event.title.clone(), None),
                 };
                 if changed_row.is_some() {
                     reminder_positions.push(reminder_count);
                 }
                 reminder_count += 1;
-                Some(json!({"eventId":r.event,"year":r.year,"title":title,"date":r.date}))
+                Some(json!({"eventId":r.event,"year":r.year,"title":title,"date":r.date,"taskId":task_id}))
             })
             .collect::<Vec<_>>();
         result["notificationDates"] = json!(alerts::dates(&w.calendar, snapshot.device, today));

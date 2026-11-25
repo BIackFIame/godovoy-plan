@@ -521,3 +521,35 @@ fn compact_check_is_bound_to_the_requested_year_token_and_client_capability() {
         assert_eq!(result, phone.state(read_year));
     }
 }
+
+#[test]
+fn reminders_identify_the_exact_checklist_item_even_when_titles_match() {
+    let tmp = TempDir::new().unwrap();
+    let phone = Phone::open(&tmp.path().join("phone"));
+    phone.ok(json!({"op":"createWorkspace","employee":"Анна","name":"Офис"}));
+    let today = Local::now().date_naive();
+    let year = today.year();
+    let owner = phone.state(year)["deviceId"].clone();
+    phone.ok(
+        json!({"op":"createEvent","title":"Подготовка","date":today,"ownerId":owner,
+        "yearly":false,"category":"Partners","preparationDays":0,
+        "checklist":[{"title":"Проверка","daysBefore":0},{"title":"Проверка","daysBefore":0}]}),
+    );
+    let state = phone.state(year);
+    let event = &state["events"][0];
+    let reminders = state["reminders"].as_array().unwrap();
+    assert!(
+        reminders
+            .iter()
+            .any(|r| r["taskId"].is_null() && r["eventId"] == event["id"])
+    );
+    for task in event["checklist"].as_array().unwrap() {
+        assert_eq!(
+            reminders
+                .iter()
+                .filter(|r| r["taskId"] == task["id"] && r["eventId"] == event["id"])
+                .count(),
+            1
+        );
+    }
+}

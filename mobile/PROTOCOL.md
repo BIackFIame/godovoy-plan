@@ -6,7 +6,7 @@
 
 | op | Дополнительные входные поля | data |
 |---|---|---|
-| state | year (число) | `{deviceId,employeeId,workspaceName,year,members,employees,events,tasks,reminders,lanEnabled,paused,lastSync}`. `workspaceName` и `lastSync` могут быть null. `members` — `{id,name,revoked,employeeId}[]`. `events` — события выбранного года. `tasks` — события текущего пользователя, которым требуется внимание сегодня. `reminders` — `{eventId,year,title,date}[]`. |
+| state | year (число) | `{deviceId,employeeId,workspaceName,year,members,employees,events,tasks,reminders,lanEnabled,paused,lastSync}`. `workspaceName` и `lastSync` могут быть null. `members` — `{id,name,revoked,employeeId}[]`. `events` — события выбранного года. `tasks` — события текущего пользователя, которым требуется внимание сегодня. `reminders` — `{eventId,year,title,date,taskId}[]`. |
 | createWorkspace | name, employee | null |
 | createEvent | title, date, yearly (bool), preparationDays (число), ownerId (UUID или null), category (`Campaign`, `Partners`, `Team`, `Operations`), checklist (`{title,daysBefore}[]`), description (строка, опционально) | null |
 | check | eventId, year, taskId, done (bool) | null |
@@ -20,7 +20,7 @@
 | export | | абсолютный путь к зашифрованному `.yrplan` в приватном временном хранилище |
 | import | path (путь к частной копии, созданной системным выбором файла) | null |
 
-Событие в `events` и `tasks` имеет поля `id`, `year`, `title`, `date`, `yearly`, `category`, `ownerId` (или null), `preparationDate`, `note`, `description`, `checklist`. Элемент `checklist` содержит `id`, `title`, `dueDate`, `done`. Для показа даты начала подготовки персональных задач и открытия напоминания используется год самого события.
+Событие в `events` и `tasks` имеет поля `id`, `year`, `title`, `date`, `yearly`, `category`, `ownerId` (или null), `preparationDate`, `note`, `description`, `checklist`. Элемент `checklist` содержит `id`, `title`, `dueDate`, `done`. У напоминания о пункте чек-листа поле `taskId` содержит его идентификатор. Для остальных напоминаний значение равно null. При чтении старого ответа без этого поля клиент открывает карточку события. Для показа даты начала подготовки персональных задач и открытия напоминания используется год самого события.
 
 Для редактирования и удаления передайте `op` равным `editEvent` или `deleteEvent`, а также `eventId`, `year`, `revision` из отображённого события и `scope` (`year` для выбранного года, `future` для шаблона с этого года). `editEvent` также принимает все поля события как в `createEvent`, включая строку `description`. Существующим пунктам передаются исходные `id`, новым — только `title` и `daysBefore`. После параллельного изменения шаблона требуется заново прочитать событие. Снимки событий также содержат `preparationDays`, `revision` и `daysBefore` каждого пункта. При сохранении заметки можно передать `base` с прочитанным ранее текстом.
 

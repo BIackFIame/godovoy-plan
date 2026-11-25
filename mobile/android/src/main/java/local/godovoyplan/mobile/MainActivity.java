@@ -55,7 +55,8 @@ public final class MainActivity extends Activity {
     private boolean changingReminders;
     private TextView status;
     private ListView list;
-    private int firstVisible, topOffset;
+    private int firstVisible, topOffset, detailOffset;
+    private String pendingTaskId = "";
     private final Runnable poll = new Runnable() {
         public void run() {
             if (!active)
@@ -109,6 +110,8 @@ public final class MainActivity extends Activity {
             month = saved.getInt("month");
             section = saved.getString("tab", "Год");
             selectedId = saved.getString("event", "");
+            pendingTaskId = saved.getString("pendingTask", "");
+            detailOffset = saved.getInt("detailOffset");
         }
         root = vertical();
         root.setBackgroundColor(BG);
@@ -122,6 +125,8 @@ public final class MainActivity extends Activity {
         s.putInt("month", month);
         s.putString("tab", section);
         s.putString("event", selectedId);
+        s.putString("pendingTask", pendingTaskId);
+        s.putInt("detailOffset", detailOffset);
     }
     @Override
     public void onStart() {
@@ -450,7 +455,7 @@ public final class MainActivity extends Activity {
         root.addView(reason);
         root.addView(button("Повторить", () -> refresh(true)));
     }
-    private void newPage(String title) {
+    private void newPage(String title, boolean eventPage) {
         if (list != null) {
             firstVisible = list.getFirstVisiblePosition();
             View top = list.getChildAt(0);
@@ -460,6 +465,7 @@ public final class MainActivity extends Activity {
         root.removeAllViews();
         LinearLayout head = horizontal();
         pad(head, 16, 4);
+        if (eventPage) head.addView(button("‹ Назад", this::onBackPressed));
         fill(head, text(title, 23, true));
         root.addView(head);
         line(root);
@@ -497,7 +503,7 @@ public final class MainActivity extends Activity {
         renderPending = false;
         boolean joined = !str(state, "workspaceName").isEmpty();
         if (!joined) {
-            newPage("Годовой план");
+            newPage("Годовой план", false);
             LinearLayout form = scroller();
             label(form, "Календарь команды", 23);
             hint(form, "Создайте календарь на этом устройстве или подключитесь к календарю коллег.");
@@ -509,7 +515,7 @@ public final class MainActivity extends Activity {
         JSONObject selected = selectedEvent();
         if (!selectedId.isEmpty() && selected == null)
             selectedId = "";
-        newPage(selected != null ? "Событие" : "Год".equals(section) ? str(state, "workspaceName") : section);
+        newPage(selected != null ? "Событие" : "Год".equals(section) ? str(state, "workspaceName") : section, selected != null);
         if (selected != null)
             detail(selected);
         else
@@ -560,6 +566,11 @@ public final class MainActivity extends Activity {
         return null;
     }
     void open(String id, int yr) {
+        open(id, yr, "");
+    }
+    private void open(String id, int yr, String taskId) {
+        detailOffset = 0;
+        pendingTaskId = taskId;
         selectedId = id;
         if (yr != year) {
             resetList();
@@ -644,7 +655,7 @@ public final class MainActivity extends Activity {
         else
             for (JSONObject r : items(array(state, "reminders")))
                 rows.add(new Row(
-                        str(r, "title"), pretty(str(r, "date")), str(r, "eventId"), r.optInt("year", year)));
+                        str(r, "title"), pretty(str(r, "date")), str(r, "eventId"), r.optInt("year", year), null, str(r, "taskId")));
         if (rows.isEmpty())
             rows.add(new Row(section.equals("Задачи") ? "Сейчас нет личных задач" : "Сейчас нет напоминаний",
                     null, null, 0));
@@ -695,10 +706,15 @@ public final class MainActivity extends Activity {
         final String title, sub, id;
         final int year;
         final JSONObject event;
+        final String taskId;
         Row(String t, String s, String i, int y) {
             this(t, s, i, y, null);
         }
         Row(String t, String s, String i, int y, JSONObject event) {
+            this(t, s, i, y, event, "");
+        }
+        Row(String t, String s, String i, int y, JSONObject event, String taskId) {
+            this.taskId = taskId;
             this.event = event;
             title = t;
             sub = s;
@@ -780,8 +796,10 @@ public final class MainActivity extends Activity {
             Object value = parent.getItemAtPosition(pos);
             if (value instanceof Row) {
                 Row r = (Row) value;
-                if (r.id != null)
-                    open(r.id, r.year);
+                if (r.id != null) {
+                    JSONObject task = preparation && r.event != null ? nextOpenTask(r.event) : null;
+                    open(r.id, r.year, task == null ? r.taskId : str(task, "id"));
+                }
             }
         });
         body.addView(list, new LinearLayout.LayoutParams(-1, 0, 1));
@@ -789,7 +807,10 @@ public final class MainActivity extends Activity {
     }
     private void detail(JSONObject e) {
         LinearLayout form = scroller();
-        form.addView(button("‹ Назад", this::onBackPressed));
+        ScrollView scroll = (ScrollView) form.getParent();
+        final int previousOffset = detailOffset;
+        final String taskToReveal = pendingTaskId;
+        CheckBox target = null;
         label(form, str(e, "title"), 24);
         hint(form, pretty(str(e, "date")) + "  ·  " + catName(str(e, "category")));
         String who = owner(str(e, "employeeId"));
@@ -811,6 +832,7 @@ public final class MainActivity extends Activity {
                 check.setChecked(task.optBoolean("done"));
                 check.setMinHeight(dp(48));
                 form.addView(check);
+                if (!taskToReveal.isEmpty() && taskToReveal.equals(str(task, "id"))) target = check;
                 check.setOnClickListener(v -> {
                     if (outstanding != 0) {
                         check.setChecked(task.optBoolean("done"));
@@ -836,6 +858,26 @@ public final class MainActivity extends Activity {
                 });
             }
         }
+        CheckBox targetCheck = target;
+        scroll.addOnLayoutChangeListener(new View.OnLayoutChangeListener() {
+            @Override public void onLayoutChange(View view, int left, int top, int right, int bottom,
+                    int oldLeft, int oldTop, int oldRight, int oldBottom) {
+                scroll.removeOnLayoutChangeListener(this);
+                if (targetCheck != null) {
+                    int y = targetCheck.getTop();
+                    boolean outside = y < scroll.getScrollY()
+                            || y + targetCheck.getHeight() > scroll.getScrollY() + scroll.getHeight();
+                    targetCheck.requestFocusFromTouch();
+                    if (outside)
+                        scroll.scrollTo(0, y - (scroll.getHeight() - targetCheck.getHeight()) / 2);
+                } else {
+                    scroll.scrollTo(0, previousOffset);
+                }
+                pendingTaskId = "";
+                detailOffset = scroll.getScrollY();
+                scroll.setOnScrollChangeListener((v, x, y, oldX, oldY) -> detailOffset = y);
+            }
+        });
         String note = str(e, "note");
         label(form, "Дневник события", 19);
         if (!note.isEmpty())
