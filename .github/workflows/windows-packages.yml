@@ -1,4 +1,4 @@
-name: Проверка Windows-пакетов выпуска
+name: Проверка Windows x64 и x86 с заложенным рендерером
 on:
   workflow_dispatch:
     inputs:
@@ -10,38 +10,84 @@ on:
         description: Идентификатор черновика для проверки перед публикацией
         required: false
         type: string
+      renderer_draft:
+        description: Черновик с проверенными тестовыми DLL Mesa
+        required: true
+        type: string
       architecture:
         description: Архитектура пакета
         type: choice
         default: all
-        options: [all, x64, x86, ARM64]
+        options: [all, x64, x86]
 permissions: {}
 jobs:
   smoke:
+    env:
+      PACKAGE_SOURCE_SHA: afc980184eea4df1976aa36ec5bbe99cf3b6650e
     permissions:
       contents: write
     strategy:
       fail-fast: false
       matrix:
-        arch: ${{ fromJSON(inputs.architecture == 'all' && '["x64","x86","ARM64"]' || format('["{0}"]', inputs.architecture)) }}
-    runs-on: ${{ matrix.arch == 'ARM64' && 'windows-11-arm' || 'windows-2022' }}
+        arch: ${{ fromJSON(inputs.architecture == 'all' && '["x64","x86"]' || format('["{0}"]', inputs.architecture)) }}
+    runs-on: windows-2022
     timeout-minutes: 40
     steps:
       - name: Скачать скрипт проверки на текущем коммите
         shell: pwsh
         run: |
           git init --quiet
-          git fetch --quiet --no-tags --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:GITHUB_SHA
+          git fetch --quiet --no-tags --depth=1 "https://github.com/$env:GITHUB_REPOSITORY.git" $env:PACKAGE_SOURCE_SHA
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           git checkout --quiet --detach FETCH_HEAD
+          if ((git rev-parse HEAD) -ne $env:PACKAGE_SOURCE_SHA) { throw 'Unexpected product source' }
       - name: Создать отдельный закрытый том NTFS для тестового профиля
         shell: pwsh
         run: ./packaging/windows/test-volume.ps1
-      - name: Собрать графический драйвер для виртуальной машины без GPU
+      - name: Получить проверенные тестовые DLL
         shell: pwsh
         env:
+          GH_TOKEN: ${{ github.token }}
+          RENDERER_DRAFT: ${{ inputs.renderer_draft }}
           PACKAGE_ARCH: ${{ matrix.arch }}
-        run: ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH
+        run: |
+          $ErrorActionPreference = 'Stop'
+          @'
+          from hashlib import sha256
+          import json, os, re, subprocess, zipfile
+          from pathlib import Path
+          arch = os.environ["PACKAGE_ARCH"]
+          pins = {
+              "x64": "6052db4fcde9cdcc6baf70d6ab81255264b8b6180398214652d5b91fbb0147c7",
+              "x86": "b99a5301076b85c6ddd1f7902d0829d6c18db310f2943640199fd91571acf455",
+          }
+          draft_id = os.environ["RENDERER_DRAFT"]
+          assert re.fullmatch(r"[0-9]+", draft_id)
+          name = f"Mesa-26.3.1-Softpipe-Windows-{arch}-local-QA.zip"
+          api = "repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases"
+          release = json.loads(subprocess.check_output(["gh", "api", f"{api}/{draft_id}"], timeout=30))
+          assert release["draft"] is True
+          assets = [a for a in release["assets"] if a["name"] == name and a["state"] == "uploaded"]
+          assert len(assets) == 1
+          asset = assets[0]
+          assert isinstance(asset["id"], int) and asset["digest"] == "sha256:" + pins[arch]
+          work = Path(os.environ["RUNNER_TEMP"]) / "renderer-pinned"
+          work.mkdir()
+          archive_path = work / name
+          with archive_path.open("xb") as out:
+              subprocess.run(["gh","api",f"{api}/assets/{asset['id']}","-H","Accept: application/octet-stream"],
+                             stdout=out, timeout=90, check=True)
+          actual = sha256(archive_path.read_bytes()).hexdigest()
+          assert actual == pins[arch] and archive_path.stat().st_size == asset["size"]
+          with zipfile.ZipFile(archive_path) as archive:
+              for dll in ("opengl32.dll", "libgallium_wgl.dll"):
+                  assert archive.namelist().count(dll) == 1
+                  (work/dll).write_bytes(archive.read(dll))
+          print("Verified renderer", name, actual)
+          with open(os.environ["GITHUB_ENV"],"a",encoding="utf-8") as env:
+              env.write(f"GP_TEST_RENDERER={work}\n")
+          '@ | python -
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
       - name: Скачать архивы зафиксированного черновика
         if: ${{ inputs.draft_id != '' }}
         shell: pwsh
@@ -52,6 +98,7 @@ jobs:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: |
           $assetDir = Join-Path $env:RUNNER_TEMP windows-packages
+          $env:GITHUB_SHA = $env:PACKAGE_SOURCE_SHA
           python packaging/windows/smoke.py --fetch-draft $assetDir
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           "RELEASE_ASSET_DIR=$assetDir" >> $env:GITHUB_ENV
@@ -60,4 +107,7 @@ jobs:
         env:
           RELEASE_TAG: ${{ inputs.tag }}
           PACKAGE_ARCH: ${{ matrix.arch }}
-        run: python packaging/windows/smoke.py
+        run: |
+          $env:GITHUB_SHA = $env:PACKAGE_SOURCE_SHA
+          python packaging/windows/smoke.py
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
