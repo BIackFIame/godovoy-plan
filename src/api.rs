@@ -68,9 +68,23 @@ impl ApiState {
         }
     }
 
+    async fn import(
+        self,
+        source: String,
+        batch: ImportBatch,
+        credential: Credential,
+    ) -> ApiResult<Vec<ImportResult>> {
+        self.write(
+            move |store| apply_import(&store, &source, batch, credential),
+            |rows| rows.iter().any(|row| row.changed),
+        )
+        .await
+    }
+
     async fn write<T: Send + 'static>(
         self,
         operation: impl FnOnce(SharedStore) -> ApiResult<T> + Send + 'static,
+        changed: impl FnOnce(&T) -> bool + Send + 'static,
     ) -> ApiResult<T> {
         let unavailable = || {
             error(
@@ -85,8 +99,12 @@ impl ApiState {
             .map_err(|_| unavailable())?;
         // The worker owns the permit even if the client disconnects or times out.
         tokio::task::spawn_blocking(move || {
-            let _permit = permit;
-            operation(self.store)
+            let result = operation(self.store);
+            drop(permit);
+            if result.as_ref().is_ok_and(changed) {
+                self.reader.repaint_window();
+            }
+            result
         })
         .await
         .map_err(|_| unavailable())?
@@ -299,11 +317,11 @@ impl Year {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct EventView {
+struct EventView<'a> {
     id: Id,
     year: i32,
-    title: String,
-    description: String,
+    title: &'a str,
+    description: &'a str,
     category: Category,
     date: NaiveDate,
     yearly: bool,
@@ -311,26 +329,41 @@ struct EventView {
     employee_id: Option<Id>,
     preparation_days: u16,
     preparation_date: NaiveDate,
-    checklist: Vec<TaskView>,
-    diary: String,
-    source: Option<ExternalSource>,
+    checklist: ChecklistView<'a>,
+    diary: &'a str,
+    source: Option<&'a ExternalSource>,
 }
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct TaskView {
+struct TaskView<'a> {
     id: Id,
-    title: String,
+    title: &'a str,
     due_date: NaiveDate,
     days_before: u16,
     done: bool,
 }
 
-fn view(event: Occurrence<'_>, calendar: &Calendar) -> EventView {
+struct ChecklistView<'a>(Occurrence<'a>);
+
+impl Serialize for ChecklistView<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let event = self.0;
+        serializer.collect_seq(event.event.tasks.iter().map(|task| TaskView {
+            id: task.id,
+            title: &task.title,
+            due_date: event.due(task),
+            days_before: task.days_before,
+            done: event.checked(task.id),
+        }))
+    }
+}
+
+fn view<'a>(event: Occurrence<'a>, calendar: &'a Calendar) -> EventView<'a> {
     EventView {
         id: event.id,
         year: event.year,
-        title: event.event.title.clone(),
-        description: event.event.description.clone(),
+        title: &event.event.title,
+        description: &event.event.description,
         category: event.event.category,
         date: event.date,
         yearly: event.event.yearly,
@@ -338,27 +371,16 @@ fn view(event: Occurrence<'_>, calendar: &Calendar) -> EventView {
         employee_id: event.event.owner.map(|id| calendar.person_for(id)),
         preparation_days: event.event.preparation_days,
         preparation_date: event.preparation_date(),
-        checklist: event
-            .event
-            .tasks
-            .iter()
-            .map(|task| TaskView {
-                id: task.id,
-                title: task.title.clone(),
-                due_date: event.due(task),
-                days_before: task.days_before,
-                done: event.checked(task.id),
-            })
-            .collect(),
-        diary: event.note().to_owned(),
-        source: calendar.plans[&event.id].source.clone(),
+        checklist: ChecklistView(event),
+        diary: event.note(),
+        source: calendar.plans[&event.id].source.as_ref(),
     }
 }
 
 async fn list(
     Extension(snapshot): Extension<ProfileSnapshot>,
     Query(query): Query<Year>,
-) -> ApiResult<Json<Vec<EventView>>> {
+) -> ApiResult<Response> {
     let year = query.value()?;
     let calendar = &snapshot
         .state
@@ -370,33 +392,50 @@ async fn list(
     if !(1..=200).contains(&max) {
         return Err(invalid("limit должен быть от 1 до 200."));
     }
-    Ok(Json(
-        calendar
-            .year(year)
-            .into_iter()
-            .skip(query.offset.unwrap_or(0))
-            .take(max)
-            .map(|event| view(event, calendar))
-            .collect(),
-    ))
+    let offset = query.offset.unwrap_or(0);
+    let mut rows = Vec::new();
+    if offset < calendar.plans.len() {
+        // The key is also the order used by Calendar::year. Select the requested
+        // portion before constructing full occurrences for the outgoing page.
+        let mut keys: Vec<_> = calendar
+            .occurrences(year)
+            .map(|event| (event.date, event.id))
+            .collect();
+        if offset < keys.len() {
+            if offset != 0 {
+                keys.select_nth_unstable(offset);
+            }
+            let remaining = &mut keys[offset..];
+            let page_len = max.min(remaining.len());
+            if page_len < remaining.len() {
+                remaining.select_nth_unstable(page_len);
+            }
+            let page = &mut remaining[..page_len];
+            page.sort_unstable();
+            rows.extend(
+                page.iter()
+                    .filter_map(|&(_, id)| calendar.event(id, year))
+                    .map(|event| view(event, calendar)),
+            );
+        }
+    }
+    Ok(Json(rows).into_response())
 }
 
 async fn event(
     Extension(snapshot): Extension<ProfileSnapshot>,
     Path(id): Path<Id>,
     Query(query): Query<Year>,
-) -> ApiResult<Json<EventView>> {
-    let year = query.value()?;
-    let calendar = &snapshot
-        .state
-        .workspace
-        .as_ref()
-        .ok_or_else(no_workspace)?
-        .calendar;
+) -> ApiResult<Response> {
+    event_response(&snapshot.state, id, query.value()?)
+}
+
+fn event_response(state: &LocalState, id: Id, year: i32) -> ApiResult<Response> {
+    let calendar = &state.workspace.as_ref().ok_or_else(no_workspace)?.calendar;
     let occurrence = calendar
         .event(id, year)
         .ok_or_else(|| error(StatusCode::NOT_FOUND, "Событие не найдено."))?;
-    Ok(Json(view(occurrence, calendar)))
+    Ok(Json(view(occurrence, calendar)).into_response())
 }
 
 #[derive(Serialize)]
@@ -534,18 +573,23 @@ async fn create(
     input: Result<Json<EventInput>, JsonRejection>,
 ) -> ApiResult<impl IntoResponse> {
     let input = body(input)?;
-    let event = api
-        .write(move |store| create_event(&store, input, credential))
+    let id = Id::new_v4();
+    let year = input.date.year();
+    let snapshot = api
+        .write(
+            move |store| create_event(&store, input, credential, id),
+            |_| true,
+        )
         .await?;
-    Ok((StatusCode::CREATED, Json(event)))
+    Ok((StatusCode::CREATED, event_response(&snapshot, id, year)?))
 }
 
 fn create_event(
     store: &SharedStore,
     input: EventInput,
     credential: Credential,
-) -> ApiResult<EventView> {
-    let id = Id::new_v4();
+    id: Id,
+) -> ApiResult<Arc<LocalState>> {
     let year = input.date.year();
     let mut store = store.lock().unwrap();
     credential.require_current(store.state())?;
@@ -568,12 +612,10 @@ fn create_event(
                 .or_default()
                 .templates
                 .insert(year, Record::new(revision, Some(event.into())));
-            let event = calendar
-                .event(id, year)
-                .ok_or("Не удалось прочитать созданное событие.")?;
-            Ok(view(event, calendar))
+            Ok(())
         })
-        .map_err(|e| invalid(e.to_string()))
+        .map_err(|e| invalid(e.to_string()))?;
+    Ok(store.snapshot())
 }
 
 async fn import(
@@ -583,9 +625,7 @@ async fn import(
     input: Result<Json<ImportBatch>, JsonRejection>,
 ) -> ApiResult<Json<Vec<ImportResult>>> {
     let batch = body(input)?;
-    api.write(move |store| apply_import(&store, &source, batch, credential))
-        .await
-        .map(Json)
+    api.import(source, batch, credential).await.map(Json)
 }
 
 fn apply_import(
@@ -819,5 +859,72 @@ mod tests {
                 .plans
                 .is_empty()
         );
+    }
+
+    #[cfg(feature = "desktop")]
+    #[tokio::test]
+    async fn only_changed_authorized_imports_notify_the_window_after_publication() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("profile")).unwrap();
+        store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                state.create_workspace("Тест".into(), "Анна".into())?;
+                state.api = Some(ApiSettings {
+                    token: [1; 32],
+                    import_token: Some([2; 32]),
+                    port: 0,
+                    enabled: true,
+                });
+                Ok(())
+            })
+            .unwrap();
+        let api = ApiState::new(store.clone());
+        let weak = Arc::downgrade(&store);
+        let calls = Arc::new(AtomicUsize::default());
+        let seen = calls.clone();
+        let callback: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            let store = weak.upgrade().unwrap();
+            let committed = store.try_lock().unwrap();
+            assert_eq!(
+                committed
+                    .state()
+                    .workspace
+                    .as_ref()
+                    .unwrap()
+                    .calendar
+                    .plans
+                    .len(),
+                1
+            );
+            seen.fetch_add(1, Ordering::Relaxed);
+        });
+        api.reader.observe_window(&callback);
+        let import = |key, title| {
+            api.clone().import(
+            "office".into(),
+            serde_json::from_value(serde_json::json!({"events":[{"externalId":"1","event":{"title":title,"date":"2026-11-20"}}]})).unwrap(),
+            Credential::Import(key),
+        )
+        };
+        assert!(import([2; 32], "Поздравления").await.unwrap()[0].changed);
+        assert!(!import([2; 32], "Поздравления").await.unwrap()[0].changed);
+        store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                state.api.as_mut().unwrap().import_token = Some([3; 32]);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            import([2; 32], "Запрещено").await.err().unwrap().0,
+            StatusCode::UNAUTHORIZED
+        );
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert!(import([3; 32], "Обновление").await.unwrap()[0].changed);
+        assert_eq!(calls.load(Ordering::Relaxed), 2);
     }
 }

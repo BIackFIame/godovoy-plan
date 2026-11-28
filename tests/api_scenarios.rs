@@ -276,6 +276,45 @@ fn list_pagination_returns_right_ids_in_calendar_order() {
 }
 
 #[test]
+fn tied_dates_have_stable_ids_across_partial_page_boundaries() {
+    let client = Client::new();
+    let mut expected = Vec::new();
+    for (index, date) in [3, 1, 3, 2, 2, 1, 3, 2, 1].into_iter().enumerate() {
+        let row = client
+            .post(&json!({
+                "title": format!("Подготовка №{index}"),
+                "date": format!("2028-02-{date:02}"),
+                "yearly": index % 2 == 0
+            }))
+            .unwrap();
+        expected.push((date, row["id"].as_str().unwrap().to_owned(), index % 2 == 0));
+    }
+    expected.sort_unstable();
+    for year in [2028, 2029] {
+        let ids: Vec<_> = expected
+            .iter()
+            .filter(|row| year == 2028 || row.2)
+            .map(|row| row.1.as_str())
+            .collect();
+        for offset in [0, 1, 3, 6, ids.len(), usize::MAX] {
+            for limit in [1, 3, 200] {
+                let rows = client
+                    .get(&format!("events?year={year}&offset={offset}&limit={limit}"))
+                    .unwrap();
+                let actual: Vec<_> = rows
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|row| row["id"].as_str().unwrap())
+                    .collect();
+                let start = offset.min(ids.len());
+                assert_eq!(actual, ids[start..(start + limit).min(ids.len())]);
+            }
+        }
+    }
+}
+
+#[test]
 fn source_updates_retain_identity_and_apply_only_supplied_fields() {
     let c = Client::new();
     let owner = c.get("members").unwrap()[0]["id"].clone();

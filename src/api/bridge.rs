@@ -12,9 +12,7 @@ use tokio::{
     net::TcpStream,
 };
 
-use super::{
-    ApiState, BODY_LIMIT, Credential, ImportBatch, ImportResult, apply_import, valid_source,
-};
+use super::{ApiState, BODY_LIMIT, Credential, ImportBatch, ImportResult, valid_source};
 use crate::{Fallible, storage::LimitedWriter};
 
 pub(super) const PREFIX: [u8; 8] = *b"\0YRAPI01";
@@ -232,14 +230,7 @@ pub(super) async fn serve(
     }
     let request: Request = receive(&mut stream, &mut transport).await?;
     let reply = match api
-        .write(move |store| {
-            apply_import(
-                &store,
-                &request.source,
-                request.batch,
-                Credential::Import(token),
-            )
-        })
+        .import(request.source, request.batch, Credential::Import(token))
         .await
     {
         Ok(rows) => Reply::Applied(rows),
@@ -277,9 +268,12 @@ async fn send_report_frame(
     transport: &mut TransportState,
     payload: &[u8],
 ) -> Fallible<()> {
-    let mut frame = [0; REPORT_LIMIT + TAG];
-    let count = transport.write_message(payload, &mut frame)?;
-    write_frame(stream, &frame[..count]).await
+    let mut frame = [0; 2 + REPORT_LIMIT + TAG];
+    let count = transport.write_message(payload, &mut frame[2..])?;
+    stream
+        .write_all(frame_with_length(&mut frame, count)?)
+        .await?;
+    Ok(())
 }
 
 async fn receive_report_frame<'a>(
@@ -294,9 +288,12 @@ async fn receive_report_frame<'a>(
 }
 
 async fn send_handshake(stream: &mut TcpStream, handshake: &mut HandshakeState) -> Fallible<()> {
-    let mut frame = [0; 128];
-    let size = handshake.write_message(&[], &mut frame)?;
-    write_frame(stream, &frame[..size]).await
+    let mut frame = [0; 2 + 128];
+    let size = handshake.write_message(&[], &mut frame[2..])?;
+    stream
+        .write_all(frame_with_length(&mut frame, size)?)
+        .await?;
+    Ok(())
 }
 
 async fn read_handshake(stream: &mut TcpStream, handshake: &mut HandshakeState) -> Fallible<()> {
@@ -308,10 +305,9 @@ async fn read_handshake(stream: &mut TcpStream, handshake: &mut HandshakeState) 
     Ok(())
 }
 
-async fn write_frame(stream: &mut TcpStream, message: &[u8]) -> Fallible<()> {
-    stream.write_u16(u16::try_from(message.len())?).await?;
-    stream.write_all(message).await?;
-    Ok(())
+fn frame_with_length(buffer: &mut [u8], payload_len: usize) -> Fallible<&[u8]> {
+    buffer[..2].copy_from_slice(&u16::try_from(payload_len)?.to_be_bytes());
+    Ok(&buffer[..2 + payload_len])
 }
 
 async fn read_frame<'a>(stream: &mut TcpStream, buffer: &'a mut [u8]) -> Fallible<&'a [u8]> {
@@ -338,11 +334,31 @@ pub(super) async fn send_payload(
     transport: &mut TransportState,
     json: &[u8],
 ) -> Fallible<()> {
+    send_payload_checked(stream, transport, json, || Ok(())).await
+}
+
+pub(super) async fn send_payload_checked(
+    stream: &mut TcpStream,
+    transport: &mut TransportState,
+    json: &[u8],
+    mut authorize: impl FnMut() -> Fallible<()>,
+) -> Fallible<()> {
     let size = u32::try_from(json.len())?.to_be_bytes();
-    let mut buffer = vec![0; json.len().clamp(4, CHUNK) + TAG];
-    for chunk in std::iter::once(size.as_slice()).chain(json.chunks(CHUNK)) {
-        let written = transport.write_message(chunk, &mut buffer)?;
-        write_frame(stream, &buffer[..written]).await?;
+    // Keep the encrypted size frame and first data frame in the same socket write.
+    // Each frame retains its own Noise nonce, length and authentication tag.
+    let mut buffer = vec![0; 2 + size.len() + TAG + 2 + json.len().min(CHUNK) + TAG];
+    let size_len = transport.write_message(&size, &mut buffer[2..])?;
+    let mut prefix = frame_with_length(&mut buffer, size_len)?.len();
+    for chunk in json.chunks(CHUNK) {
+        authorize()?;
+        let written = transport.write_message(chunk, &mut buffer[prefix + 2..])?;
+        let end = prefix + frame_with_length(&mut buffer[prefix..], written)?.len();
+        stream.write_all(&buffer[..end]).await?;
+        prefix = 0;
+    }
+    if json.is_empty() {
+        authorize()?;
+        stream.write_all(&buffer[..prefix]).await?;
     }
     Ok(())
 }
@@ -389,6 +405,44 @@ mod tests {
         api::ApiServer,
         storage::{ApiSettings, Store},
     };
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_partial_payload_is_discarded_when_access_ends_between_chunks() {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let token = [17; 32];
+        let (checks, reply) = tokio::join!(
+            async {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut prefix = [0; 8];
+                stream.read_exact(&mut prefix).await.unwrap();
+                assert_eq!(prefix, PREFIX);
+                let mut transport = accept(&mut stream, &token, CONTEXT).await.unwrap();
+                let mut checks = 0;
+                let result =
+                    send_payload_checked(&mut stream, &mut transport, &vec![7; CHUNK + 1], || {
+                        checks += 1;
+                        if checks == 1 {
+                            Ok(())
+                        } else {
+                            Err("Отозвано".into())
+                        }
+                    })
+                    .await;
+                assert!(result.is_err());
+                checks
+            },
+            async {
+                let (mut stream, mut transport) =
+                    connect(port, &token, &PREFIX, CONTEXT).await.unwrap();
+                receive_payload(&mut stream, &mut transport, CHUNK + 1).await
+            }
+        );
+        assert_eq!(checks, 2);
+        assert!(reply.is_err());
+    }
 
     #[tokio::test(flavor = "current_thread")]
     async fn a_sent_batch_with_no_reply_has_unknown_confirmation() {

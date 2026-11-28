@@ -1,31 +1,29 @@
 use std::{
-    collections::BTreeSet,
-    net::SocketAddrV4,
+    collections::{BTreeSet, HashMap},
     path::PathBuf,
     sync::{
         Arc, Weak,
-        mpsc::{Receiver, TryRecvError, sync_channel},
+        atomic::{AtomicBool, Ordering},
     },
-    thread,
     time::{Duration, Instant},
 };
 
-use chrono::{Datelike, Days, Local, Months, NaiveDate, TimeZone};
+use chrono::{Datelike, Days, Local, Months, NaiveDate};
 use eframe::egui::{
-    self, Align, Button, ComboBox, DragValue, Frame, Layout, Margin, Panel, RichText, ScrollArea,
-    Stroke, TextEdit, Ui, Vec2, vec2,
+    self, Align, Button, ComboBox, Frame, Layout, Margin, Panel, RichText, ScrollArea, Stroke,
+    TextEdit, Ui, Vec2, vec2,
 };
 use godovoy_plan::{
     Fallible,
-    api::{self, BridgeOutcome},
-    exchange::{EXCHANGE_EXTENSION, export_file, import_file},
-    model::{Calendar, Category, Event, Id, Occurrence, Record, Revision, Task, YearChange},
-    network::{Config, Network, SYNC_PORT},
+    model::{
+        Calendar, Category, Event, Id, MAX_DESCRIPTION_CHARS, MAX_NOTE_CHARS, MAX_PREPARATION_DAYS,
+        MAX_TASKS, MAX_TITLE_CHARS, Occurrence, Record, Revision, Task, YearChange,
+    },
+    network::{Config, Network},
     planning::{self, AgendaItem, Horizon, Milestone, OwnerFilter, Reminder},
     storage::{
-        BackupEntry, BridgeRunStatus, CALENDAR_MESSAGE_LIMIT, ImportResultKind, ImportStatus,
-        LocalState, ProfileSizeLimit, ProfileUsage, ReminderRecovery, ReminderStore, RestoreResult,
-        SharedStore, Store, StoreReader, Workspace,
+        BackupEntry, CALENDAR_MESSAGE_LIMIT, LocalState, ProfileSizeLimit, ProfileUsage,
+        ReminderRecovery, ReminderStore, RestoreResult, SharedStore, StoreReader, Workspace,
     },
 };
 use serde::{Deserialize, Serialize};
@@ -33,7 +31,6 @@ use serde::{Deserialize, Serialize};
 use crate::{
     autostart,
     chart::{draw_marker, legend_marker, year_wheel},
-    file_picker::{pick_exchange_to_open, pick_exchange_to_save, reveal_exchange_file},
     notifications::{Delivery, TestStatus},
     theme::{
         self, ACCENT, ACTION_TEXT, BACK, BORDER, DUE_TODAY, GREEN, INK, MUTED, NAV,
@@ -44,18 +41,53 @@ use crate::{
 };
 
 mod api_controls;
+mod backups;
+mod connections;
 mod drafts;
 mod editor_fields;
+mod file_exchange;
 use editor_fields::editor_fields;
 mod hosted;
+mod integrations;
 mod people;
 mod reminder_work;
-use api_controls::{Action as ApiAction, ApiControls};
+use backups::Backups;
+pub use backups::RestoreRequest;
+use connections::SyncSettings;
 use drafts::{Drafts, MAX_NOTE_DRAFTS};
-use people::{DeviceAssignments, employee_options};
+use file_exchange::FileExchange;
+use integrations::Integrations;
+use people::employee_options;
 use reminder_work::{ReminderWork, Status as ReminderWorkStatus};
 
 const COMPACT_CALENDAR_WIDTH: f32 = 1040.0;
+const PEER_STATUS_WIDTH: f32 = 1150.0;
+
+pub(crate) fn feedback(ui: &mut Ui, message: &str, is_error: bool) {
+    ui.colored_label(if is_error { RED } else { MUTED }, message);
+}
+
+pub(crate) fn spawn_worker<T, F>(
+    name: &str,
+    ctx: &egui::Context,
+    work: F,
+) -> std::io::Result<std::sync::mpsc::Receiver<T>>
+where
+    T: Send + 'static,
+    F: FnOnce() -> Option<T> + Send + 'static,
+{
+    let (send, completed) = std::sync::mpsc::sync_channel(1);
+    let worker_ctx = ctx.clone();
+    std::thread::Builder::new()
+        .name(name.into())
+        .spawn(move || {
+            if let Some(result) = work() {
+                let _ = send.send(result);
+            }
+            worker_ctx.request_repaint();
+        })?;
+    Ok(completed)
+}
 
 #[derive(Clone, Copy, PartialEq)]
 enum Page {
@@ -65,10 +97,34 @@ enum Page {
     Reminders,
 }
 
+struct AgendaReturn {
+    row: AgendaItem,
+    next: Option<AgendaItem>,
+    previous: Option<AgendaItem>,
+    index: usize,
+    offset_from_row: f32,
+}
+
+impl AgendaReturn {
+    fn target(&self, rows: &[AgendaItem]) -> usize {
+        [Some(self.row), self.next, self.previous]
+            .into_iter()
+            .flatten()
+            .find_map(|target| rows.iter().position(|row| *row == target))
+            .unwrap_or_else(|| self.index.min(rows.len().saturating_sub(1)))
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 enum Scope {
     ThisYear,
     Future,
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum EditorConfirmation {
+    Remove,
+    Discard,
 }
 
 struct Editor {
@@ -81,8 +137,7 @@ struct Editor {
     scope: Scope,
     initial_scope: Scope,
     error: Option<String>,
-    confirm_remove: bool,
-    confirm_discard: bool,
+    confirmation: Option<EditorConfirmation>,
     focus_title: bool,
     focus_new_task: bool,
 }
@@ -184,8 +239,7 @@ impl Editor {
             scope,
             initial_scope: scope,
             error: None,
-            confirm_remove: false,
-            confirm_discard: false,
+            confirmation: None,
             focus_title: existing.is_none(),
             focus_new_task: false,
         }
@@ -214,16 +268,21 @@ impl Editor {
         }
         let mut event = self.event.clone();
         event.title = event.title.trim().to_owned();
-        if event.title.is_empty() || event.title.chars().count() > 160 {
-            return Err("Введите название длиной от 1 до 160 символов.".into());
+        if event.title.is_empty() || event.title.chars().count() > MAX_TITLE_CHARS {
+            return Err(
+                format!("Введите название длиной от 1 до {MAX_TITLE_CHARS} символов.").into(),
+            );
         }
         if self.date_input.trim() != self.initial_date_input || self.existing.is_none() {
             event.date = date;
         }
         for task in &mut event.tasks {
             task.title = task.title.trim().to_owned();
-            if task.title.is_empty() || task.title.chars().count() > 160 {
-                return Err("Заполните названия всех пунктов чек-листа, до 160 символов.".into());
+            if task.title.is_empty() || task.title.chars().count() > MAX_TITLE_CHARS {
+                return Err(format!(
+                    "Заполните названия всех пунктов чек-листа, до {MAX_TITLE_CHARS} символов."
+                )
+                .into());
             }
             if task.days_before > event.preparation_days {
                 return Err("Пункт чек-листа не может быть раньше начала подготовки.".into());
@@ -246,7 +305,7 @@ struct NoteDraft {
 pub(crate) struct CalendarRow {
     pub(crate) id: Id,
     pub(crate) date: NaiveDate,
-    pub(crate) title: String,
+    pub(crate) title: Arc<str>,
     pub(crate) category: Category,
 }
 
@@ -256,13 +315,20 @@ struct CalendarView {
     search: String,
     category: Option<Category>,
     rows: Arc<[CalendarRow]>,
+    normalized_titles: Option<HashMap<Id, String>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct TaskRow {
     event: Id,
     year: i32,
-    task: Option<usize>,
+    kind: TaskRowKind,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskRowKind {
+    Event,
+    Checklist { index: usize, due: NaiveDate },
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -285,6 +351,7 @@ struct PersonalView {
     today: NaiveDate,
     events: Vec<(Id, i32)>,
     task_rows: Option<TaskRows>,
+    all_task_rows: Option<Arc<[TaskRow]>>,
     pending: Arc<[Reminder]>,
     open_count: usize,
 }
@@ -316,51 +383,6 @@ enum CapacityPrompt {
     RestoreFocus(egui::Id),
 }
 
-#[derive(Default)]
-struct FileExchange {
-    path: String,
-    dropped: Option<PathBuf>,
-    exported: Option<PathBuf>,
-    job: Option<Receiver<Fallible<ExchangeResult>>>,
-    status: Option<(String, bool)>,
-}
-
-#[derive(Clone, Copy)]
-enum ExchangeOperation {
-    Export,
-    Import,
-    Reveal,
-}
-
-enum ExchangeRequest {
-    PickExport,
-    PickImport,
-    Use(ExchangeOperation, PathBuf),
-}
-
-enum ExchangeResult {
-    Exported(PathBuf),
-    Imported { changed: bool },
-    Revealed,
-}
-
-#[derive(Default)]
-enum BackupCreation {
-    #[default]
-    Idle,
-    Writing(Receiver<Fallible<BackupEntry>>),
-    Finished {
-        message: String,
-        error: bool,
-        notice: bool,
-    },
-}
-
-pub enum RestoreRequest {
-    Choose,
-    ReturnTo(BackupEntry),
-}
-
 enum DesktopTransport {
     Waiting(Config),
     Started(Result<Network, String>),
@@ -384,22 +406,70 @@ impl DesktopTransport {
     }
 }
 
+#[derive(Clone, Copy, Default)]
+pub(crate) struct WorkStatus {
+    pub(crate) busy: bool,
+    pub(crate) failed: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+pub(crate) struct LocalWorkStatus {
+    pub(crate) exchange: WorkStatus,
+    pub(crate) reminders: WorkStatus,
+    pub(crate) api: WorkStatus,
+    pub(crate) backup: WorkStatus,
+}
+
+impl LocalWorkStatus {
+    pub(crate) fn any_busy(self) -> bool {
+        self.exchange.busy || self.reminders.busy || self.api.busy || self.backup.busy
+    }
+
+    pub(crate) fn with_backup_was_writing(mut self, was_writing: bool) -> Self {
+        self.backup.busy |= was_writing;
+        self
+    }
+
+    pub(crate) fn failed_for(self, current: Self) -> bool {
+        (self.exchange.busy && current.exchange.failed)
+            || (self.reminders.busy && current.reminders.failed)
+            || (self.api.busy && current.api.failed)
+            || (self.backup.busy && current.backup.failed)
+    }
+
+    pub(crate) fn caption(self) -> &'static str {
+        match (
+            self.exchange.busy,
+            self.reminders.busy,
+            self.api.busy,
+            self.backup.busy,
+        ) {
+            (true, false, false, false) => "Завершаем обмен через файл",
+            (false, true, false, false) => "Сохраняем отметки напоминаний",
+            (false, false, true, false) => "Завершаем работу с интеграциями",
+            (false, false, false, true) => "Сохраняем резервную копию",
+            _ => "Завершаем локальные операции",
+        }
+    }
+}
+
 pub struct App {
     store: SharedStore,
     reader: StoreReader,
     network: DesktopTransport,
+    window_repaint: Option<Arc<dyn Fn() + Send + Sync>>,
+    window_visible: Arc<AtomicBool>,
     page: Page,
     year: i32,
     selected: Option<Id>,
+    selected_index: Option<usize>,
     reveal_event: bool,
     reveal_task: Option<AgendaItem>,
     search: String,
     search_focus: bool,
     category: Option<Category>,
     show_circle: bool,
-    integrations_open: bool,
-    confirm_token_change: bool,
-    api_controls: ApiControls,
+    integrations: Integrations,
     note_event: Option<(Id, i32)>,
     note: String,
     note_baseline: String,
@@ -408,30 +478,16 @@ pub struct App {
     editor: Option<Editor>,
     capacity_prompt: Option<CapacityPrompt>,
     drafts: Drafts,
-    backup_open: bool,
-    backup_folder: Option<PathBuf>,
-    latest_backup: Result<Option<BackupEntry>, String>,
-    backup_creation: BackupCreation,
-    backup_status: Option<(String, bool)>,
-    restore_result: Option<RestoreResult>,
+    backups: Backups,
     restore_requested: Option<RestoreRequest>,
-    connections: bool,
-    confirm_access_renewal: bool,
-    selected_revocations: BTreeSet<Id>,
-    device_assignments: DeviceAssignments,
-    access_work: bool,
+    sync: SyncSettings,
     pub renewed_profile: Option<std::path::PathBuf>,
-    sync_message: Option<(String, bool)>,
     file_exchange: FileExchange,
-    address: String,
-    join_code: String,
-    pairing_request: String,
     company: String,
     employee: String,
     hosted_entry: hosted::HostedEntry,
     join_mode: bool,
     onboarding_focus: bool,
-    join_result: Option<Receiver<Fallible<()>>>,
     message: Option<(String, bool)>,
     startup: Result<Startup, String>,
     startup_error: Option<String>,
@@ -439,6 +495,7 @@ pub struct App {
     personal: Option<PersonalView>,
     task_filter: TaskFilter,
     agenda: Option<AgendaView>,
+    agenda_return: Option<AgendaReturn>,
     agenda_overdue: bool,
     horizon: Horizon,
     owner_filter: OwnerFilter,
@@ -481,23 +538,24 @@ impl App {
                 guard.reminder_store(),
             )
         };
-        let api_controls = ApiControls::new(&store, reader.snapshot().state.api.as_ref());
+        let integrations = Integrations::new(&store, reader.snapshot().state.api.as_ref());
         let mut app = Self {
             store,
             reader,
             network,
+            window_repaint: None,
+            window_visible: Arc::new(AtomicBool::new(true)),
             page: Page::Calendar,
             year: Local::now().year(),
             selected: None,
+            selected_index: None,
             reveal_event: false,
             reveal_task: None,
             search: String::new(),
             search_focus: false,
             category: None,
             show_circle: true,
-            integrations_open: false,
-            confirm_token_change: false,
-            api_controls,
+            integrations,
             note_event: None,
             note: String::new(),
             note_baseline: String::new(),
@@ -506,30 +564,16 @@ impl App {
             editor: None,
             capacity_prompt: None,
             drafts: Drafts::default(),
-            backup_open: false,
-            backup_folder,
-            latest_backup: Ok(None),
-            backup_creation: BackupCreation::default(),
-            backup_status: None,
-            restore_result: None,
+            backups: Backups::new(backup_folder),
             restore_requested: None,
-            connections: false,
-            confirm_access_renewal: false,
-            selected_revocations: BTreeSet::new(),
-            device_assignments: DeviceAssignments::default(),
-            access_work: false,
+            sync: SyncSettings::default(),
             renewed_profile: None,
-            sync_message: None,
             file_exchange: FileExchange::default(),
-            address: String::new(),
-            join_code: String::new(),
-            pairing_request: String::new(),
             company: String::new(),
             employee: String::new(),
             hosted_entry: hosted::HostedEntry::default(),
             join_mode: false,
             onboarding_focus: true,
-            join_result: None,
             message: None,
             startup,
             startup_error: None,
@@ -537,6 +581,7 @@ impl App {
             personal: None,
             task_filter: TaskFilter::All,
             agenda: None,
+            agenda_return: None,
             agenda_overdue: false,
             horizon: Horizon::Days30,
             owner_filter: OwnerFilter::Everyone,
@@ -569,7 +614,7 @@ impl App {
                             );
                             muted(ui, "События, сроки подготовки и задачи в одном календаре.");
                             ui.add_space(12.0);
-                            let waiting = self.join_result.is_some();
+                            let waiting = self.sync.busy();
                             card().show(ui, |ui| {
                                 ui.add_enabled_ui(!waiting, |ui| {
                                     ui.horizontal(|ui| {
@@ -618,7 +663,7 @@ impl App {
                                     let caption = ui.label("Код приглашения");
                                     ui.add_enabled(
                                         !waiting,
-                                        TextEdit::singleline(&mut self.join_code)
+                                        TextEdit::singleline(&mut self.sync.join_code)
                                             .hint_text("Вставьте код от коллеги")
                                             .margin(theme::field_margin(ui))
                                             .char_limit(300)
@@ -637,7 +682,7 @@ impl App {
                                     .labelled_by(caption.id)
                                 };
                                 let required = if self.join_mode {
-                                    &self.join_code
+                                    &self.sync.join_code
                                 } else {
                                     &self.company
                                 };
@@ -671,13 +716,7 @@ impl App {
                                     ui.collapsing(
                                         "Указать сетевой адрес вручную",
                                         |ui| {
-                                            ui.add(
-                                                TextEdit::singleline(&mut self.address)
-                                                    .hint_text("192.168.1.15:45736")
-                                                    .margin(theme::field_margin(ui))
-                                                    .desired_width(f32::INFINITY)
-                                                    .char_limit(40),
-                                            );
+                                            self.sync.address_field(ui, f32::INFINITY);
                                         },
                                     );
                                 }
@@ -687,14 +726,14 @@ impl App {
                             self.hosted_entry.show(ui);
                             let ui = &mut columns[1];
                             ui.add_space(10.0);
-                            year_wheel(ui, today.year(), today, &[], None);
+                            year_wheel(ui, 308.0, today.year(), today, &[], None);
                         });
                     });
             });
     }
 
     fn create(&mut self) {
-        if self.join_result.is_some() {
+        if self.sync.busy() {
             return;
         }
         let company = self.company.trim().to_owned();
@@ -709,28 +748,6 @@ impl App {
             .unwrap()
             .transaction(|state| state.create_workspace(company, employee));
         self.report(result, None);
-    }
-
-    fn begin_join(&mut self) {
-        let result = (|| -> Fallible<_> {
-            if self.join_code.trim().is_empty() || self.employee.trim().is_empty() {
-                return Err("Введите ваше имя и код приглашения.".into());
-            }
-            let address = if self.address.trim().is_empty() {
-                None
-            } else {
-                Some(parse_address(&self.address)?)
-            };
-            let network = self.network.enable(&self.store)?;
-            Ok(network.join_async(self.join_code.clone(), self.employee.clone(), address))
-        })();
-        match result {
-            Ok(receiver) => {
-                self.message = None;
-                self.join_result = Some(receiver);
-            }
-            Err(error) => self.fail(error.to_string()),
-        }
     }
 
     fn app_bar(
@@ -761,10 +778,12 @@ impl App {
                         ui.add_space(12.0);
                     }
                     if nav(ui, "Календарь", self.page == Page::Calendar) {
+                        self.agenda_return = None;
                         self.page = Page::Calendar;
                     }
                     let tasks = navigation_count("Мои задачи", count);
                     if nav(ui, &tasks, self.page == Page::Tasks) {
+                        self.agenda_return = None;
                         self.page = Page::Tasks;
                     }
                     if nav(ui, "Обзор", self.page == Page::Agenda) {
@@ -772,12 +791,13 @@ impl App {
                     }
                     let caption = navigation_count("Напоминания", pending);
                     if nav(ui, &caption, self.page == Page::Reminders) {
+                        self.agenda_return = None;
                         self.page = Page::Reminders;
                         self.message = None;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if nav(ui, "Интеграции", self.integrations_open) {
-                            self.integrations_open = true;
+                        if nav(ui, "Интеграции", self.integrations.is_open()) {
+                            self.integrations.open();
                         }
                         let sync_label =
                             if matches!(self.network, DesktopTransport::Started(Err(_))) {
@@ -787,12 +807,12 @@ impl App {
                             } else {
                                 "Синхронизация"
                             };
-                        if nav(ui, sync_label, self.connections) {
-                            self.connections = true;
+                        if nav(ui, sync_label, self.sync.open) {
+                            self.sync.open = true;
                             self.message = None;
                         }
                         ui.add_space(7.0);
-                        if ui.ctx().content_rect().width() >= 1150.0
+                        if ui.ctx().content_rect().width() >= PEER_STATUS_WIDTH
                             && let Ok(network) = self.network.as_ref()
                         {
                             let paused = network.paused();
@@ -812,42 +832,87 @@ impl App {
             });
     }
 
+    fn release_search_index(&mut self) {
+        if let Some(view) = &mut self.calendar_view {
+            view.normalized_titles = None;
+        }
+    }
+
     fn calendar_rows(&mut self, workspace: &Arc<Workspace>) -> Arc<[CalendarRow]> {
         let calendar = &workspace.calendar;
         let snapshot = Arc::downgrade(workspace);
-        let search = search_key(&self.search);
         if let Some(view) = &self.calendar_view
             && view.snapshot.ptr_eq(&snapshot)
             && view.year == self.year
             && view.category == self.category
-            && view.search == search
+            && view.search == self.search
         {
             return Arc::clone(&view.rows);
         }
-        let matches = |category, title: &str| {
-            self.category.is_none_or(|selected| selected == category)
-                && (search.is_empty() || search_key(title).contains(&search))
-        };
-        let rows: Arc<[CalendarRow]> = if let Some(previous) = &self.calendar_view
-            && previous.snapshot.ptr_eq(&snapshot)
-            && previous.year == self.year
-            && (previous.category.is_none() || previous.category == self.category)
-            && search.contains(&previous.search)
+        let mut previous = self
+            .calendar_view
+            .take()
+            .filter(|view| view.snapshot.ptr_eq(&snapshot) && view.year == self.year);
+        let search = search_key(&self.search);
+        let previous_search = previous
+            .as_ref()
+            .map_or_else(String::new, |view| search_key(&view.search));
+        if let Some(mut view) =
+            previous.take_if(|view| view.category == self.category && previous_search == search)
         {
-            previous
+            view.search.clone_from(&self.search);
+            let rows = Arc::clone(&view.rows);
+            self.calendar_view = Some(view);
+            return rows;
+        }
+        // A pasted query and the first character need no index. Build it only as
+        // the user continues the search, and release it when the search is cleared.
+        let mut normalized_titles = previous
+            .as_mut()
+            .filter(|_| !previous_search.is_empty() && !search.is_empty())
+            .map(|view| view.normalized_titles.take().unwrap_or_default());
+        let mut matches = |id, category, title: &str| {
+            self.category.is_none_or(|selected| selected == category)
+                && (search.is_empty()
+                    || match &mut normalized_titles {
+                        Some(titles) => titles
+                            .entry(id)
+                            .or_insert_with(|| search_key(title))
+                            .contains(&search),
+                        None => search_key(title).contains(&search),
+                    })
+        };
+        let rows: Arc<[CalendarRow]> = if let Some(previous) = &previous
+            && (previous.category.is_none() || previous.category == self.category)
+            && search.contains(&previous_search)
+        {
+            if let Some(first_removed) = previous
                 .rows
                 .iter()
-                .filter(|row| matches(row.category, &row.title))
-                .cloned()
-                .collect()
+                .position(|row| !matches(row.id, row.category, &row.title))
+            {
+                previous.rows[..first_removed]
+                    .iter()
+                    .chain(
+                        previous.rows[first_removed + 1..]
+                            .iter()
+                            .filter(|row| matches(row.id, row.category, &row.title)),
+                    )
+                    .cloned()
+                    .collect()
+            } else {
+                // Many calendars share a title prefix. Preserve the same rows
+                // while the next character leaves every result visible.
+                Arc::clone(&previous.rows)
+            }
         } else {
             let mut rows: Vec<_> = calendar
                 .occurrences(self.year)
-                .filter(|entry| matches(entry.event.category, &entry.event.title))
+                .filter(|entry| matches(entry.id, entry.event.category, &entry.event.title))
                 .map(|event| CalendarRow {
                     id: event.id,
                     date: event.date,
-                    title: event.event.title.clone(),
+                    title: Arc::from(event.event.title.as_str()),
                     category: event.event.category,
                 })
                 .collect();
@@ -857,9 +922,10 @@ impl App {
         self.calendar_view = Some(CalendarView {
             snapshot,
             year: self.year,
-            search,
+            search: self.search.clone(),
             category: self.category,
             rows: Arc::clone(&rows),
+            normalized_titles,
         });
         rows
     }
@@ -874,7 +940,9 @@ impl App {
         let calendar = &workspace.calendar;
         if let Some(id) = self.selected
             && self.calendar_view.as_ref().is_some_and(|view| {
-                view.year == self.year && view.rows.iter().any(|row| row.id == id)
+                view.year == self.year
+                    && !std::ptr::eq(view.snapshot.as_ptr(), Arc::as_ptr(workspace))
+                    && self.selected_position(&view.rows).is_some()
             })
             && let Some(event) = calendar.follow_event(id, self.year)
             && event.year != self.year
@@ -885,7 +953,7 @@ impl App {
         let events = self.calendar_rows(workspace);
         let selected = self
             .update_selection(&events, today)
-            .and_then(|id| calendar.event(id, displayed_year));
+            .and_then(|index| calendar.event(events[index].id, displayed_year));
         let inspector_width = if ui.ctx().content_rect().width() < 1160.0 {
             308.0
         } else {
@@ -906,6 +974,11 @@ impl App {
                     [pane.left_top(), pane.left_bottom()],
                     Stroke::new(1.0, BORDER),
                 );
+                if self.agenda_return.is_some() && ui.add(quiet("Назад к обзору")).clicked()
+                {
+                    self.page = Page::Agenda;
+                    ui.ctx().request_repaint();
+                }
                 ScrollArea::vertical()
                     .id_salt("event-details")
                     .auto_shrink([false, false])
@@ -931,7 +1004,7 @@ impl App {
                             });
                         }
                         if ui.add(quiet("Резервные копии")).clicked() {
-                            self.open_backup_window();
+                            self.backups.open_window();
                         }
                     });
                 });
@@ -996,44 +1069,63 @@ impl App {
             });
     }
 
-    fn update_selection(&mut self, events: &[CalendarRow], today: NaiveDate) -> Option<Id> {
-        let selected = events
-            .iter()
-            .find(|event| Some(event.id) == self.selected)
-            .or_else(|| events.iter().find(|event| event.date >= today))
-            .or_else(|| events.last())
-            .map(|event| event.id);
+    fn selected_position(&self, events: &[CalendarRow]) -> Option<usize> {
+        let id = self.selected?;
+        self.selected_index
+            .filter(|&index| events.get(index).is_some_and(|event| event.id == id))
+            .or_else(|| events.iter().position(|event| event.id == id))
+    }
+
+    fn update_selection(&mut self, events: &[CalendarRow], today: NaiveDate) -> Option<usize> {
+        // Calendar rows are ordered by date, including after category and search filters.
+        let position = self.selected_position(events).or_else(|| {
+            (!events.is_empty()).then(|| {
+                events
+                    .partition_point(|event| event.date < today)
+                    .min(events.len() - 1)
+            })
+        });
+        let selected = position.map(|index| events[index].id);
         if self.selected != selected {
             self.reveal_event = true;
         }
         self.selected = selected;
-        selected
+        self.selected_index = position;
+        position
     }
 
     fn dial(&mut self, ui: &mut Ui, events: &[CalendarRow], today: NaiveDate) {
         ui.horizontal(|ui| title(ui, "Годовой круг", SECTION_TITLE_SIZE));
-        if let Some(id) = year_wheel(ui, self.year, today, events, self.selected) {
+        let columns = if ui.available_width() < 308.0 { 2 } else { 4 };
+        let legend_height = if columns == 2 { 43.0 } else { 24.0 };
+        let wheel_height = (ui.available_height() - legend_height).min(360.0);
+        let position = self.selected_position(events);
+        if let Some(id) = year_wheel(ui, wheel_height, self.year, today, events, position) {
             self.selected = Some(id);
             self.reveal_event = true;
             ui.ctx().request_repaint();
         }
-        let legend = |ui: &mut Ui, categories: &[Category]| {
-            ui.spacing_mut().item_spacing.x = 9.0;
-            for &category in categories {
-                ui.horizontal(|ui| {
-                    ui.spacing_mut().item_spacing.x = 3.0;
-                    legend_marker(ui, category);
-                    ui.label(RichText::new(category.label()).size(11.5).color(MUTED));
+        ui.add_space(4.0);
+        ui.scope(|ui| {
+            ui.spacing_mut().interact_size.y = 16.0;
+            egui::Grid::new("calendar-category-legend")
+                .num_columns(columns)
+                .min_col_width(0.0)
+                .min_row_height(16.0)
+                .spacing(vec2(12.0, 3.0))
+                .show(ui, |ui| {
+                    for row in Category::ALL.chunks(columns) {
+                        for &category in row {
+                            ui.horizontal(|ui| {
+                                ui.spacing_mut().item_spacing.x = 3.0;
+                                legend_marker(ui, category);
+                                ui.label(RichText::new(category.label()).size(12.0).color(MUTED));
+                            });
+                        }
+                        ui.end_row();
+                    }
                 });
-            }
-        };
-        if ui.ctx().content_rect().width() < COMPACT_CALENDAR_WIDTH {
-            for pair in Category::ALL.chunks(2) {
-                ui.horizontal(|ui| legend(ui, pair));
-            }
-        } else {
-            ui.horizontal_wrapped(|ui| legend(ui, &Category::ALL));
-        }
+        });
     }
 
     fn calendar_controls(&mut self, ui: &mut Ui, today: NaiveDate) {
@@ -1104,6 +1196,8 @@ impl App {
             });
             if std::mem::take(&mut self.search_focus) {
                 response.request_focus();
+            } else if response.lost_focus() {
+                self.release_search_index();
             }
             if !self.search.is_empty()
                 && ui
@@ -1156,26 +1250,42 @@ impl App {
         }
         let date_width = 46.0;
         let row_height = 46.0;
-        let height = ui.available_height().max(140.0);
+        let available_height = ui.available_height();
+        let visible_rows = (available_height / row_height).floor().max(1.0) as usize;
+        let last_start = events.len().saturating_sub(visible_rows);
+        // At the end of the list egui clamps the offset to content height minus
+        // viewport height. A whole-row viewport keeps that boundary aligned.
+        let height = if last_start > 0 {
+            (visible_rows as f32 * row_height).min(available_height)
+        } else {
+            available_height
+        };
+        let list_id = "event-list";
         let mut scroll = ScrollArea::vertical()
-            .id_salt("event-list")
+            .id_salt(list_id)
             .max_height(height)
             .auto_shrink([false, false]);
-        let visible_rows = (height / row_height).floor().max(1.0) as usize;
         let month_start = |index: usize| {
             let month = events[index].date.month();
             events[..index].partition_point(|row| row.date.month() < month)
         };
-        if std::mem::take(&mut self.reveal_event)
-            && let Some(index) = events
-                .iter()
-                .position(|event| Some(event.id) == self.selected)
-        {
-            let first = month_start(index).max((index + 1).saturating_sub(visible_rows));
-            scroll = scroll.vertical_scroll_offset(first as f32 * row_height);
-        }
         ui.scope(|ui| {
             ui.spacing_mut().item_spacing.y = 0.0;
+            if std::mem::take(&mut self.reveal_event)
+                && let Some(index) = self.selected_position(events)
+            {
+                let first = month_start(index)
+                    .max((index + 1).saturating_sub(visible_rows))
+                    .min(last_start);
+                let id = ui.make_persistent_id(egui::Id::new(list_id));
+                // A deliberate reveal should stop an earlier drag's inertia.
+                if egui::scroll_area::State::load(ui.ctx(), id)
+                    .is_some_and(|state| state.velocity().y != 0.0)
+                {
+                    egui::scroll_area::State::default().store(ui.ctx(), id);
+                }
+                scroll = scroll.vertical_scroll_offset(first as f32 * row_height);
+            }
             scroll.show_rows(ui, row_height, events.len(), |ui, range| {
                 for event in &events[range] {
                     let active = self.selected == Some(event.id);
@@ -1183,15 +1293,24 @@ impl App {
                         vec2(ui.available_width(), row_height),
                         egui::Sense::click(),
                     );
-                    let date = short_date(event.date);
-                    let label = format!("{date}, {}, {}", event.title, event.category.label());
-                    let response = response.on_hover_text(&label);
+                    let label = || {
+                        format!(
+                            "{}, {}, {}",
+                            short_date(event.date),
+                            event.title,
+                            event.category.label()
+                        )
+                    };
+                    let response = response.on_hover_ui(|ui| {
+                        ui.set_max_width(ui.spacing().tooltip_width);
+                        ui.label(label());
+                    });
                     response.widget_info(|| {
                         egui::WidgetInfo::selected(
                             egui::WidgetType::SelectableLabel,
                             true,
                             active,
-                            &label,
+                            label(),
                         )
                     });
                     let painter = ui.painter_at(rect);
@@ -1244,7 +1363,7 @@ impl App {
                         egui::FontId::proportional(14.0)
                     };
                     let mut job = egui::text::LayoutJob::simple(
-                        event.title.clone(),
+                        event.title.to_string(),
                         font,
                         INK,
                         (rect.width() - text_x - 7.0).max(35.0),
@@ -1419,7 +1538,7 @@ impl App {
                 .desired_rows(3)
                 .desired_width(f32::INFINITY)
                 .margin(Margin::same(8))
-                .char_limit(4000)
+                .char_limit(MAX_NOTE_CHARS)
                 .hint_text("Результаты и замечания"),
         );
         response.widget_info(|| {
@@ -1463,16 +1582,7 @@ impl App {
 
     fn load_note(&mut self, key: (Id, i32), current: &str) {
         if self.note_event != Some(key) {
-            if let Some(event) = self.note_event
-                && self.note != self.note_baseline
-            {
-                self.note_drafts.push(NoteDraft {
-                    event,
-                    text: std::mem::take(&mut self.note),
-                    baseline: std::mem::take(&mut self.note_baseline),
-                    merging: self.note_merging,
-                });
-            }
+            self.park_active_note();
             self.note_event = Some(key);
             if let Some(index) = self.note_drafts.iter().position(|draft| draft.event == key) {
                 let draft = self.note_drafts.swap_remove(index);
@@ -1606,25 +1716,16 @@ impl App {
                 let Some(view) = &mut self.personal else {
                     return;
                 };
-                if view
-                    .task_rows
-                    .as_ref()
-                    .is_some_and(|rows| rows.filter != filter)
+                if let Some(previous) = view.task_rows.take_if(|rows| rows.filter != filter)
+                    && previous.filter == TaskFilter::All
                 {
-                    view.task_rows = None;
+                    view.all_task_rows = Some(previous.rows);
                 }
                 let cached = view.task_rows.get_or_insert_with(|| {
-                    let rows = task_rows(calendar, &view.events, view.open_count, today, filter);
-                    let open_count = if filter == TaskFilter::All {
-                        view.open_count
-                    } else {
-                        rows.iter().filter(|row| row.task.is_some()).count()
-                    };
-                    TaskRows {
-                        filter,
-                        rows: rows.into(),
-                        open_count,
-                    }
+                    let all = view.all_task_rows.get_or_insert_with(|| {
+                        all_task_rows(calendar, &view.events, view.open_count)
+                    });
+                    filtered_task_rows(all, view.open_count, today, filter)
                 });
                 let open_count = cached.open_count;
                 let rows = Arc::clone(&cached.rows);
@@ -1650,7 +1751,10 @@ impl App {
                     });
                     return;
                 }
-                ui.spacing_mut().item_spacing.y = 0.0;
+                let style = ui.style_mut();
+                style.wrap_mode = Some(egui::TextWrapMode::Truncate);
+                style.spacing.item_spacing.y = 0.0;
+                style.spacing.icon_spacing = 7.0;
                 ScrollArea::vertical()
                     .id_salt(("my-task-rows", filter))
                     .auto_shrink([false, false])
@@ -1676,17 +1780,12 @@ impl App {
                                     Layout::left_to_right(Align::Center),
                                     |ui| {
                                         ui.set_min_size(vec2(width, LIST_ROW_HEIGHT));
-                                        ui.style_mut().wrap_mode =
-                                            Some(egui::TextWrapMode::Truncate);
-                                        if let Some(index) = row.task {
+                                        if let TaskRowKind::Checklist { index, due } = row.kind {
                                             if let Some(task) = event.event.tasks.get(index) {
                                                 let mut checked = false;
                                                 ui.add_space(16.0);
-                                                let deadline = task_deadline(
-                                                    event.due(task),
-                                                    event.date,
-                                                    today,
-                                                );
+                                                let deadline =
+                                                    task_deadline(due, event.date, today);
                                                 let changed = ui
                                                     .push_id(
                                                         (event.id, event.year, task.id),
@@ -1700,8 +1799,6 @@ impl App {
                                                                         Align::Center,
                                                                     ),
                                                                     |ui| {
-                                                                        ui.spacing_mut()
-                                                                            .icon_spacing = 7.0;
                                                                         ui.checkbox(
                                                                             &mut checked,
                                                                             semibold(
@@ -1981,8 +2078,8 @@ impl App {
         } else {
             224.0
         };
-        if original_issue.is_some() {
-            editor.confirm_remove = false;
+        if original_issue.is_some() && editor.confirmation == Some(EditorConfirmation::Remove) {
+            editor.confirmation = None;
         }
         let name = if existing {
             "Изменить событие"
@@ -1995,36 +2092,40 @@ impl App {
             .backdrop_color(theme::MODAL_BACKDROP)
             .show(ctx, |ui| {
                 ui.set_width((ctx.content_rect().width() - 70.0).clamp(300.0, 620.0));
-                if editor.confirm_discard || editor.confirm_remove {
-                    let heading = if editor.confirm_discard {
-                        "Не сохранять изменения?"
-                    } else {
-                        "Удалить событие?"
+                if let Some(confirmation) = editor.confirmation {
+                    let heading = match confirmation {
+                        EditorConfirmation::Discard => "Не сохранять изменения?",
+                        EditorConfirmation::Remove => "Удалить событие?",
                     };
                     title(ui, heading, theme::DIALOG_TITLE_SIZE);
-                    if editor.confirm_discard {
-                        muted(ui, "Изменения в этом редакторе будут потеряны.");
-                    } else if editor.scope == Scope::ThisYear {
-                        muted(ui, "Событие исчезнет из календаря за выбранный год.");
-                    } else {
-                        muted(ui, "Событие исчезнет за выбранный и следующие годы до следующей версии шаблона.");
+                    match confirmation {
+                        EditorConfirmation::Discard => {
+                            muted(ui, "Изменения в этом редакторе будут потеряны.");
+                        }
+                        EditorConfirmation::Remove if editor.scope == Scope::ThisYear => {
+                            muted(ui, "Событие исчезнет из календаря за выбранный год.");
+                        }
+                        EditorConfirmation::Remove => {
+                            muted(ui, "Событие исчезнет за выбранный и следующие годы до следующей версии шаблона.");
+                        }
                     }
                     if let Some(error) = &editor.error {
                         ui.colored_label(RED, error);
                     }
                     ui.separator();
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        let action = if editor.confirm_discard { "Не сохранять" } else { "Удалить событие" };
+                        let action = match confirmation {
+                            EditorConfirmation::Discard => "Не сохранять",
+                            EditorConfirmation::Remove => "Удалить событие",
+                        };
                         if ui.button(RichText::new(action).color(RED)).clicked() {
-                            if editor.confirm_discard {
-                                discard = true;
-                            } else {
-                                save = Some(true);
+                            match confirmation {
+                                EditorConfirmation::Discard => discard = true,
+                                EditorConfirmation::Remove => save = Some(true),
                             }
                         }
                         if ui.add(primary("Вернуться к событию")).clicked() {
-                            editor.confirm_remove = false;
-                            editor.confirm_discard = false;
+                            editor.confirmation = None;
                             editor.error = None;
                         }
                     });
@@ -2067,7 +2168,11 @@ impl App {
                 }
                 ui.separator();
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(editor.event.tasks.len() < 100, quiet("+ Добавить пункт"))
+                    if ui
+                        .add_enabled(
+                            editor.event.tasks.len() < MAX_TASKS,
+                            quiet("+ Добавить пункт"),
+                        )
                         .clicked()
                     {
                         editor.event.tasks.push(Task {
@@ -2079,7 +2184,7 @@ impl App {
                         ui.ctx().request_repaint();
                     }
                     if existing && original_issue.is_none() && ui.button("Удалить…").clicked() {
-                        editor.confirm_remove = true;
+                        editor.confirmation = Some(EditorConfirmation::Remove);
                         editor.error = None;
                     }
                     ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
@@ -2107,15 +2212,13 @@ impl App {
             let escape =
                 ctx.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape));
             if escape {
-                if editor.confirm_discard || editor.confirm_remove {
-                    editor.confirm_discard = false;
-                    editor.confirm_remove = false;
+                if editor.confirmation.is_some() {
+                    editor.confirmation = None;
                     editor.error = None;
                 } else {
                     close = true;
                 }
-            } else if !editor.confirm_discard
-                && !editor.confirm_remove
+            } else if editor.confirmation.is_none()
                 && original_issue.is_none()
                 && !blocked_creation
                 && ctx.input_mut(|input| {
@@ -2169,7 +2272,7 @@ impl App {
             return;
         }
         if close {
-            editor.confirm_discard = true;
+            editor.confirmation = Some(EditorConfirmation::Discard);
             editor.error = None;
             ctx.request_repaint();
         }
@@ -2184,34 +2287,22 @@ impl App {
         self.editor.as_ref().is_some_and(Editor::has_changes) || self.has_unsaved_notes()
     }
 
-    pub fn file_exchange_busy(&self) -> bool {
-        self.file_exchange.job.is_some()
-    }
-
-    pub fn file_exchange_failed(&self) -> bool {
-        self.file_exchange
-            .status
-            .as_ref()
-            .is_some_and(|(_, error)| *error)
-    }
-
-    pub fn reminder_work_busy(&self) -> bool {
-        self.reminder_work.busy()
-    }
-
-    pub fn reminder_work_failed(&self) -> bool {
-        matches!(self.reminder_work.status(), ReminderWorkStatus::Failed(_))
-    }
-
-    pub fn backup_creation_busy(&self) -> bool {
-        matches!(self.backup_creation, BackupCreation::Writing(_))
-    }
-
-    pub fn backup_creation_failed(&self) -> bool {
-        matches!(
-            self.backup_creation,
-            BackupCreation::Finished { error: true, .. }
-        )
+    pub(crate) fn local_work_status(&self) -> LocalWorkStatus {
+        LocalWorkStatus {
+            exchange: WorkStatus {
+                busy: self.file_exchange.busy(),
+                failed: self.file_exchange.failed(),
+            },
+            reminders: WorkStatus {
+                busy: self.reminder_work.busy(),
+                failed: matches!(self.reminder_work.status(), ReminderWorkStatus::Failed(_)),
+            },
+            api: self.integrations.work_status(),
+            backup: WorkStatus {
+                busy: self.backups.busy(),
+                failed: self.backups.failed(),
+            },
+        }
     }
 
     fn has_unsaved_notes(&self) -> bool {
@@ -2222,17 +2313,8 @@ impl App {
         &self,
         backup: &BackupEntry,
     ) -> Fallible<(SharedStore, RestoreResult)> {
-        if self.backup_creation_busy() {
-            return Err("Дождитесь создания резервной копии.".into());
-        }
-        if self.file_exchange.job.is_some() {
-            return Err("Дождитесь завершения обмена через файл.".into());
-        }
-        if self.reminder_work_busy() {
-            return Err("Дождитесь завершения работы с отметками напоминаний.".into());
-        }
-        if self.api_controls_busy() {
-            return Err("Дождитесь завершения работы с локальным API.".into());
+        if let Some(reason) = self.profile_work_in_progress() {
+            return Err(reason.into());
         }
         let mut store = self.store.lock().unwrap();
         let result = store.restore_open_backup(backup)?;
@@ -2243,1020 +2325,35 @@ impl App {
         Ok((Arc::clone(&self.store), result))
     }
 
-    fn open_backup_window(&mut self) {
-        self.latest_backup = self
-            .backup_folder
-            .as_deref()
-            .and_then(|folder| folder.parent())
-            .ok_or_else(|| "Не удалось определить папку копий.".to_owned())
-            .and_then(|profile| {
-                Store::backups(profile)
-                    .map(|copies| copies.into_iter().next())
-                    .map_err(|error| format!("Не удалось прочитать список копий. {error}"))
-            });
-        self.backup_status = None;
-        self.backup_open = true;
-        if let BackupCreation::Finished { notice, .. } = &mut self.backup_creation {
-            *notice = false;
-        }
-    }
-
-    fn create_profile_backup(&mut self, ctx: &egui::Context) {
-        if self.backup_creation_busy() {
-            return;
-        }
-        let (send, completed) = sync_channel(1);
-        let store = Arc::clone(&self.store);
-        let worker_ctx = ctx.clone();
-        let worker = thread::Builder::new()
-            .name("calendar-backup".into())
-            .spawn(move || {
-                let result = Store::create_shared_backup(&store);
-                drop(store);
-                let _ = send.send(result);
-                worker_ctx.request_repaint();
-            });
-        self.backup_status = None;
-        match worker {
-            Ok(_) => self.backup_creation = BackupCreation::Writing(completed),
-            Err(error) => self.finish_backup_creation(Err(error.into())),
-        }
-        ctx.request_repaint();
-    }
-
-    fn poll_backup_creation(&mut self) {
-        let BackupCreation::Writing(completed) = &self.backup_creation else {
-            return;
-        };
-        let result = match completed.try_recv() {
-            Ok(result) => result,
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => Err("Создание копии прервано.".into()),
-        };
-        self.finish_backup_creation(result);
-    }
-
-    fn finish_backup_creation(&mut self, result: Fallible<BackupEntry>) {
-        let (message, error) = match result {
-            Ok(copy) => {
-                let latest = self.latest_backup.as_mut().ok().and_then(Option::take);
-                self.latest_backup = Ok(latest.max(Some(copy)));
-                ("Копия создана.".into(), false)
-            }
-            Err(error) => (format!("Не удалось создать копию. {error}"), true),
-        };
-        self.backup_creation = BackupCreation::Finished {
-            message,
-            error,
-            notice: !self.backup_open,
-        };
-    }
-
-    fn backup_creation_notice(&mut self, ui: &mut Ui) {
-        let BackupCreation::Finished { error, notice, .. } = &mut self.backup_creation else {
-            return;
-        };
-        if !*notice || self.backup_open {
-            return;
-        }
-        let mut open = false;
-        let mut dismiss = false;
-        Panel::bottom("backup-creation-notice")
-            .frame(
-                Frame::new()
-                    .fill(NAV)
-                    .inner_margin(Margin::symmetric(theme::PAGE_MARGIN.left, 4)),
-            )
-            .show_separator_line(true)
-            .show_inside(ui, |ui| {
-                ui.horizontal(|ui| {
-                    if *error {
-                        ui.colored_label(RED, "Не удалось создать копию.");
-                    } else {
-                        ui.colored_label(MUTED, "Копия создана.");
-                    }
-                    open = ui.add(quiet("Резервные копии")).clicked();
-                    dismiss = ui.add(quiet("Закрыть сообщение")).clicked();
-                });
-            });
-        if dismiss {
-            *notice = false;
-        }
-        if open {
-            self.open_backup_window();
-        }
-    }
-
     pub fn report_restore(&mut self, result: RestoreResult) {
-        self.backup_open = true;
-        self.backup_status = None;
-        self.restore_result = Some(result);
+        self.backups.report_restore(result);
+    }
+
+    fn profile_work_in_progress(&self) -> Option<&'static str> {
+        if self.backups.busy() {
+            return Some("Дождитесь создания резервной копии.");
+        }
+        if self.file_exchange.busy() {
+            return Some("Дождитесь завершения обмена через файл.");
+        }
+        if self.reminder_work.busy() {
+            return Some("Дождитесь завершения работы с отметками напоминаний.");
+        }
+        if self.integrations.work_status().busy {
+            return Some("Дождитесь завершения работы с локальным API.");
+        }
+        None
     }
 
     fn request_restore(&mut self, request: RestoreRequest) {
-        let blocked = if self.backup_creation_busy() {
-            Some("Дождитесь создания резервной копии.")
-        } else if self.file_exchange_busy() {
-            Some("Дождитесь завершения обмена через файл.")
-        } else if self.reminder_work_busy() {
-            Some("Дождитесь завершения работы с отметками напоминаний.")
-        } else if self.api_controls_busy() {
-            Some("Дождитесь завершения работы с локальным API.")
-        } else if self.has_unsaved_notes() {
-            Some("Сохраните черновики в дневнике перед восстановлением.")
-        } else {
-            None
-        };
+        let blocked = self.profile_work_in_progress().or_else(|| {
+            self.has_unsaved_notes()
+                .then_some("Сохраните черновики в дневнике перед восстановлением.")
+        });
         if let Some(message) = blocked {
-            self.backup_status = Some((message.into(), true));
+            self.backups.reject_restore(message);
         } else {
             self.restore_requested = Some(request);
-        }
-    }
-
-    fn backup_window(&mut self, ctx: &egui::Context) {
-        if !self.backup_open {
-            return;
-        }
-        let mut close = false;
-        let restored = self.restore_result.is_some();
-        let dialog = egui::Modal::new(egui::Id::new("profile-backups"))
-            .frame(dialog(ctx))
-            .backdrop_color(theme::MODAL_BACKDROP)
-            .show(ctx, |ui| {
-                ui.set_width(if restored { 460.0 } else { 500.0 });
-                title(
-                    ui,
-                    if restored {
-                        "Календарь восстановлен"
-                    } else {
-                        "Резервные копии"
-                    },
-                    theme::DIALOG_TITLE_SIZE,
-                );
-                ScrollArea::vertical()
-                    .id_salt(("backup-content", restored))
-                    .max_height((ctx.content_rect().height() - 152.0).max(100.0))
-                    .show(ui, |ui| self.backup_content(ui, ctx));
-                ui.separator();
-                ui.allocate_ui_with_layout(
-                    vec2(ui.available_width(), theme::CONTROL_HEIGHT),
-                    Layout::right_to_left(Align::Center),
-                    |ui| {
-                        if restored {
-                            close = ui.add(primary("Готово")).clicked();
-                            if let Some(point) = self
-                                .restore_result
-                                .as_ref()
-                                .and_then(|result| result.restore_point.as_ref())
-                                && ui.button("Вернуть прежний календарь…").clicked()
-                            {
-                                self.request_restore(RestoreRequest::ReturnTo(point.clone()));
-                            }
-                        } else {
-                            close = ui.button("Закрыть").clicked();
-                        }
-                    },
-                );
-            });
-        if close || dialog.should_close() {
-            self.backup_open = false;
-            self.restore_result = None;
-        }
-    }
-
-    fn backup_content(&mut self, ui: &mut Ui, ctx: &egui::Context) {
-        if let Some(result) = &self.restore_result {
-            ui.label("Обмен с коллегами на паузе до ручного возобновления.");
-            if result.restore_point_warning {
-                ui.colored_label(
-                    RED,
-                    "Точку возврата создать не удалось. Прежние данные сохранены в файлах профиля.",
-                );
-            }
-            let original = result.original.as_ref();
-            let working = result.working_snapshot.as_ref();
-            if let Some(path) = original.or(working) {
-                ui.add_space(5.0);
-                muted(
-                    ui,
-                    "Файлы могут содержать ключ синхронизации и токены API. Храните их в закрытой папке.",
-                );
-                egui::CollapsingHeader::new("Файлы прежнего профиля")
-                    .id_salt(path)
-                    .show(ui, |ui| {
-                        for (name, path) in [
-                            ("Прежний файл на диске", original),
-                            ("Прежнее открытое состояние", working),
-                        ] {
-                            if let Some(path) = path {
-                                ui.horizontal_wrapped(|ui| {
-                                    let label = ui.label(name);
-                                    if ui
-                                        .button("Скопировать путь")
-                                        .labelled_by(label.id)
-                                        .clicked()
-                                    {
-                                        ctx.copy_text(path.display().to_string());
-                                    }
-                                });
-                                let filename = path.file_name().unwrap_or(path.as_os_str());
-                                ui.add(egui::Label::new(filename.to_string_lossy()).wrap())
-                                    .on_hover_text(path.display().to_string());
-                            }
-                        }
-                        muted(ui, "Для обмена с коллегами используйте файл .yrplan.");
-                    });
-            }
-            if let Some((message, error)) = &self.backup_status {
-                ui.colored_label(if *error { RED } else { MUTED }, message);
-            }
-            return;
-        }
-        muted(
-            ui,
-            "Копия содержит календарь и ключ синхронизации. Токены API исключены. Храните копию в закрытой папке.",
-        );
-        ui.add_space(5.0);
-        match &self.latest_backup {
-            Ok(Some(copy)) => {
-                ui.label(format!(
-                    "Последняя копия · {}",
-                    copy.created.with_timezone(&Local).format("%d.%m.%Y %H:%M"),
-                ))
-                .on_hover_text("Файл проверяется перед восстановлением.");
-            }
-            Ok(None) => {
-                muted(ui, "Копий пока нет.");
-            }
-            Err(error) => {
-                ui.colored_label(RED, error);
-            }
-        }
-        ui.add_space(5.0);
-        ui.horizontal(|ui| {
-            let enabled = !self.backup_creation_busy();
-            if ui.add_enabled(enabled, primary("Создать копию")).clicked() {
-                self.create_profile_backup(ctx);
-            }
-            if ui
-                .add_enabled(enabled, Button::new("Восстановить из копии…"))
-                .clicked()
-            {
-                self.request_restore(RestoreRequest::Choose);
-            }
-        });
-        if self.backup_creation_busy() {
-            ui.horizontal(|ui| {
-                ui.add(egui::Spinner::new().size(16.0).color(ACCENT));
-                muted(ui, "Сохраняем резервную копию…");
-            });
-        }
-        if let BackupCreation::Finished { message, error, .. } = &self.backup_creation {
-            ui.colored_label(if *error { RED } else { MUTED }, message);
-        }
-        if let Some((message, error)) = &self.backup_status {
-            ui.colored_label(if *error { RED } else { MUTED }, message);
-        }
-        ui.separator();
-        if let Some(folder) = &self.backup_folder {
-            muted(ui, "Папка копий");
-            ui.add(egui::Label::new(folder.to_string_lossy()).truncate())
-                .on_hover_text(folder.display().to_string());
-            if ui.button("Скопировать путь").clicked() {
-                ctx.copy_text(folder.to_string_lossy().into_owned());
-                self.backup_status = Some(("Путь скопирован.".into(), false));
-            }
-        }
-    }
-
-    fn file_exchange_section(&mut self, ui: &mut Ui) -> Option<ExchangeRequest> {
-        let mut request = None;
-        egui::CollapsingHeader::new("Обмен через файл")
-            .default_open(self.network.as_ref().is_err())
-            .show(ui, |ui| {
-                let exchange = &mut self.file_exchange;
-                let working = exchange.job.is_some();
-                if !working {
-                    let dropped = ui.input_mut(|input| std::mem::take(&mut input.raw.dropped_files));
-                    match dropped.as_slice() {
-                        [] => {}
-                        [file] if file.path.is_some() => {
-                            exchange.dropped.clone_from(&file.path);
-                            exchange.status = None;
-                        }
-                        _ => {
-                            exchange.status = Some(("Перетащите один файл обмена.".into(), true));
-                        }
-                    }
-                }
-                muted(ui, "Файл .yrplan можно передать уже подключённому коллеге на флешке, через AirDrop на Mac или через Bluetooth в Windows.");
-                if let Some(path) = exchange.dropped.clone() {
-                    let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                    muted(ui, format!("Выбран файл · {name}"));
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!working, primary("Принять выбранный файл")).clicked() {
-                            request = Some(ExchangeRequest::Use(ExchangeOperation::Import, path));
-                            exchange.dropped = None;
-                        }
-                        if ui.add_enabled(!working, quiet("Сбросить")).clicked() {
-                            exchange.dropped = None;
-                        }
-                    });
-                }
-                let native_picker = cfg!(any(windows, target_os = "macos"));
-                if native_picker {
-                    ui.horizontal_wrapped(|ui| {
-                        if ui.add_enabled(!working, Button::new("Сохранить файл…")).clicked() {
-                            request = Some(ExchangeRequest::PickExport);
-                        }
-                        if ui.add_enabled(!working, Button::new("Открыть файл…")).clicked() {
-                            request = Some(ExchangeRequest::PickImport);
-                        }
-                    });
-                }
-                if exchange.dropped.is_none() {
-                    muted(ui, "Полученный файл можно перетащить в это окно.");
-                }
-                egui::CollapsingHeader::new("Указать путь вручную")
-                    .default_open(!native_picker)
-                    .show(ui, |ui| {
-                        let label = ui.label("Путь к файлу .yrplan");
-                        ui.add_enabled(
-                            !working,
-                            TextEdit::singleline(&mut exchange.path)
-                                .margin(theme::field_margin(ui))
-                                .desired_width(f32::INFINITY),
-                        )
-                        .labelled_by(label.id);
-                        let enabled = !working && !exchange.path.trim().is_empty();
-                        ui.horizontal_wrapped(|ui| {
-                            if ui.add_enabled(enabled, Button::new("Сохранить по пути")).clicked() {
-                                request = Some(ExchangeRequest::Use(
-                                    ExchangeOperation::Export,
-                                    PathBuf::from(&exchange.path),
-                                ));
-                            }
-                            if ui.add_enabled(enabled, Button::new("Открыть по пути")).clicked() {
-                                request = Some(ExchangeRequest::Use(
-                                    ExchangeOperation::Import,
-                                    PathBuf::from(&exchange.path),
-                                ));
-                            }
-                        });
-                    });
-                if let Some((message, error)) = &exchange.status {
-                    ui.colored_label(if *error { RED } else { MUTED }, message);
-                }
-                if let Some(path) = &exchange.exported {
-                    let name = path.file_name().unwrap_or(path.as_os_str()).to_string_lossy();
-                    let label = format!("Последний сохранённый файл · {name}");
-                    ui.add(egui::Label::new(RichText::new(label).color(MUTED)).truncate())
-                        .on_hover_text(path.display().to_string());
-                    if native_picker && ui.add_enabled(!working, quiet("Показать в папке")).clicked() {
-                        request = Some(ExchangeRequest::Use(ExchangeOperation::Reveal, path.clone()));
-                    }
-                }
-            });
-        request
-    }
-
-    fn start_file_exchange(&mut self, ctx: &egui::Context, request: ExchangeRequest) {
-        if self.file_exchange.job.is_some() {
-            return;
-        }
-        let (operation, path) = match request {
-            ExchangeRequest::PickExport => (ExchangeOperation::Export, pick_exchange_to_save()),
-            ExchangeRequest::PickImport => (ExchangeOperation::Import, pick_exchange_to_open()),
-            ExchangeRequest::Use(operation, path) => (operation, Some(path)),
-        };
-        let Some(mut path) = path else {
-            return;
-        };
-        if !path.is_absolute() {
-            self.file_exchange.status = Some(("Укажите полный путь к файлу.".into(), true));
-            ctx.request_repaint();
-            return;
-        }
-        if matches!(operation, ExchangeOperation::Export) && path.extension().is_none() {
-            path.set_extension(EXCHANGE_EXTENSION);
-        }
-        let store = self.store.clone();
-        let worker_ctx = ctx.clone();
-        let (sender, receiver) = sync_channel(1);
-        match thread::Builder::new()
-            .name("file-exchange".into())
-            .spawn(move || {
-                let result = match operation {
-                    ExchangeOperation::Export => export_file(&store, &path)
-                        .map(|_| ExchangeResult::Exported(path))
-                        .map_err(|error| format!("Не удалось сохранить файл. {error}").into()),
-                    ExchangeOperation::Import => import_file(&store, &path)
-                        .map(|changed| ExchangeResult::Imported { changed })
-                        .map_err(|error| format!("Не удалось открыть файл. {error}").into()),
-                    ExchangeOperation::Reveal => reveal_exchange_file(&path)
-                        .map(|()| ExchangeResult::Revealed)
-                        .map_err(|error| format!("Не удалось показать файл. {error}").into()),
-                };
-                let _ = sender.send(result);
-                worker_ctx.request_repaint();
-            }) {
-            Ok(_) => {
-                self.file_exchange.job = Some(receiver);
-                let status = match operation {
-                    ExchangeOperation::Export => "Сохраняем файл…",
-                    ExchangeOperation::Import => "Принимаем изменения из файла…",
-                    ExchangeOperation::Reveal => "Открываем папку файла…",
-                };
-                self.file_exchange.status = Some((status.into(), false));
-            }
-            Err(_) => {
-                self.file_exchange.status =
-                    Some(("Не удалось начать обмен через файл.".into(), true));
-            }
-        }
-        ctx.request_repaint();
-    }
-
-    fn poll_file_exchange(&mut self) {
-        let Some(result) = self.file_exchange.job.as_ref().map(Receiver::try_recv) else {
-            return;
-        };
-        let status = match result {
-            Ok(Ok(ExchangeResult::Exported(path))) => {
-                self.file_exchange.exported = Some(path);
-                ("Файл сохранён. Передайте его коллеге.".into(), false)
-            }
-            Ok(Ok(ExchangeResult::Imported { changed: true })) => {
-                self.next_reminder_check = Instant::now();
-                ("Изменения из файла добавлены в календарь.".into(), false)
-            }
-            Ok(Ok(ExchangeResult::Imported { changed: false })) => {
-                ("Календарь уже содержит эти изменения.".into(), false)
-            }
-            Ok(Ok(ExchangeResult::Revealed)) => ("Папка файла открыта.".into(), false),
-            Ok(Err(error)) => (error.to_string(), true),
-            Err(TryRecvError::Disconnected) => ("Обмен через файл прерван.".into(), true),
-            Err(TryRecvError::Empty) => return,
-        };
-        self.file_exchange.job = None;
-        self.file_exchange.status = Some(status);
-    }
-
-    pub fn show_renewed_access(&mut self) {
-        self.connections = true;
-        self.sync_message = Some(("Открыт календарь с новым ключом.".into(), false));
-    }
-
-    fn sync_window(
-        &mut self,
-        ctx: &egui::Context,
-        state: &LocalState,
-        workspace: &Workspace,
-        usage: ProfileUsage,
-    ) {
-        if !self.connections {
-            return;
-        }
-        let mut open = true;
-        let mut address_result = None;
-        let mut file_request = None;
-        let busy = self.file_exchange_busy()
-            || self.reminder_work_busy()
-            || self.backup_creation_busy()
-            || self.api_controls_busy()
-            || self.join_result.is_some();
-        let mut renew = false;
-        let mut rejoin = false;
-        let mut link = None;
-
-        settings_window(ctx, "Синхронизация", &mut open, |ui| {
-            ui.set_min_width(440.0);
-            self.hosted_entry.show(ui);
-            ui.separator();
-            title(ui, "Пригласить коллегу", SECTION_TITLE_SIZE);
-            if let Ok(network) = self.network.as_ref() {
-                let mut paused = network.paused();
-                let status = network.status();
-                if let Some(id) = workspace.access_manager.filter(|id| *id != state.device) {
-                    let name = workspace
-                        .calendar
-                        .members
-                        .get(&id)
-                        .map_or("Управляющий компьютер", |m| {
-                            m.value.as_str()
-                        });
-                    muted(
-                        ui,
-                        format!(
-                            "За приглашением обратитесь к сотруднику {name}. ID управляющего компьютера · {id}"
-                        ),
-                    );
-                } else {
-                    muted(
-                        ui,
-                        "Попросите коллегу открыть «Присоединиться» и прислать запрос устройства.",
-                    );
-                    let label = ui.label("Запрос устройства коллеги");
-                    ui.add(
-                        TextEdit::singleline(&mut self.pairing_request)
-                            .desired_width(f32::INFINITY)
-                            .char_limit(120)
-                            .hint_text("Вставьте запрос от коллеги")
-                            .margin(theme::field_margin(ui)),
-                    )
-                    .labelled_by(label.id);
-                    ui.horizontal_wrapped(|ui| {
-                        if ui
-                            .add_enabled(
-                                !paused && !self.pairing_request.trim().is_empty(),
-                                primary("Создать и скопировать код"),
-                            )
-                            .clicked()
-                        {
-                            match network.make_invite(&self.pairing_request) {
-                                Ok(code) => {
-                                    ctx.copy_text(code);
-                                    self.pairing_request.clear();
-                                    self.sync_message = Some((
-                                        "Приглашение скопировано. Передайте его коллеге.".into(),
-                                        false,
-                                    ));
-                                }
-                                Err(error) => address_result = Some(Err(error)),
-                            }
-                        }
-                    });
-                    muted(
-                        ui,
-                        "Код действует 15 минут и подходит только устройству, от которого вы получили запрос.",
-                    );
-                }
-                if let Some(error) = status.merge_error {
-                    ui.colored_label(RED, error);
-                }
-                if let Some(warning) = status.warning {
-                    ui.colored_label(RED, warning);
-                }
-                if let Some(warning) = status.route_warning {
-                    ui.colored_label(RED, warning);
-                }
-                if let Some((message, error)) = &self.sync_message {
-                    ui.colored_label(if *error { RED } else { MUTED }, message);
-                }
-                ui.separator();
-                ui.horizontal_wrapped(|ui| {
-                    if paused {
-                        muted(ui, "Синхронизация на паузе");
-                    } else if status.recent_peers > 0 {
-                        ui.label(format!("Устройств на связи · {}", status.recent_peers));
-                    } else {
-                        muted(ui, "Других устройств пока нет на связи");
-                    }
-                    if ui.checkbox(&mut paused, "Приостановить обмен").changed() {
-                        self.sync_message = network.set_profile_paused(paused).err().map(|error| {
-                            (format!("Не удалось сохранить режим обмена. {error}"), true)
-                        });
-                    }
-                });
-                ui.collapsing("Подключение по адресу и состояние сети", |ui| {
-                    let time = status.last_sync.or(state.last_sync)
-                        .and_then(|ts| Local.timestamp_opt(ts, 0).single());
-                    muted(ui, time.map_or_else(|| "Обмена ещё не было".into(), |time|
-                        format!("Последний обмен · {}", time.format("%d.%m.%Y %H:%M"))
-                    ));
-                    if let Some(address) = network.address() {
-                        muted(ui, format!("Адрес этого устройства · {address}"));
-                    }
-                    ui.horizontal(|ui| {
-                        let address = ui.label("Адрес коллеги");
-                        ui.add(TextEdit::singleline(&mut self.address)
-                            .hint_text("192.168.1.15:45736").margin(theme::field_margin(ui)).desired_width(180.0).char_limit(40))
-                            .labelled_by(address.id);
-                        if ui.add_enabled(!self.address.trim().is_empty(), Button::new("Добавить адрес")).clicked() {
-                            address_result = Some(parse_address(&self.address)
-                                .and_then(|address| network.remember_peer(address))
-                                .map(|()| "Адрес добавлен. Приложение попробует связаться с ним."));
-                        }
-                    });
-                    if !state.peers.is_empty() {
-                        muted(ui, format!("Сохранённые адреса · {}", state.peers.len()));
-                        ScrollArea::vertical()
-                            .id_salt("saved-peer-addresses")
-                            .max_height(104.0)
-                            .auto_shrink([false, true])
-                            .show(ui, |ui| {
-                                for &address in &state.peers {
-                                    ui.push_id(address, |ui| {
-                                        ui.horizontal(|ui| {
-                                            ui.label(address.to_string());
-                                            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                                                let remove = ui.button("Удалить адрес");
-                                                remove.widget_info(|| egui::WidgetInfo::labeled(
-                                                    egui::WidgetType::Button, true, format!("Удалить адрес {address}"),
-                                                ));
-                                                if remove.clicked() {
-                                                    address_result = Some(network.remove_saved_address(address)
-                                                        .map(|()| "Адрес удалён из сохранённого списка."));
-                                                }
-                                            });
-                                        });
-                                    });
-                                }
-                            });
-                    }
-                });
-            } else if matches!(self.network, DesktopTransport::Waiting(_)) {
-                if ui
-                    .add(primary("Включить обмен по локальной сети"))
-                    .clicked()
-                    && let Err(error) = self.network.enable(&self.store)
-                {
-                    self.sync_message = Some((error.to_string(), true));
-                }
-            } else if let Err(error) = self.network.as_ref() {
-                ui.colored_label(RED, format!("Обмен по сети недоступен. {error}"));
-            }
-            ui.separator();
-            file_request = self.file_exchange_section(ui);
-            let near_limit = usage.near_limit();
-            if near_limit {
-                let warning = if usage.plans >= usage.plan_limit {
-                    "Достигнут лимит записей календаря."
-                } else {
-                    "Календарь близок к лимиту."
-                };
-                ui.colored_label(RED, warning);
-            }
-            egui::CollapsingHeader::new("Ёмкость профиля")
-                .id_salt(("profile-capacity", near_limit))
-                .default_open(near_limit)
-                .show(ui, |ui| Self::capacity_details(ui, usage));
-            ui.separator();
-            if let Ok(network) = self.network.as_ref() {
-                ui.collapsing("Доступ к календарю", |ui| {
-                    muted(ui, format!("ID этого устройства · {}", state.device));
-                    if workspace.access_manager.is_none_or(|id| id == state.device) {
-                    if self.confirm_access_renewal {
-                        if self.selected_revocations.is_empty() {
-                            ui.label("Перевыпустить ключ для всего календаря?");
-                        } else {
-                            ui.label("Отозвать доступ выбранных устройств?");
-                            for id in &self.selected_revocations {
-                                if let Some(member) = workspace.calendar.members.get(id) {
-                                    ui.label(format!("{} · {id}", member.value));
-                                }
-                            }
-                        }
-                        if workspace.access_manager.is_none() {
-                            muted(ui, "Этот компьютер станет управляющим. В дальнейшем приглашения и отзыв доступа будут доступны только на нём.");
-                        }
-                        muted(ui, "Остальным компьютерам понадобятся новые приглашения. История и назначения сохранятся. Прежние копии останутся у их владельцев.");
-                        ui.horizontal_wrapped(|ui| {
-                            let action = if self.selected_revocations.is_empty() { "Перевыпустить ключ" } else { "Отозвать доступ" };
-                            if ui.add_enabled(!busy, Button::new(RichText::new(action).color(RED))).clicked() { renew = true; }
-                            if ui.button("Отмена").clicked() { self.confirm_access_renewal = false; }
-                        });
-                    } else {
-                        muted(ui, "При потере компьютера отметьте его в списке. Сверьте ID, если имена совпадают.");
-                        ScrollArea::vertical().id_salt("device-access-list").max_height(164.0).show(ui, |ui| {
-                            for (&id, member) in &workspace.calendar.members {
-                                if id == state.device { continue; }
-                                if workspace.is_revoked(id) {
-                                    muted(ui, format!("{} · {id} · доступ отозван", member.value));
-                                } else {
-                                    let mut chosen = self.selected_revocations.contains(&id);
-                                    if ui.checkbox(&mut chosen, format!("{} · {id}", member.value)).changed() {
-                                        if chosen { self.selected_revocations.insert(id); } else { self.selected_revocations.remove(&id); }
-                                    }
-                                }
-                            }
-                        });
-                        let action = if self.selected_revocations.is_empty() { "Перевыпустить доступ…" } else { "Отозвать доступ устройств…" };
-                        if ui.add_enabled(!busy, Button::new(action)).clicked() {
-                            self.confirm_access_renewal = true;
-                        }
-                    }
-                    }
-                    ui.separator();
-                    ui.label("Коллега уже перевыпустил ключ");
-                    muted(ui, "Отправьте коллеге запрос этого компьютера. Вставьте полученный код до закрытия приложения. Ваши сохранённые правки будут объединены с календарём команды.");
-                    if ui.button("Скопировать запрос устройства").clicked() {
-                        ctx.copy_text(network.pairing_request());
-                        self.sync_message = Some(("Запрос скопирован.".into(), false));
-                    }
-                    let code_label = ui.label("Новый код приглашения");
-                    ui.add(TextEdit::singleline(&mut self.join_code).password(true).char_limit(300)).labelled_by(code_label.id);
-                    if ui.add_enabled(!busy && !self.join_code.trim().is_empty(), Button::new("Подключиться по новому коду")).clicked() { rejoin = true; }
-                });
-                ui.separator();
-            }
-            if workspace.access_manager.is_none_or(|id| id == state.device) {
-                ui.collapsing("Устройства сотрудников", |ui| {
-                    link = self
-                        .device_assignments
-                        .show(ui, workspace, state.device, busy);
-                });
-                ui.separator();
-            }
-            title(ui, "Подключённые устройства", SECTION_TITLE_SIZE);
-            ScrollArea::vertical().max_height(135.0).show(ui, |ui| {
-                for (&id, member) in &workspace.calendar.members {
-                    let status = if id == state.device {
-                        " · вы"
-                    } else if workspace.is_revoked(id) {
-                        " · доступ отозван"
-                    } else if workspace.access_manager == Some(state.device) {
-                        if state.admitted_this_generation.contains(&id) {
-                            " · запрос принят"
-                        } else {
-                            " · ожидает подключения"
-                        }
-                    } else {
-                        ""
-                    };
-                    let employee = workspace.calendar.person_for(id);
-                    let name = if employee == id {
-                        member.value.clone()
-                    } else {
-                        format!(
-                            "{} · {}",
-                            owner_name(&workspace.calendar, Some(employee)),
-                            member.value
-                        )
-                    };
-                    ui.label(format!("{name}{status}"))
-                        .on_hover_text(id.to_string());
-                }
-            });
-        });
-        if let Some((device, employee)) = link {
-            let result = self
-                .store
-                .lock()
-                .unwrap()
-                .link_employee_device(device, employee);
-            self.device_assignments.finish(result);
-            self.next_reminder_check = Instant::now();
-            ctx.request_repaint();
-        }
-        if renew || rejoin {
-            let result = (|| -> Fallible<_> {
-                self.flush_local_drafts()?;
-                let network = self.network.as_ref()?;
-                if renew {
-                    if self.selected_revocations.is_empty() {
-                        Ok(network.renew_access_async())
-                    } else {
-                        Ok(network.revoke_devices_async(self.selected_revocations.clone()))
-                    }
-                } else {
-                    let address = if self.address.trim().is_empty() {
-                        None
-                    } else {
-                        Some(parse_address(&self.address)?)
-                    };
-                    Ok(network.rejoin_async(self.join_code.trim().to_owned(), address))
-                }
-            })();
-            match result {
-                Ok(job) => {
-                    self.join_result = Some(job);
-                    self.access_work = true;
-                }
-                Err(e) => self.sync_message = Some((e.to_string(), true)),
-            }
-            self.confirm_access_renewal = false;
-        }
-        self.connections = open;
-        if !open {
-            self.confirm_access_renewal = false;
-            self.selected_revocations.clear();
-            self.device_assignments = DeviceAssignments::default();
-            self.sync_message = None;
-        }
-        if let Some(result) = address_result {
-            self.sync_message = Some(match result {
-                Ok(message) => (message.into(), false),
-                Err(error) => (error.to_string(), true),
-            });
-            ctx.request_repaint();
-        }
-        if let Some(request) = file_request {
-            self.start_file_exchange(ctx, request);
-        }
-    }
-
-    fn integration_window(&mut self, ctx: &egui::Context, state: &LocalState) {
-        if !self.integrations_open {
-            return;
-        }
-        if self.api_controls.running_port().is_some()
-            && !ctx.input(|input| input.viewport().minimized == Some(true))
-        {
-            ctx.request_repaint_after(Duration::from_secs(1));
-        }
-        let mut open = true;
-        let mut action = None;
-        settings_window(ctx, "Интеграции", &mut open, |ui| {
-            title(ui, "Локальный API", SECTION_TITLE_SIZE);
-            muted(
-                ui,
-                "Интеграции подключаются через godovoy-bridge по защищённому каналу.",
-            );
-            if let Some(progress) = self.api_controls.progress() {
-                ui.horizontal(|ui| {
-                    ui.add(egui::Spinner::new());
-                    muted(ui, progress);
-                });
-            } else if let Some(port) = self.api_controls.running_port() {
-                ui.colored_label(GREEN, "API включён");
-                ui.label(RichText::new(format!("Защищённый порт {port}")).strong());
-                ui.horizontal_wrapped(|ui| {
-                    if let Some(settings) = state.api.as_ref() {
-                        if ui.button("Копировать основной токен").clicked() {
-                            ctx.copy_text(api::encode_token(&settings.token));
-                            self.api_controls.message =
-                                Some(("Основной токен скопирован.".into(), false));
-                        }
-                        if let Some(key) = settings.import_token
-                            && ui.button("Копировать токен импорта").clicked()
-                        {
-                            ctx.copy_text(api::encode_token(&key));
-                            self.api_controls.message =
-                                Some(("Токен импорта скопирован.".into(), false));
-                        }
-                    }
-                    if ui.button("Сменить токены…").clicked() {
-                        self.confirm_token_change = true;
-                    }
-                    if ui.button("Выключить").clicked() {
-                        action = Some(ApiAction::Disable);
-                    }
-                });
-                if self.confirm_token_change {
-                    ui.separator();
-                    muted(
-                        ui,
-                        "Старые токены перестанут действовать. В подключённых системах потребуется ввести новые.",
-                    );
-                    ui.horizontal(|ui| {
-                        if ui.button("Отмена").clicked() {
-                            self.confirm_token_change = false;
-                        }
-                        if ui
-                            .button(RichText::new("Заменить токены").color(RED))
-                            .clicked()
-                        {
-                            self.confirm_token_change = false;
-                            action = Some(ApiAction::Rotate);
-                        }
-                    });
-                }
-            } else {
-                let configured = state.api.as_ref().is_some_and(|settings| settings.enabled);
-                muted(
-                    ui,
-                    if configured {
-                        "API не запустился"
-                    } else {
-                        "API выключен"
-                    },
-                );
-                let label = if configured {
-                    "Повторить запуск"
-                } else {
-                    "Включить API"
-                };
-                if ui.add(primary(label)).clicked() {
-                    action = Some(ApiAction::Enable);
-                }
-                if configured && ui.button("Выключить").clicked() {
-                    action = Some(ApiAction::Disable);
-                }
-                ui.collapsing("Настройки подключения", |ui| {
-                    ui.horizontal(|ui| {
-                        let port = ui.label("Порт");
-                        ui.add(DragValue::new(&mut self.api_controls.port).range(1024..=65535))
-                            .labelled_by(port.id);
-                    });
-                });
-            }
-            if let Some((message, error)) = &self.api_controls.message {
-                ui.colored_label(if *error { RED } else { MUTED }, message);
-            }
-            Self::import_status_section(
-                ui,
-                &self.reader.import_status(),
-                self.reader.import_status_warning(),
-            );
-        });
-        self.integrations_open = open;
-        if !open {
-            self.confirm_token_change = false;
-            if self
-                .api_controls
-                .message
-                .as_ref()
-                .is_some_and(|(_, error)| !error)
-            {
-                self.api_controls.message = None;
-            }
-        }
-        if let Some(action) = action {
-            self.api_controls.start(&self.store, action, Some(ctx));
-        }
-    }
-
-    fn import_status_section(ui: &mut Ui, statuses: &[ImportStatus], warning: bool) {
-        ui.separator();
-        title(ui, "Журнал импорта", SECTION_TITLE_SIZE);
-        if warning {
-            ui.colored_label(
-                RED,
-                "Файл журнала импорта недоступен. Новые записи могут остаться только в памяти.",
-            );
-        }
-        if statuses.is_empty() {
-            muted(ui, "На этом компьютере пока нет записей об импорте.");
-            return;
-        }
-        ScrollArea::vertical()
-            .id_salt("integration-import-status")
-            .max_height(230.0)
-            .auto_shrink([false, true])
-            .show(ui, |ui| {
-                for (index, status) in statuses.iter().enumerate() {
-                    if index != 0 {
-                        ui.separator();
-                    }
-                    ui.label(semibold(&status.source, 14.0, INK));
-                    if let Some(bridge_run) = &status.bridge_run {
-                        Self::bridge_run_summary(ui, bridge_run);
-                    }
-                    if let Some(success) = &status.success {
-                        muted(
-                            ui,
-                            format!(
-                                "Пачка принята через API · {} · событий {}, изменено {}",
-                                success.at.with_timezone(&Local).format("%d.%m.%Y %H:%M"),
-                                success.received,
-                                success.changed,
-                            ),
-                        );
-                    }
-                    if let Some(failure) = &status.failure {
-                        ui.colored_label(
-                            RED,
-                            format!(
-                                "Отказ локального API · {}",
-                                failure.at.with_timezone(&Local).format("%d.%m.%Y %H:%M"),
-                            ),
-                        );
-                        let message = match failure.kind {
-                            ImportResultKind::InvalidBatch => {
-                                "Некорректная пачка. Проверьте формат и поля."
-                            }
-                            ImportResultKind::CalendarRejected => {
-                                "Календарь отклонил запись. Проверьте состояние профиля и лимиты."
-                            }
-                        };
-                        muted(ui, message);
-                    }
-                }
-            });
-    }
-
-    fn bridge_run_summary(ui: &mut Ui, status: &BridgeRunStatus) {
-        let run = &status.run;
-        let (outcome, show_counts, failed) = match run.outcome {
-            BridgeOutcome::Complete if run.fetched == 0 => ("Выгрузка пуста", false, false),
-            BridgeOutcome::Complete => ("Завершён", true, false),
-            BridgeOutcome::SourceUnavailable => ("Источник недоступен", false, true),
-            BridgeOutcome::SourceRejected => ("Источник отклонил запрос", false, true),
-            BridgeOutcome::SourceInvalid => ("Источник вернул некорректные данные", false, true),
-            BridgeOutcome::BatchRejected => ("Локальный API отклонил пачку", true, true),
-            BridgeOutcome::ApiUnavailable => ("Локальный API недоступен", true, true),
-            BridgeOutcome::ConfirmationLost => ("Ответ от локального API потерян", true, true),
-        };
-        let label = format!(
-            "Запуск моста · {} · {outcome}",
-            status.at.with_timezone(&Local).format("%d.%m.%Y %H:%M"),
-        );
-        if failed {
-            ui.colored_label(RED, label);
-        } else {
-            muted(ui, label);
-        }
-        if show_counts {
-            let mut counts = format!(
-                "Подтверждено {} из {}, изменено {}",
-                run.confirmed, run.fetched, run.changed,
-            );
-            if matches!(run.outcome, BridgeOutcome::ConfirmationLost) {
-                counts.push_str(". Последняя пачка могла быть записана.");
-            }
-            muted(ui, counts);
         }
     }
 
@@ -3273,7 +2370,7 @@ impl App {
 
     fn draw_message(&self, ui: &mut Ui) {
         if let Some((message, is_error)) = &self.message {
-            ui.colored_label(if *is_error { RED } else { MUTED }, message);
+            feedback(ui, message, *is_error);
         }
     }
 
@@ -3288,11 +2385,18 @@ impl App {
             .frame(page_frame())
             .show_inside(ui, |ui| {
                 title(ui, "Сроки команды", PAGE_TITLE_SIZE);
+                let returning = self.agenda_return.take();
+                let mut current_period = None;
                 ui.horizontal_wrapped(|ui| {
                     for (overdue, label) in [(false, "Ближайшие"), (true, "Просрочено")]
                     {
-                        if view_option(ui, label, self.agenda_overdue == overdue) {
+                        let active = self.agenda_overdue == overdue;
+                        let button = theme::choice_button(ui, label, active, Some(BACK));
+                        if button.clicked() {
                             self.agenda_overdue = overdue;
+                        }
+                        if active {
+                            current_period = Some(button);
                         }
                     }
                     ui.separator();
@@ -3402,6 +2506,9 @@ impl App {
                     return;
                 };
                 if rows.is_empty() {
+                    if returning.is_some() && let Some(button) = current_period {
+                        button.request_focus();
+                    }
                     muted(
                         ui,
                         match period {
@@ -3420,32 +2527,57 @@ impl App {
                     }
                 };
                 ui.spacing_mut().item_spacing.y = 0.0;
-                ScrollArea::vertical()
+                let mut scroll = ScrollArea::vertical()
                     .id_salt((period, self.owner_filter))
-                    .auto_shrink([false, false])
-                    .show_rows(ui, LIST_ROW_HEIGHT, rows.len(), |ui, range| {
-                        for index in range {
-                            let row = rows[index];
-                            let Some(item) = resolve_item(state, row, today) else {
-                                continue;
-                            };
-                            let week_start = row.date.week(chrono::Weekday::Mon).first_day();
-                            let first = index == 0 || rows[index - 1].date < week_start;
-                            let owner = owner_name(&workspace.calendar, item.owner);
-                            let response = agenda_button(
-                                ui,
-                                &columns,
-                                row,
-                                &item,
-                                display_date(row.date),
-                                owner,
-                                first.then(|| display_date(week_start)),
-                            );
-                            if response.clicked() {
-                                self.open_milestone(row);
-                            }
+                    .auto_shrink([false, false]);
+                let restore = if let Some(returning) = returning {
+                    let target = returning.target(&rows);
+                    let desired = LIST_ROW_HEIGHT * target as f32 + returning.offset_from_row;
+                    let max = (LIST_ROW_HEIGHT * rows.len() as f32 - ui.available_height()).max(0.0);
+                    scroll = scroll.vertical_scroll_offset(desired.clamp(0.0, max));
+                    Some(target)
+                } else {
+                    None
+                };
+                let mut opened = None;
+                let output = scroll.show_rows(ui, LIST_ROW_HEIGHT, rows.len(), |ui, range| {
+                    for index in range {
+                        let row = rows[index];
+                        let Some(item) = resolve_item(state, row, today) else {
+                            continue;
+                        };
+                        let week_start = row.date.week(chrono::Weekday::Mon).first_day();
+                        let first = index == 0 || rows[index - 1].date < week_start;
+                        let owner = owner_name(&workspace.calendar, item.owner);
+                        let response = agenda_button(
+                            ui,
+                            &columns,
+                            row,
+                            &item,
+                            display_date(row.date),
+                            owner,
+                            first.then(|| display_date(week_start)),
+                        );
+                        if restore == Some(index) {
+                            response.request_focus();
+                            response.scroll_to_me(None);
                         }
+                        if response.clicked() {
+                            opened = Some((index, row));
+                        }
+                    }
+                });
+                if let Some((index, row)) = opened {
+                    self.agenda_return = Some(AgendaReturn {
+                        row,
+                        next: rows.get(index + 1).copied(),
+                        previous: index.checked_sub(1).and_then(|i| rows.get(i)).copied(),
+                        index,
+                        offset_from_row: output.state.offset.y - LIST_ROW_HEIGHT * index as f32,
                     });
+                    self.open_milestone(row);
+                    ui.ctx().request_repaint();
+                }
             });
     }
 
@@ -3515,7 +2647,7 @@ impl App {
                 let issue = self.reader.snapshot().reminder_issue;
                 if let Some(issue) = issue {
                     ui.colored_label(RED, issue.message());
-                    if issue.can_recover() && ui.add_enabled(!self.reminder_work_busy(),
+                    if issue.can_recover() && ui.add_enabled(!self.reminder_work.busy(),
                         Button::new("Начать отметки заново")).clicked()
                     {
                         self.reminder_work.repair(&self.reminder_store, ui.ctx());
@@ -3629,19 +2761,21 @@ impl App {
         };
         let snapshot = Arc::downgrade(workspace);
         let receipt_snapshot = Arc::downgrade(receipts);
-        if self.personal.as_ref().is_some_and(|view| {
-            view.snapshot.ptr_eq(&snapshot)
-                && view.device == state.device
-                && view.receipts.ptr_eq(&receipt_snapshot)
-                && view.today == today
+        if let Some(view) = self.personal.as_mut().filter(|view| {
+            view.snapshot.ptr_eq(&snapshot) && view.device == state.device && view.today == today
         }) {
+            if !view.receipts.ptr_eq(&receipt_snapshot) {
+                let events: Vec<_> = view
+                    .events
+                    .iter()
+                    .filter_map(|&(id, year)| workspace.calendar.event(id, year))
+                    .collect();
+                view.pending = pending_reminders(&events, receipts, today);
+                view.receipts = receipt_snapshot;
+            }
             return;
         }
         let events = planning::personal_events(&workspace.calendar, today, state.device);
-        let pending = planning::due_reminders(&events, today)
-            .into_iter()
-            .filter(|reminder| !receipts.contains(reminder))
-            .collect::<Vec<_>>();
         self.personal = Some(PersonalView {
             device: state.device,
             snapshot,
@@ -3649,7 +2783,8 @@ impl App {
             today,
             events: events.iter().map(|event| (event.id, event.year)).collect(),
             task_rows: None,
-            pending: pending.into(),
+            all_task_rows: None,
+            pending: pending_reminders(&events, receipts, today),
             open_count: events
                 .iter()
                 .map(|event| event.event.tasks.len() - event.completed())
@@ -3670,8 +2805,7 @@ impl App {
         }
         self.personal_view(state, receipts, today);
         let Some(view) = &self.personal else { return };
-        let new = self.notification.new_reminders(&view.pending);
-        self.notification.reminders(new, now);
+        self.notification.reminders(&view.pending, now);
     }
 }
 
@@ -3680,42 +2814,50 @@ impl eframe::App for App {
         BACK.to_normalized_gamma_f32()
     }
 
-    fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        self.poll_file_exchange();
+    fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
+        let mut minimized = ctx.input(|input| input.viewport().minimized == Some(true));
+        if cfg!(target_os = "macos")
+            && let Some(window) = frame.winit_window()
+        {
+            // egui-winit only populates the macOS minimized flag at startup.
+            // Query outside the egui input lock, on the native window thread.
+            minimized = window.is_minimized().unwrap_or(minimized);
+        }
+        let visible = !minimized;
+        self.window_visible.store(visible, Ordering::Relaxed);
+        self.window_repaint.get_or_insert_with(|| {
+            let ctx = ctx.clone();
+            let visible = self.window_visible.clone();
+            let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                if visible.load(Ordering::Relaxed) {
+                    ctx.request_repaint();
+                } else if cfg!(target_os = "macos") {
+                    // AppKit may restore the cached surface without asking for a new frame.
+                    // Refresh that surface only after changes and coalesce bursts while hidden.
+                    ctx.request_repaint_after(Duration::from_secs(2));
+                }
+            });
+            self.reader.observe_window(&observer);
+            observer
+        });
+        if self.file_exchange.poll() {
+            self.next_reminder_check = Instant::now();
+        }
         self.poll_api_controls();
-        self.poll_backup_creation();
+        self.backups.poll();
         if let Some(error) = self.reminder_work.poll(&self.reminder_store, ctx)
             && self.page != Page::Reminders
         {
             self.fail(error);
         }
         self.notification.poll(Instant::now());
-        let join = self.join_result.as_ref().map(Receiver::try_recv);
-        match join {
-            Some(Ok(result)) => {
-                self.join_result = None;
-                if self.access_work {
-                    self.renewed_profile = self.store.lock().unwrap().successor_directory();
-                    self.sync_message = result.err().map(|e| {
-                        let message = if self.network.as_ref().is_ok_and(|n| n.paused()) {
-                            format!("{e} Прежняя синхронизация на паузе. Проверьте данные и повторите действие.")
-                        } else { e.to_string() };
-                        (message, true)
-                    });
-                    self.access_work = false;
-                } else {
-                    self.report(result, None);
-                }
-                self.next_reminder_check = Instant::now();
-            }
-            Some(Err(TryRecvError::Disconnected)) => {
-                self.join_result = None;
-                self.access_work = false;
-                self.fail("Подключение было прервано.");
-            }
-            _ => {}
-        }
+        self.poll_connection();
         if Instant::now() >= self.next_reminder_check {
+            // Keep the reusable source only between nearby filter changes,
+            // using the existing wake rather than scheduling another repaint.
+            if let Some(personal) = &mut self.personal {
+                personal.all_task_rows = None;
+            }
             let snapshot = self.reader.snapshot();
             self.remind(
                 &snapshot.state,
@@ -3723,37 +2865,43 @@ impl eframe::App for App {
                 Local::now().date_naive(),
             );
         }
-        let delay = if self.join_result.is_some()
-            || self.file_exchange.job.is_some()
-            || self.reminder_work_busy()
-            || self.api_controls_busy()
-            || self.backup_creation_busy()
+        let delay = if self.sync.busy()
+            || self.profile_work_in_progress().is_some()
             || self.notification.busy()
         {
             Duration::from_millis(250)
-        } else if (self
-            .network
-            .as_ref()
-            .is_ok_and(Network::can_sync_automatically)
-            || self.api_controls.running_port().is_some())
-            && !ctx.input(|input| input.viewport().minimized == Some(true))
+        } else if (self.network.as_ref().is_ok_and(|network| {
+            // Panels also present live reachability and retry information.
+            network.can_sync_automatically()
+                && (network.paused() || self.sync.open || self.integrations.is_open())
+        }) || self.integrations.needs_refresh())
+            && visible
         {
-            // Other processes or peers can change the visible calendar.
+            // Refresh changing operational status while its controls are visible.
             Duration::from_secs(2)
         } else {
             // egui subtracts a predicted frame from repaint delays. Compensate
             // when waiting for an absolute deadline to avoid spinning just before it.
             let frame_lead = ctx
                 .input(|input| Duration::try_from_secs_f32(input.predicted_dt).unwrap_or_default());
-            self.next_reminder_check
-                .saturating_duration_since(Instant::now())
-                .saturating_add(frame_lead)
+            let mut deadline = self
+                .next_reminder_check
+                .saturating_duration_since(Instant::now());
+            if visible
+                && ctx.content_rect().width() >= PEER_STATUS_WIDTH
+                && let Ok(network) = self.network.as_ref()
+                && !network.paused()
+                && let Some(remaining) = network.recent_peer_remaining()
+            {
+                deadline = deadline.min(remaining);
+            }
+            deadline.saturating_add(frame_lead)
         };
         ctx.request_repaint_after(delay);
     }
 
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
-        if self.access_work {
+        if self.sync.changing_access() {
             ui.spinner();
             ui.label("Обновляем доступ к календарю…");
             return;
@@ -3763,21 +2911,30 @@ impl eframe::App for App {
         let receipts = snapshot.reminder_receipts;
         let today = Local::now().date_naive();
         let Some(workspace) = &state.workspace else {
+            self.calendar_view = None;
             self.show_onboarding(ui, today);
             return;
         };
         if self.editor.is_none()
             && self.capacity_prompt.is_none()
-            && !self.connections
-            && !self.integrations_open
-            && !self.backup_open
+            && !self.sync.open
+            && !self.integrations.is_open()
+            && !self.backups.is_open()
         {
             if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::N)) {
                 self.request_new_event(ui.ctx(), snapshot.usage, |year| Editor::new(year, today));
             }
             if ui.input_mut(|input| input.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
+                self.agenda_return = None;
                 self.page = Page::Calendar;
                 self.search_focus = true;
+            }
+            if self.page == Page::Calendar
+                && self.agenda_return.is_some()
+                && ui.ctx().output(|output| output.ime.is_none())
+                && ui.input_mut(|input| input.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.page = Page::Agenda;
             }
         }
         self.personal_view(&state, &receipts, today);
@@ -3792,19 +2949,30 @@ impl eframe::App for App {
             pending.len(),
             snapshot.usage.near_limit(),
         );
-        self.backup_creation_notice(ui);
+        self.backups.show_notice(ui);
         self.draft_banner(ui, &workspace.calendar);
+        if self.page != Page::Calendar {
+            self.release_search_index();
+        }
         match self.page {
             Page::Calendar => self.calendar(ui, workspace, today, snapshot.usage),
             Page::Tasks => self.tasks(ui, today, &workspace.calendar),
             Page::Agenda => self.agenda_page(ui, &state, workspace, today),
             Page::Reminders => self.reminders_page(ui, &state, &pending, today),
         }
+        if self.page != Page::Tasks
+            && let Some(personal) = &mut self.personal
+        {
+            personal.all_task_rows = None;
+        }
         self.edit_window(ui.ctx(), workspace, snapshot.usage);
         self.capacity_window(ui.ctx(), snapshot.usage);
         self.sync_window(ui.ctx(), &state, workspace, snapshot.usage);
-        self.integration_window(ui.ctx(), &state);
-        self.backup_window(ui.ctx());
+        self.integrations
+            .show(ui.ctx(), &state, &self.store, &self.reader);
+        if let Some(request) = self.backups.show(ui.ctx(), &self.store) {
+            self.request_restore(request);
+        }
         self.checkpoint_local_drafts(ui.ctx());
     }
 }
@@ -3936,7 +3104,7 @@ fn date_picker(
                     egui::Label::new(
                         RichText::new(format!(
                             "{} {}",
-                            MONTH_NAMES[month.month0() as usize],
+                            crate::chart::MONTH_NAMES[month.month0() as usize],
                             month.year()
                         ))
                         .strong(),
@@ -3994,21 +3162,6 @@ fn date_picker(
     chosen
 }
 
-const MONTH_NAMES: [&str; 12] = [
-    "Январь",
-    "Февраль",
-    "Март",
-    "Апрель",
-    "Май",
-    "Июнь",
-    "Июль",
-    "Август",
-    "Сентябрь",
-    "Октябрь",
-    "Ноябрь",
-    "Декабрь",
-];
-
 fn search_key(text: &str) -> String {
     let lower = text.trim().to_lowercase();
     if lower.contains('ё') {
@@ -4018,19 +3171,16 @@ fn search_key(text: &str) -> String {
     }
 }
 
-fn task_rows(
-    calendar: &Calendar,
-    events: &[(Id, i32)],
-    open_count: usize,
+fn pending_reminders(
+    events: &[Occurrence<'_>],
+    receipts: &BTreeSet<Reminder>,
     today: NaiveDate,
-    filter: TaskFilter,
-) -> Vec<TaskRow> {
-    let tomorrow = today.succ_opt().unwrap_or(today);
-    let mut rows = if filter == TaskFilter::All {
-        Vec::with_capacity(events.len() + open_count)
-    } else {
-        Vec::new()
-    };
+) -> Arc<[Reminder]> {
+    planning::unread_reminders(events, today, receipts).into()
+}
+
+fn all_task_rows(calendar: &Calendar, events: &[(Id, i32)], open_count: usize) -> Arc<[TaskRow]> {
+    let mut rows = Vec::with_capacity(events.len() + open_count);
     let mut open = Vec::new();
     for &(id, year) in events {
         let Some(event) = calendar.event(id, year) else {
@@ -4039,7 +3189,7 @@ fn task_rows(
         let header = TaskRow {
             event: id,
             year,
-            task: None,
+            kind: TaskRowKind::Event,
         };
         open.clear();
         open.extend(
@@ -4048,30 +3198,57 @@ fn task_rows(
                 .tasks
                 .iter()
                 .enumerate()
-                .filter_map(|(index, task)| {
-                    if event.checked(task.id) {
-                        return None;
-                    }
-                    let due = event.due(task);
-                    let matches = match filter {
-                        TaskFilter::All => true,
-                        TaskFilter::TodayAndTomorrow => (today..=tomorrow).contains(&due),
-                        TaskFilter::Overdue => due < today,
-                    };
-                    matches.then_some((due, index))
-                }),
+                .filter(|(_, task)| !event.checked(task.id))
+                .map(|(index, task)| (event.due(task), index)),
         );
-        if filter != TaskFilter::All && open.is_empty() {
-            continue;
-        }
         rows.push(header);
         open.sort_unstable();
-        rows.extend(open.iter().map(|&(_, index)| TaskRow {
-            task: Some(index),
+        rows.extend(open.iter().map(|&(due, index)| TaskRow {
+            kind: TaskRowKind::Checklist { index, due },
             ..header
         }));
     }
-    rows
+    rows.into()
+}
+
+fn filtered_task_rows(
+    all: &Arc<[TaskRow]>,
+    open_count: usize,
+    today: NaiveDate,
+    filter: TaskFilter,
+) -> TaskRows {
+    if filter == TaskFilter::All {
+        return TaskRows {
+            filter,
+            rows: Arc::clone(all),
+            open_count,
+        };
+    }
+    let tomorrow = today.succ_opt().unwrap_or(today);
+    let mut header = None;
+    let mut rows = Vec::new();
+    let mut open_count = 0;
+    for &row in all.iter() {
+        let TaskRowKind::Checklist { due, .. } = row.kind else {
+            header = Some(row);
+            continue;
+        };
+        let matches = match filter {
+            TaskFilter::All => true,
+            TaskFilter::TodayAndTomorrow => (today..=tomorrow).contains(&due),
+            TaskFilter::Overdue => due < today,
+        };
+        if matches {
+            rows.extend(header.take());
+            rows.push(row);
+            open_count += 1;
+        }
+    }
+    TaskRows {
+        filter,
+        rows: rows.into(),
+        open_count,
+    }
 }
 
 const LIST_ROW_HEIGHT: f32 = 48.0;
@@ -4200,11 +3377,7 @@ struct ItemLabel<'a> {
     owner: Option<Id>,
 }
 
-fn resolve_item(
-    state: &LocalState,
-    row: AgendaItem,
-    today: NaiveDate,
-) -> Option<ItemLabel<'_>> {
+fn resolve_item(state: &LocalState, row: AgendaItem, today: NaiveDate) -> Option<ItemLabel<'_>> {
     let event = state
         .workspace
         .as_ref()?
@@ -4217,7 +3390,11 @@ fn resolve_item(
         Milestone::Task(id) => {
             let task = event.event.tasks.iter().find(|task| task.id == id)?;
             let (status, color) = task_alert(row.date, today).unwrap_or(("Срок", MUTED));
-            (task.title.as_str(), format!("{status} · {title}").into(), color)
+            (
+                task.title.as_str(),
+                format!("{status} · {title}").into(),
+                color,
+            )
         }
     };
     Some(ItemLabel {
@@ -4233,16 +3410,6 @@ fn owner_name(calendar: &Calendar, id: Option<Id>) -> &str {
         Some(id) => calendar.person_name(id).unwrap_or("Неизвестный сотрудник"),
         None => "Без ответственного",
     }
-}
-
-fn parse_address(input: &str) -> Fallible<SocketAddrV4> {
-    let input = input.trim();
-    let result = if input.contains(':') {
-        input.parse()
-    } else {
-        format!("{input}:{SYNC_PORT}").parse()
-    };
-    result.map_err(|_| "Введите IPv4-адрес, например 192.168.1.15:45736.".into())
 }
 
 pub fn short_date(date: NaiveDate) -> String {

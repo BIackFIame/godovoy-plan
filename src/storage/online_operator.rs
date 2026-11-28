@@ -1,8 +1,5 @@
 //! Voluntary operator-declared metadata and targeted registry operations.
-use super::{
-    ACCESS, ACCESS_LIMIT, Access, GrantPurpose, Id, LockedVault, ProtectionConflict, record, save,
-    sync_directory,
-};
+use super::{GrantPurpose, Id, LockedVault, ProtectionConflict};
 use crate::Fallible;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, fmt};
@@ -85,10 +82,6 @@ impl LockedVault<'_> {
         }
         Ok(acl.operator)
     }
-    fn commit_registry(&self, acl: &Access) -> Fallible<()> {
-        save(&self.directory.join(ACCESS), acl, ACCESS_LIMIT)?;
-        sync_directory(self.directory)
-    }
     pub fn employee_directory(&self) -> Fallible<serde_json::Value> {
         let acl = self.access()?;
         let mut by_employee = BTreeMap::<_, Vec<_>>::new();
@@ -140,25 +133,5 @@ impl LockedVault<'_> {
             self.commit_registry(&acl)?;
         }
         Ok(())
-    }
-    pub fn revoke_employee_keys(&self, employee: Id) -> Fallible<usize> {
-        let mut acl = self.access()?;
-        if !acl.employees.contains_key(&employee) {
-            return Err(OperatorInput.into());
-        }
-        let ids: Vec<_> = acl
-            .grants
-            .iter()
-            .filter_map(|(&id, g)| (g.employee == employee).then_some(id))
-            .collect();
-        self.audit_security("revoke_employee_requested", None, Some(employee), None)?;
-        for &id in &ids {
-            acl.grants.remove(&id);
-            record(&mut acl.audit, "revoke", id, employee, None);
-        }
-        if !ids.is_empty() {
-            self.commit_registry(&acl)?;
-        }
-        Ok(ids.len())
     }
 }

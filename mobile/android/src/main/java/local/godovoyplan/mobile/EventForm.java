@@ -30,7 +30,10 @@ final class EventForm {
         EditText title, offset;
     }
 
+    private final MainActivity.CardView view;
+
     EventForm(MainActivity activity, JSONObject previous) {
+        this.view = previous == null ? null : activity.cardView();
         this.activity = activity;
         this.previous = previous;
         date = previous == null ? LocalDate.now().withYear(activity.year)
@@ -73,17 +76,17 @@ final class EventForm {
         activity.label(form, "Чек-лист", 18);
         taskList = activity.vertical();
         form.addView(taskList);
-        for (JSONObject task : items(array(previous, "checklist"))) addTask(task);
+        for (JSONObject task : ChecklistRows.forCard(array(previous, "checklist"))) addTask(task);
         form.addView(activity.button("Добавить пункт", () -> {
-            if (tasks.size() < 100)
+            if (tasks.size() < MobileLimits.MAX_TASKS)
                 addTask(null);
             else
-                activity.feedback("До 100 пунктов в одном событии.");
+                activity.feedback("До " + MobileLimits.MAX_TASKS + " пунктов в одном событии.");
         }));
         description = activity.field(form, "Описание", str(previous, "description"), true);
         activity.submit(previous == null ? "Новое событие" : "Редактировать событие", form,
                 previous == null ? "Создать" : "Сохранить", this::command,
-                ignored -> activity.year = date.getYear());
+                ignored -> activity.eventSaved(previous, date.getYear()));
     }
 
     private Spinner choices(LinearLayout form, String label, String[] names, int initial) {
@@ -134,19 +137,39 @@ final class EventForm {
     }
 
     private JSONObject command() throws Exception {
-        if (value(title).isEmpty()) {
+        String eventTitle = value(title);
+        if (eventTitle.isEmpty()) {
             title.requestFocus();
             throw new IllegalArgumentException("Введите название события.");
         }
-        int lead = days(preparation, 366);
+        if (!MobileLimits.withinTitleLimit(eventTitle)) {
+            title.requestFocus();
+            throw new IllegalArgumentException("Название события не должно превышать " +
+                    MobileLimits.MAX_TITLE_CHARS + " символов.");
+        }
+        String eventDescription = description.getText().toString();
+        if (!MobileLimits.withinDescriptionLimit(eventDescription)) {
+            description.requestFocus();
+            throw new IllegalArgumentException("Описание не должно превышать " +
+                    MobileLimits.MAX_DESCRIPTION_CHARS + " символов.");
+        }
+        if (tasks.size() > MobileLimits.MAX_TASKS)
+            throw new IllegalArgumentException("В одном событии может быть не более " + MobileLimits.MAX_TASKS + " пунктов.");
+        int lead = days(preparation, MobileLimits.MAX_PREPARATION_DAYS);
         JSONArray checklist = new JSONArray();
         for (TaskFields task : tasks) {
-            if (value(task.title).isEmpty()) {
+            String taskTitle = value(task.title);
+            if (taskTitle.isEmpty()) {
                 task.title.requestFocus();
                 throw new IllegalArgumentException("Введите название пункта чек-листа или уберите его.");
             }
+            if (!MobileLimits.withinTitleLimit(taskTitle)) {
+                task.title.requestFocus();
+                throw new IllegalArgumentException("Название пункта не должно превышать " +
+                        MobileLimits.MAX_TITLE_CHARS + " символов.");
+            }
             JSONObject item = new JSONObject()
-                                      .put("title", value(task.title))
+                                      .put("title", taskTitle)
                                       .put("daysBefore", days(task.offset, lead));
             if (!task.id.isEmpty())
                 item.put("id", task.id);
@@ -155,8 +178,8 @@ final class EventForm {
         String owner = employeeIds.get(assignee.getSelectedItemPosition());
         if (previous != null && owner.equals(str(previous, "employeeId")))
             owner = str(previous, "ownerId");
-        JSONObject command = message(previous == null ? "createEvent" : "editEvent", "title", value(title),
-                "date", date.toString(), "description", description.getText().toString(), "yearly",
+        JSONObject command = message(previous == null ? "createEvent" : "editEvent", "title", eventTitle,
+                "date", date.toString(), "description", eventDescription, "yearly",
                 yearly.isChecked(), "preparationDays", lead, "ownerId", owner.isEmpty() ? null : owner,
                 "category", CATS[category.getSelectedItemPosition()], "checklist", checklist);
         if (previous != null) {
@@ -165,6 +188,6 @@ final class EventForm {
                     .put("year", previous.getInt("year"))
                     .put("scope", scope != null && scope.getSelectedItemPosition() == 0 ? "year" : "future");
         }
-        return command;
+        return previous == null ? command : view.bind(command);
     }
 }

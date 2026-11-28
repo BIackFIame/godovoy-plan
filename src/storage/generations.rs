@@ -277,7 +277,7 @@ impl Store {
     }
 }
 
-fn sync_directory(path: &Path) -> io::Result<()> {
+pub(super) fn sync_directory(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(path)?.sync_all()?;
     #[cfg(not(unix))]

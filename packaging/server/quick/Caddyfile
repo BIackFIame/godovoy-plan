@@ -1,0 +1,13 @@
+{
+    admin off
+    skip_install_trust
+    auto_https disable_redirects
+    servers {
+        protocols h1 h2
+    }
+}
+
+https://{$GODOVOY_OFFICE_HOST} {
+    tls internal
+    reverse_proxy unix//run/godovoy-quick-calendar/http.sock
+}

@@ -5,7 +5,7 @@ on:
       tag:
         description: Тег выпуска
         required: true
-        default: v0.6.6
+        default: v0.6.7
       draft_id:
         description: Числовой ID черновика выпуска. Для опубликованного выпуска оставьте пустым.
         required: false
@@ -17,9 +17,9 @@ on:
 permissions:
   contents: read
 jobs:
-  input:
+  simulator:
     runs-on: macos-15
-    timeout-minutes: 5
+    timeout-minutes: 30
     # GitHub requires push access for draft releases. This job only reads a digest-pinned asset.
     permissions:
       contents: write
@@ -47,30 +47,14 @@ jobs:
           [[ "$digest" =~ ^sha256:[a-f0-9]{64}$ ]]
           if [[ -n "$PIN" ]]; then test "$digest" = "sha256:$PIN"; fi
           id=$(jq -er '.id | numbers' "$RUNNER_TEMP/asset.json")
-          gh api "$api/assets/$id" -H 'Accept: application/octet-stream' > xcode.zip
-          echo "${digest#sha256:}  xcode.zip" | shasum -a 256 -c -
-      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: xcode-input-${{ github.run_id }}-${{ github.run_attempt }}
-          path: xcode.zip
-          retention-days: 1
-          compression-level: 0
-          if-no-files-found: error
-  simulator:
-    needs: input
-    runs-on: macos-15
-    timeout-minutes: 30
-    permissions:
-      contents: read
-      actions: read
-    steps:
-      - name: Распаковать комплект из этого запуска
-        env:
-          GH_TOKEN: ${{ github.token }}
+          mkdir -p "$RUNNER_TEMP/input"
+          archive="$RUNNER_TEMP/input/xcode.zip"
+          gh api "$api/assets/$id" -H 'Accept: application/octet-stream' > "$archive"
+          printf '%s  %s\n' "${digest#sha256:}" "$archive" | shasum -a 256 -c -
+      - name: Распаковать проверенный комплект
         run: |
           set -euo pipefail
           test "$(uname -m)" = arm64
-          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --name "xcode-input-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT" --dir "$RUNNER_TEMP/input"
           ditto -x -k "$RUNNER_TEMP/input/xcode.zip" "$RUNNER_TEMP/package"
       - name: Собрать приложение для устройства без ключа подписи
         run: |

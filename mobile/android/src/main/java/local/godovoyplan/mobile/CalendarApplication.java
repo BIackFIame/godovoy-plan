@@ -145,19 +145,8 @@ public final class CalendarApplication extends Application {
         }
     }
 
-    private static final int FILE_LIMIT = 9 * 1024 * 1024;
     private void copy(InputStream in, OutputStream out) throws IOException {
-        if (in == null || out == null)
-            throw new IOException("Провайдер не открыл документ.");
-        byte[] buffer = new byte[32 * 1024];
-        int count, total = 0;
-        while ((count = in.read(buffer)) != -1) {
-            if (count > FILE_LIMIT - total)
-                throw new IOException("Размер файла превышает допустимый предел.");
-            total += count;
-            out.write(buffer, 0, count);
-        }
-        out.flush();
+        MobileLimits.copyExchange(in, out);
     }
 
     private File exchangeFolder() throws IOException {

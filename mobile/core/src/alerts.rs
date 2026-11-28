@@ -1,6 +1,5 @@
 use chrono::{Datelike, Days, NaiveDate};
 use godovoy_plan::model::{Calendar, Id};
-use std::collections::BTreeSet;
 
 /// One local notification per day, independent of the visible calendar year.
 pub(super) fn dates(calendar: &Calendar, member: Id, today: NaiveDate) -> Vec<NaiveDate> {
@@ -11,37 +10,100 @@ pub(super) fn dates(calendar: &Calendar, member: Id, today: NaiveDate) -> Vec<Na
         .checked_add_days(Days::new(366))
         .unwrap_or(NaiveDate::MAX);
     let employee = calendar.person_for(member);
-    let mut dates = BTreeSet::new();
+    let mut days = 0u64;
+    let last = (end - today).num_days();
+    let all_days = (1u64 << (last + 1)) - 1;
     for event in (today.year()..=last_event.year()).flat_map(|year| calendar.occurrences(year)) {
-        if event.event.owner.map(|id| calendar.person_for(id)) != Some(employee)
-            || (!event.event.tasks.is_empty() && !event.has_open_tasks())
+        let prep = event.preparation_date();
+        // In a validated calendar, each task is due between preparation and the event.
+        if event.date < today
+            || prep > end
+            || event.event.owner.map(|owner| calendar.person_for(owner)) != Some(employee)
         {
             continue;
         }
-        let prep = event.preparation_date();
-        if (today..=end).contains(&prep) {
-            dates.insert(prep);
-        }
+        let start = (prep - today).num_days();
+        let event_day = (event.date - today).num_days();
+        let mut open = event.event.tasks.is_empty();
         for task in &event.event.tasks {
+            let due = (event_day - i64::from(task.days_before)).max(start);
+            if (due < 0 || due > last + 1) && (open || start < 0) {
+                continue;
+            }
             if event.checked(task.id) {
                 continue;
             }
-            let due = event.due(task);
-            let alert = due.pred_opt().unwrap_or(due).max(prep);
-            for d in [alert, due] {
-                if (today..=end).contains(&d) {
-                    dates.insert(d);
+            open = true;
+            for day in [due, (due - 1).max(start)] {
+                if (0..=last).contains(&day) {
+                    days |= 1u64 << day;
                 }
             }
         }
+        if open && (0..=last).contains(&start) {
+            days |= 1u64 << start;
+        }
+        if days == all_days {
+            break;
+        }
     }
-    dates.into_iter().collect()
+    (0..=last)
+        .filter(|day| days & (1u64 << day) != 0)
+        .map(|day| today + Days::new(day as u64))
+        .collect()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use godovoy_plan::model::{Category, Event, Record, Revision, Task};
+
+    #[test]
+    fn final_day_alert_includes_tomorrows_deadline_and_excludes_closed_tasks() {
+        let today = NaiveDate::from_ymd_opt(2028, 1, 1).unwrap();
+        let member = Id::new_v4();
+        let id = Id::new_v4();
+        let task_id = Id::new_v4();
+        let revision = Revision {
+            sequence: 1,
+            operation: Id::new_v4(),
+        };
+        let mut calendar = Calendar::default();
+        let event = Event {
+            title: "Подготовка".into(),
+            description: String::new(),
+            category: Category::Team,
+            date: today + Days::new(71),
+            yearly: false,
+            owner: Some(member),
+            preparation_days: 20,
+            tasks: vec![Task {
+                id: task_id,
+                title: "Проверить".into(),
+                days_before: 11,
+            }],
+        };
+        calendar
+            .plans
+            .entry(id)
+            .or_default()
+            .templates
+            .insert(2028, Record::new(revision, Some(event.into())));
+        assert_eq!(
+            dates(&calendar, member, today),
+            [today + Days::new(51), today + Days::new(59)]
+        );
+        calendar
+            .plans
+            .get_mut(&id)
+            .unwrap()
+            .years
+            .entry(2028)
+            .or_default()
+            .checks
+            .insert(task_id, Record::new(revision, true));
+        assert!(dates(&calendar, member, today).is_empty());
+    }
 
     #[test]
     fn january_preparation_is_scheduled_in_december_for_assignee_only() {

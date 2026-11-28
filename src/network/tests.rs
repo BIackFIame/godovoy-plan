@@ -1,35 +1,118 @@
 use chrono::NaiveDate;
 
 use super::*;
+use super::scheduler::next_peer;
+use super::wire::{FRAME, decode_calendar, encode_calendar, send_bytes};
 use crate::{
     model::{Category, Event, Revision, Task},
     storage::Store,
 };
 
 #[test]
-fn quiet_polling_requires_two_edit_aware_matches_and_resets_on_changes_or_errors() {
-    let now = Instant::now();
-    let mut peer = Backoff {
-        next: now,
-        last_attempt: now,
-        failures: 0,
-        quiet_matches: 0,
-        protocol: PeerProtocol::Digest,
-    };
-    for (result, seconds) in [
-        (Ok(SyncPace::QuietMatch), 3),
-        (Ok(SyncPace::QuietMatch), 9),
-        (Err("offline".into()), 3),
-        (Err("offline".into()), 6),
-        (Ok(SyncPace::QuietMatch), 3),
-        (Ok(SyncPace::QuietMatch), 9),
-        (Ok(SyncPace::Regular), 3),
-        (Ok(SyncPace::Regular), 3),
-        (Ok(SyncPace::QuietMatch), 3),
-    ] {
-        peer.record_exchange(result, now);
-        assert_eq!(peer.next - now, Duration::from_secs(seconds));
+fn employee_name_policy_counts_unicode_scalars_without_normalizing() {
+    assert!(!valid_employee_name(""));
+    assert!(!valid_employee_name(" \t "));
+    assert!(valid_employee_name(&"Яя".repeat(40)));
+    assert!(!valid_employee_name(&"Я".repeat(81)));
+    assert!(valid_employee_name("  Анна  "));
+}
+
+#[test]
+fn invitation_parser_preserves_the_wire_format_and_rejects_invalid_keys() {
+    let host = Id::new_v4();
+    let id = Id::new_v4();
+    let public = PairingKeys::generate().unwrap().encoded_public();
+    let key = [42; 32];
+    let encoded = URL_SAFE_NO_PAD.encode(key);
+    let code = |key: &str, address: &str| format!(" yr2.{host}.{id}.{key}.{public}.{address} ");
+
+    let (parsed, address) = JoinCredentials::parse(&code(&encoded, "127.0.0.1:45736")).unwrap();
+    assert_eq!((parsed.host, parsed.id, *parsed.key), (host, id, key));
+    assert_eq!(address, Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45736)));
+    assert!(
+        JoinCredentials::parse(&code(&encoded, "-"))
+            .unwrap()
+            .1
+            .is_none()
+    );
+    assert!(JoinCredentials::parse(&code(&encoded, "invalid")).is_err());
+
+    let short = URL_SAFE_NO_PAD.encode([42; 31]);
+    let padded = format!("{encoded}=");
+    let invalid = format!("{}!", &encoded[..42]);
+    for malformed in [&short, &padded, &invalid] {
+        assert!(JoinCredentials::parse(&code(malformed, "-")).is_err());
     }
+}
+
+#[test]
+fn access_jobs_allow_retry_after_work_finishes_and_reject_overlap() {
+    const WAIT: Duration = Duration::from_secs(5);
+
+    #[derive(Debug)]
+    struct HeldReply {
+        disposing: mpsc::SyncSender<()>,
+        resume: Mutex<Receiver<()>>,
+    }
+
+    impl std::fmt::Display for HeldReply {
+        fn fmt(&self, output: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            output.write_str("test reply")
+        }
+    }
+
+    impl std::error::Error for HeldReply {}
+
+    impl Drop for HeldReply {
+        fn drop(&mut self) {
+            let _ = self.disposing.send(());
+            let _ = self.resume.get_mut().unwrap().recv_timeout(WAIT);
+        }
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let store = Store::open(&directory.path().join("profile")).unwrap();
+    let network = Network {
+        core: Arc::new(Core::new(store, SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)).unwrap()),
+        workers: Vec::new(),
+        joining: Mutex::default(),
+    };
+    let (started, work_started) = mpsc::sync_channel(1);
+    let (finish, finish_work) = mpsc::sync_channel(1);
+    let (disposing, reply_disposing) = mpsc::sync_channel(1);
+    let (resume, resume_cleanup) = mpsc::sync_channel(1);
+    let reply = network.access_job(move |_| {
+        started.send(()).unwrap();
+        finish_work.recv_timeout(WAIT).unwrap();
+        Err(Box::new(HeldReply {
+            disposing,
+            resume: Mutex::new(resume_cleanup),
+        }))
+    });
+    work_started.recv_timeout(WAIT).unwrap();
+    let overlapping = network.access_job(|_| Ok(()));
+
+    // Discard the result and hold its destructor beyond the end of actual work.
+    drop(reply);
+    finish.send(()).unwrap();
+    reply_disposing.recv_timeout(WAIT).unwrap();
+    let retry = network.access_job(|_| Ok(()));
+    let before_cleanup = retry.try_recv();
+    resume.send(()).unwrap();
+
+    assert_eq!(
+        overlapping
+            .recv_timeout(WAIT)
+            .unwrap()
+            .unwrap_err()
+            .to_string(),
+        "Подключение уже выполняется."
+    );
+    assert!(
+        matches!(before_cleanup, Err(mpsc::TryRecvError::Empty)),
+        "{before_cleanup:?}"
+    );
+    retry.recv_timeout(WAIT).unwrap().unwrap();
 }
 
 #[test]
@@ -51,7 +134,7 @@ fn network_interface_limits_discovery_and_outgoing_sources() {
         conf(Ipv4Addr::new(192, 168, 1, 20)).effective_discovery_port(),
         None
     );
-    let udp = discovery_socket(Ipv4Addr::LOCALHOST, 0).unwrap();
+    let udp = discovery::socket(Ipv4Addr::LOCALHOST, 0).unwrap();
     assert_eq!(udp.local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
     assert!(!udp.broadcast().unwrap());
     let tcp = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
@@ -127,8 +210,8 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
         )
         .unwrap()
     };
-    let wait = |stage: &str, f: &dyn Fn() -> bool| {
-        let deadline = Instant::now() + Duration::from_secs(2);
+    let wait = |stage: &str, timeout: Duration, f: &dyn Fn() -> bool| {
+        let deadline = Instant::now() + timeout;
         while !f() {
             assert!(
                 Instant::now() < deadline,
@@ -149,7 +232,8 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     // A group beacon alone cannot complete enrollment.
     sender.send_to(&beacon(&group_key), address).unwrap();
     let join = peer.join_async(fields.join("."), "Борис".into(), None);
-    wait("pending invitation", &|| {
+    let discovery_timeout = Duration::from_secs(2);
+    wait("pending invitation", discovery_timeout, &|| {
         peer.core.pending_discovery.lock().unwrap().is_some()
     });
     sender.send_to(&beacon(&group_key), address).unwrap();
@@ -162,10 +246,26 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     assert!(peer.core.pending_discovery.lock().unwrap().is_none());
     peer.core.discovered.lock().unwrap().clear();
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait("group beacon after enrollment", &seen);
+    wait("group beacon after enrollment", discovery_timeout, &seen);
+    let inbound = peer.core.inbound.get().unwrap();
+    assert!(inbound.discovery_bound());
     peer.set_paused(true);
+    assert!(peer.paused());
+    assert!(!inbound.discovery_bound());
+    assert!(!peer.can_sync_automatically());
     peer.core.discovered.lock().unwrap().clear();
-    let monitor = UdpSocket::bind(address).unwrap();
+    // A concurrent process launch on macOS can retain a closed socket until exec.
+    // The application must drop its own socket synchronously regardless.
+    let deadline = Instant::now() + Duration::from_secs(1);
+    let monitor = loop {
+        match UdpSocket::bind(address) {
+            Ok(socket) => break socket,
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && Instant::now() < deadline => {
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => panic!("Could not bind the released UDP port {udp}: {error}"),
+        }
+    };
     monitor
         .set_read_timeout(Some(Duration::from_secs(1)))
         .unwrap();
@@ -176,8 +276,11 @@ fn loopback_discovery_uses_pending_invite_then_group_and_closes_during_pause() {
     assert!(!seen());
     drop(monitor);
     peer.set_paused(false);
+    wait("UDP socket after resume", Duration::from_secs(5), &|| {
+        inbound.discovery_bound()
+    });
     sender.send_to(&beacon(&group_key), address).unwrap();
-    wait("group beacon after resume", &seen);
+    wait("group beacon after resume", discovery_timeout, &seen);
 }
 
 #[test]
@@ -403,7 +506,7 @@ fn repeated_port_changes_keep_one_beacon_per_device_on_an_ip() {
     };
     let mut seen = BTreeMap::new();
     for (port, device) in [(1000, 3), (1001, 4)] {
-        remember_discovery(
+        discovery::remember(
             &mut seen,
             address(port),
             Seen {
@@ -413,11 +516,11 @@ fn repeated_port_changes_keep_one_beacon_per_device_on_an_ip() {
         );
     }
     let alternate = SocketAddrV4::new(Ipv4Addr::new(127, 0, 0, 2), 2000);
-    remember_discovery(&mut seen, alternate, original);
+    discovery::remember(&mut seen, alternate, original);
     for port in 2000..2005 {
-        remember_discovery(&mut seen, address(port), original);
+        discovery::remember(&mut seen, address(port), original);
     }
-    remember_discovery(
+    discovery::remember(
         &mut seen,
         address(1002),
         Seen {
@@ -570,6 +673,56 @@ fn team(events: usize) -> (Replica, Replica) {
     (leader, colleague)
 }
 
+#[test]
+fn publishing_a_saved_address_wakes_every_transport_using_the_profile() {
+    let (office, laptop) = team(1);
+    let config = Config {
+        listen: SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        discovery_port: None,
+    };
+    let store = &office.core.store;
+    let first = Network::start(store.clone(), config).unwrap();
+    let second = Network::start(store.clone(), config).unwrap();
+    let remote = Network::start(laptop.core.store.clone(), config).unwrap();
+    let target = remote.address().unwrap();
+
+    // An ordinary store transaction bypasses Network::remember_peer.
+    // Both workers start without a route and the remote knows neither port.
+    for network in [&first, &second] {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while network
+            .core
+            .inbound
+            .get()
+            .unwrap()
+            .sync_thread
+            .get()
+            .is_none()
+        {
+            assert!(Instant::now() < deadline);
+            thread::yield_now();
+        }
+    }
+    thread::sleep(Duration::from_millis(50));
+    store
+        .lock()
+        .unwrap()
+        .transaction(|s| {
+            s.peers.insert(target);
+            Ok(())
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !first.has_recent_peer() || !second.has_recent_peer() {
+        assert!(
+            Instant::now() < deadline,
+            "saved address did not reach both workers"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(remote.has_recent_peer());
+}
+
 struct Counted<T> {
     stream: T,
     read: usize,
@@ -615,6 +768,7 @@ fn measured_exchange(sender: &Replica, receiver: &Replica) -> (usize, usize) {
         )
         .unwrap();
         let delta_negotiated = stream.capabilities.contains(Capabilities::DELTA);
+        let capabilities = stream.capabilities;
         let mut counted = Counted {
             stream,
             read: 0,
@@ -628,6 +782,7 @@ fn measured_exchange(sender: &Replica, receiver: &Replica) -> (usize, usize) {
                 &state,
                 Ipv4Addr::LOCALHOST,
                 delta::Role::Initiator,
+                capabilities,
             )
             .unwrap();
         } else {
@@ -701,7 +856,6 @@ fn four_lan_devices_converge_after_edits_during_a_partition() {
                 Ok(())
             })
             .unwrap();
-        nodes[index].core.wake_sync();
     }
     let note = |device: usize, index: usize, text: &str| {
         profiles[device]
@@ -966,7 +1120,8 @@ fn delta_handles_late_low_revisions_and_cold_or_conflicting_peers() {
     same();
     edit(&a, 300, "Изменение А", false);
     edit(&b, 320, "Изменение Б", false);
-    measured_exchange(&a, &b);
+    let (sent, received) = measured_exchange(&a, &b);
+    assert!(sent + received < 12000);
     same();
     edit(&a, 85, "Возврат после перезапуска", false);
     a.core.delta_baselines.clear_for_test();
@@ -1016,8 +1171,8 @@ fn digest_exchange_uses_only_controls_until_calendar_changes() {
         serde_json::to_vec(&legacy_packet(&source, leader.core.advertised_port()).unwrap())
             .unwrap();
     assert!(sent < old_snapshot.len() / 3);
-    // The responder chooses the direction and confirms reconstruction before merging.
-    assert_eq!(received, 125);
+    // The responder supplies an eight-byte revision hint and confirms reconstruction.
+    assert_eq!(received, 133);
     assert_eq!(measured_exchange(&leader, &colleague), (68, 87));
     eprintln!(
         "1,950 plans: legacy JSON {} bytes per calendar; changed transfer {} B + {} B; unchanged 155 B, after Noise handshake; changed exchange {:?}",
@@ -1090,17 +1245,17 @@ fn a_recent_incoming_session_defers_only_its_own_reverse_connection() {
 
     local
         .core
-        .inbound_exchange(Id::from_u128(1), Id::from_u128(2), peer, RECENT_INBOUND);
+        .inbound_exchange(Id::from_u128(1), Id::from_u128(2), peer, RECENT_INBOUND, None);
     assert!(local.core.inbound_until.lock().unwrap().is_empty());
     local
         .core
-        .inbound_exchange(Id::from_u128(2), Id::from_u128(1), peer, RECENT_INBOUND);
+        .inbound_exchange(Id::from_u128(2), Id::from_u128(1), peer, RECENT_INBOUND, None);
 
     let incoming = local.core.inbound_until.lock().unwrap();
-    let expiry = incoming[&peer];
+    let expiry = incoming[&peer].until;
     assert_eq!(
         next_peer(
-            &peers,
+            peers.iter().copied(),
             &preferred,
             &no_attempts,
             &incoming,
@@ -1109,9 +1264,144 @@ fn a_recent_incoming_session_defers_only_its_own_reverse_connection() {
         Some(other)
     );
     assert_eq!(
-        next_peer(&peers, &preferred, &no_attempts, &incoming, expiry),
+        next_peer(
+            peers.iter().copied(),
+            &preferred,
+            &no_attempts,
+            &incoming,
+            expiry
+        ),
         Some(peer)
     );
+}
+
+#[test]
+fn confirmed_inbound_patch_leaves_other_peers_ready_and_releases_on_local_edit() {
+    let (left, right) = team(1);
+    let (sender, receiver) = if left.core.snapshot().device > right.core.snapshot().device {
+        (&left, &right)
+    } else {
+        (&right, &left)
+    };
+    let peer = sender.core.listen;
+    let other = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 1);
+    let peers = BTreeSet::from([peer, other]);
+    let preferred = BTreeSet::from([peer]);
+    let attempts = BTreeMap::new();
+    let wake = receiver.core.store.lock().unwrap().subscribe_calendar();
+    measured_exchange(sender, receiver);
+    let change = |replica: &Replica, year, text: &str| {
+        replica
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                let revision = state.revision()?;
+                let plan = state
+                    .workspace_mut()?
+                    .calendar
+                    .plans
+                    .values_mut()
+                    .next()
+                    .unwrap();
+                plan.years.entry(year).or_default().note =
+                    Some(Record::new(revision, text.to_owned()));
+                Ok(())
+            })
+            .unwrap();
+    };
+    change(sender, 2026, "Исходная правка");
+    measured_exchange(sender, receiver);
+    assert!(wake.take_change());
+    let now = Instant::now();
+    {
+        let incoming = receiver.core.inbound_schedule(now);
+        assert!(incoming[&peer].confirmed.is_some());
+        assert_eq!(
+            next_peer(peers.iter().copied(), &preferred, &attempts, &incoming, now),
+            Some(other)
+        );
+    }
+
+    change(receiver, 2027, "Конкурентная правка");
+    assert!(wake.take_change());
+    let now = Instant::now();
+    {
+        let incoming = receiver.core.inbound_schedule(now);
+        assert!(incoming.is_empty());
+        assert_eq!(
+            next_peer(peers.iter().copied(), &preferred, &attempts, &incoming, now),
+            Some(peer)
+        );
+    }
+    measured_exchange(receiver, sender);
+    assert_eq!(
+        workspace(&receiver.core.snapshot()).unwrap().calendar,
+        workspace(&sender.core.snapshot()).unwrap().calendar
+    );
+}
+
+#[test]
+fn stale_receipt_cannot_defer_a_new_calendar_or_resumed_network() {
+    let (local, remote) = team(1);
+    let peer = remote.core.listen;
+    let capture = || {
+        let snapshot = local.core.snapshot();
+        ConfirmedInbound {
+            workspace: Arc::downgrade(snapshot.workspace.as_ref().unwrap()),
+            generation: local.core.generation.load(Ordering::Acquire),
+        }
+    };
+    let record = |proof| {
+        local.core.inbound_exchange(
+            local.core.snapshot().device,
+            remote.core.snapshot().device,
+            peer,
+            RECENT_INBOUND,
+            Some(proof),
+        );
+    };
+
+    let prior = capture();
+    local
+        .core
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|state| {
+            let revision = state.revision()?;
+            let id = state.device;
+            state
+                .workspace_mut()?
+                .calendar
+                .members
+                .insert(id, Record::new(revision, "Новое имя".into()));
+            Ok(())
+        })
+        .unwrap();
+    record(prior);
+    assert!(local.core.inbound_schedule(Instant::now()).is_empty());
+
+    let before_pause = capture();
+    local.core.change_pause(true).unwrap();
+    local.core.change_pause(false).unwrap();
+    record(before_pause);
+    assert!(local.core.inbound_schedule(Instant::now()).is_empty());
+}
+
+#[test]
+fn overlapping_inbound_delta_holds_a_peer_until_last_guard() {
+    let local = Replica::new();
+    let peer = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 45100);
+    let first = local.core.receive_delta(peer);
+    let deadline = local.core.receiving_deltas.lock().unwrap()[&peer].defer_until;
+    let second = local.core.receive_delta(peer);
+    assert_eq!(local.core.receiving_deltas.lock().unwrap()[&peer].defer_until, deadline);
+    drop(first);
+    assert!(local.core.receiving_deltas.lock().unwrap().contains_key(&peer));
+    drop(second);
+    assert!(local.core.receiving_deltas.lock().unwrap().is_empty());
 }
 
 fn accept_test_connection(listener: &TcpListener) -> TcpStream {
@@ -1192,4 +1482,747 @@ fn legacy_peer_is_rechecked_after_upgrade() {
         assert!(matches!(protocol, PeerProtocol::Digest));
         upgraded.join().unwrap();
     });
+}
+
+#[test]
+fn mutual_delta_reproduces_both_complete_snapshots_before_merging() {
+    use crate::model::{Plan, YearChange};
+    let (left, right) = team(1000);
+    let initial = workspace(&left.core.snapshot()).unwrap().calendar.latest();
+    let common = *workspace(&left.core.snapshot())
+        .unwrap()
+        .calendar
+        .plans
+        .keys()
+        .next()
+        .unwrap();
+    let expected_merge = || {
+        let mut expected = workspace(&left.core.snapshot()).unwrap().calendar.clone();
+        expected.merge(workspace(&right.core.snapshot()).unwrap().calendar.clone());
+        expected
+    };
+    let check = |expect_small: bool| {
+        let expected = expected_merge();
+        let (sent, received) = measured_exchange(&left, &right);
+        assert!(workspace(&left.core.snapshot()).unwrap().calendar == expected, "инициатор должен сохранить обе истории");
+        assert!(workspace(&right.core.snapshot()).unwrap().calendar == expected, "ответчик должен сохранить обе истории");
+        if expect_small {
+            assert!(sent + received < 12_000, "{sent} + {received}");
+        } else {
+            assert!(sent + received > 100_000, "{sent} + {received}");
+        }
+        assert_eq!(measured_exchange(&left, &right), (68, 87));
+    };
+    assert_eq!(measured_exchange(&left, &right), (68, 87));
+    for (index, local) in [&left, &right].into_iter().enumerate() {
+        local
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|s| {
+                let stamp = s.revision()?;
+                let me = s.device;
+                let cal = &mut s.workspace_mut()?.calendar;
+                let plan = cal.plans.get_mut(&common).unwrap();
+                let task_id = plan.templates[&2026].value.as_ref().unwrap().tasks[index].id;
+                let year = plan.years.entry(2026).or_default();
+                year.checks.insert(task_id, Record::new(stamp, true));
+                year.note = Some(Record::new(stamp, format!("Согласование {index}")));
+                if index == 0 {
+                    year.change = Some(Record::new(stamp, YearChange::Cancel));
+                }
+                let mut added = Plan::default();
+                added.years.entry(2027).or_default().note =
+                    Some(Record::new(stamp, format!("Новый план {index}")));
+                cal.plans.insert(Id::from_u128(11 + index as u128), added);
+                cal.members
+                    .insert(me, Record::new(stamp, format!("Сотрудник {index}")));
+                Ok(())
+            })
+            .unwrap();
+    }
+    check(true);
+    for (index, local) in [&left, &right].into_iter().enumerate() {
+        local
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|s| {
+                let mut stamp = s.revision()?;
+                if index == 1 {
+                    stamp.sequence = initial;
+                }
+                let cal = &mut s.workspace_mut()?.calendar;
+                let mut late = Plan::default();
+                late.years.entry(2025).or_default().note =
+                    Some(Record::new(stamp, format!("Поздний импорт {index}")));
+                cal.plans.insert(Id::from_u128(21 + index as u128), late);
+                Ok(())
+            })
+            .unwrap();
+    }
+    check(false);
+    for local in [&left, &right] {
+        local
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|s| {
+                let stamp = s.revision()?;
+                for plan in s.workspace_mut()?.calendar.plans.values_mut().take(65) {
+                    plan.years.entry(2028).or_default().note =
+                        Some(Record::new(stamp, "Большое обновление".into()));
+                }
+                Ok(())
+            })
+            .unwrap();
+    }
+    check(false);
+}
+
+#[test]
+fn verified_calendar_from_a_prior_generation_cannot_be_applied() {
+    let (left, right) = team(20);
+    let state = right.core.snapshot();
+    let remote = workspace(&state).unwrap();
+    let packet = SyncPacket {
+        device: state.device,
+        workspace: remote.id,
+        port: right.core.listen.port(),
+        calendar: remote.calendar.clone(),
+    };
+    let mut previous = remote.clone();
+    previous.key_generation += 1;
+    assert!(
+        left.core
+            .merge_in_scope(packet, Some(delta::PeerScope::new(&previous, state.device)))
+            .is_err()
+    );
+    assert_eq!(
+        workspace(&left.core.snapshot()).unwrap().calendar,
+        remote.calendar
+    );
+}
+
+#[test]
+fn a_verified_one_way_image_cannot_hide_a_local_winning_record() {
+    let (sender, receiver) = team(32);
+    let id = *workspace(&sender.core.snapshot())
+        .unwrap()
+        .calendar
+        .plans
+        .keys()
+        .next()
+        .unwrap();
+    receiver
+        .core
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|state| {
+            let revision = state.revision()?;
+            state
+                .workspace_mut()?
+                .calendar
+                .plans
+                .get_mut(&id)
+                .unwrap()
+                .years
+                .entry(2027)
+                .or_default()
+                .note = Some(Record::new(revision, "Сохранить и после обмена".into()));
+            Ok(())
+        })
+        .unwrap();
+    measured_exchange(&receiver, &sender);
+    assert_eq!(measured_exchange(&sender, &receiver), (68, 87));
+
+    // An imported replacement for one plan can omit part of the previous local history.
+    sender
+        .core
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|state| {
+            let revision = state.revision()?;
+            let plan = state.workspace_mut()?.calendar.plans.get_mut(&id).unwrap();
+            plan.years.remove(&2027);
+            plan.years.entry(2028).or_default().note =
+                Some(Record::new(revision, "Согласована дата".into()));
+            Ok(())
+        })
+        .unwrap();
+    let offered_digest = sender
+        .core
+        .calendar_digest(&sender.core.snapshot())
+        .unwrap();
+    measured_exchange(&sender, &receiver);
+    for replica in [&sender, &receiver] {
+        let state = replica.core.snapshot();
+        let calendar = &workspace(&state).unwrap().calendar;
+        let years = &calendar.plans[&id].years;
+        assert_eq!(
+            years[&2027].note.as_ref().unwrap().value,
+            "Сохранить и после обмена"
+        );
+        assert_eq!(
+            years[&2028].note.as_ref().unwrap().value,
+            "Согласована дата"
+        );
+        let actual = calendar_digest(calendar).unwrap();
+        assert_ne!(offered_digest, actual);
+        assert_eq!(replica.core.calendar_digest(&state).unwrap(), actual);
+    }
+    assert_eq!(measured_exchange(&sender, &receiver), (68, 87));
+}
+
+#[test]
+fn publishing_a_new_workspace_fences_cached_and_verified_digests() {
+    let (local, _) = team(1);
+    let core = &local.core;
+    let original = core.snapshot();
+    let original_workspace = original.workspace.as_ref().unwrap();
+    let prior_digest = core.calendar_digest(&original).unwrap();
+    let approved = || CachedDigest {
+        workspace: Arc::downgrade(original_workspace),
+        digest: prior_digest,
+    };
+    let barrier = std::sync::Barrier::new(2);
+    thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            core.store
+                .lock()
+                .unwrap()
+                .transaction(|state| {
+                    let employee = state.device;
+                    let revision = state.revision()?;
+                    state
+                        .workspace_mut()?
+                        .calendar
+                        .members
+                        .insert(employee, Record::new(revision, "Новый участник".to_owned()));
+                    Ok(())
+                })
+                .unwrap();
+            let newer = core.snapshot();
+            let digest = core.calendar_digest(&newer).unwrap();
+            barrier.wait();
+            (newer, digest)
+        });
+        barrier.wait();
+        let (newer, new_digest) = writer.join().unwrap();
+        assert_ne!(prior_digest, new_digest);
+        // Completing the older exchange must preserve the newer cached revision.
+        assert_eq!(
+            core.calendar_digest_with(&original, Some(approved()))
+                .unwrap(),
+            prior_digest
+        );
+        {
+            let cache = core.digest.lock().unwrap();
+            let entry = cache.as_ref().unwrap();
+            assert!(
+                entry
+                    .workspace
+                    .ptr_eq(&Arc::downgrade(newer.workspace.as_ref().unwrap()))
+            );
+            assert_eq!(entry.digest, new_digest);
+        }
+        // Even after eviction the older proof cannot label the new allocation.
+        *core.digest.lock().unwrap() = None;
+        assert_eq!(
+            core.calendar_digest_with(&newer, Some(approved())).unwrap(),
+            new_digest
+        );
+    });
+}
+
+#[test]
+fn verified_one_way_patch_reconstructs_omitted_plans_after_base_changes() {
+    let (local, peer) = team(2);
+    let initial = local.core.snapshot();
+    let base = &workspace(&initial).unwrap().calendar;
+    let omitted = *base.plans.keys().next().unwrap();
+    let changed = *base.plans.keys().last().unwrap();
+    let remote = peer.core.snapshot();
+    let remote_workspace = workspace(&remote).unwrap();
+    let mut patch = Calendar {
+        members: base.members.clone(),
+        ..Calendar::default()
+    };
+    let mut plan = base.plans[&changed].clone();
+    plan.years.entry(2026).or_default().note = Some(Record::new(
+        remote.revision().unwrap(),
+        "Синхронизированная запись".into(),
+    ));
+    patch.plans.insert(changed, plan);
+    let image = delta::restore_plans(base, patch.clone(), None);
+    let packet = SyncPacket {
+        device: remote.device,
+        workspace: remote_workspace.id,
+        port: peer.core.listen.port(),
+        calendar: patch,
+    };
+    let scope = delta::PeerScope::new(remote_workspace, remote.device);
+    let mut store = local.core.store.lock().unwrap();
+    thread::scope(|threads| {
+        let (waiting, started) = mpsc::sync_channel(0);
+        let core = &local.core;
+        let pending = threads.spawn(move || {
+            waiting.send(()).unwrap();
+            core.merge_received(packet, Some(scope), Some(base))
+        });
+        started.recv().unwrap();
+        store
+            .transaction(|state| {
+                // A concurrent replacement can omit a plan from the verified old base.
+                state.workspace_mut()?.calendar.plans.remove(&omitted);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !workspace(&store.snapshot())
+                .unwrap()
+                .calendar
+                .plans
+                .contains_key(&omitted)
+        );
+        drop(store);
+        assert!(pending.join().unwrap().unwrap().is_none());
+    });
+    assert_eq!(workspace(&local.core.snapshot()).unwrap().calendar, image);
+}
+
+#[test]
+fn verified_one_way_patch_enforces_final_roster_and_plan_history_limits() {
+    use crate::model::Plan;
+
+    let (local, peer) = team(2);
+    let peer_state = peer.core.snapshot();
+    let peer_id = peer_state.device;
+    let remote = workspace(&peer_state).unwrap();
+    let scope = delta::PeerScope::new(remote, peer_id);
+    let profile = local._profile.path().join("profile").join("calendar.json");
+    for fill_roster in [true, false] {
+        local
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                let revision = state.revision()?;
+                let calendar = &mut state.workspace_mut()?.calendar;
+                if fill_roster {
+                    for index in 0..254 {
+                        let id = Id::from_u128(10_000 + index);
+                        calendar
+                            .members
+                            .insert(id, Record::new(revision, "Анна".into()));
+                    }
+                } else {
+                    let plan = calendar.plans.values_mut().next().unwrap();
+                    for year in 1900..2050 {
+                        plan.templates.insert(year, Record::new(revision, None));
+                    }
+                }
+                Ok(())
+            })
+            .unwrap();
+        let baseline = local.core.snapshot();
+        let base = &workspace(&baseline).unwrap().calendar;
+        let revision = baseline.revision().unwrap();
+        let mut patch = Calendar {
+            members: base.members.clone(),
+            ..Calendar::default()
+        };
+        if fill_roster {
+            patch.members.retain(|&id, _| id == peer_id);
+            let new_device = Id::from_u128(20_000);
+            patch
+                .members
+                .insert(new_device, Record::new(revision, "Дарья".into()));
+            patch
+                .device_people
+                .insert(new_device, Record::new(revision, peer_id));
+        } else {
+            let (&plan_id, _) = base.plans.first_key_value().unwrap();
+            let mut plan = Plan::default();
+            plan.templates.insert(2050, Record::new(revision, None));
+            patch.plans.insert(plan_id, plan);
+        }
+        delta::restore_plans(base, patch.clone(), None)
+            .validate()
+            .unwrap();
+        let before = std::fs::read(&profile).unwrap();
+        let error = local
+            .core
+            .merge_received(
+                SyncPacket {
+                    device: peer_id,
+                    workspace: remote.id,
+                    port: peer.core.listen.port(),
+                    calendar: patch,
+                },
+                Some(scope),
+                Some(base),
+            )
+            .unwrap_err();
+        let expected = if fill_roster {
+            "числа участников"
+        } else {
+            "истории события"
+        };
+        assert!(error.to_string().contains(expected), "{error}");
+        assert!(Arc::ptr_eq(&baseline, &local.core.snapshot()));
+        assert_eq!(std::fs::read(&profile).unwrap(), before);
+    }
+}
+
+#[test]
+fn verified_one_way_patch_cannot_commit_behind_revocation_holding_the_store_lock() {
+    let (local, peer) = team(2);
+    let initial = local.core.snapshot();
+    let base = &workspace(&initial).unwrap().calendar;
+    let peer_state = peer.core.snapshot();
+    let remote = workspace(&peer_state).unwrap();
+    let mut patch = Calendar {
+        members: base.members.clone(),
+        ..Calendar::default()
+    };
+    let (&id, plan) = base.plans.first_key_value().unwrap();
+    let mut updated = plan.clone();
+    updated.years.entry(2026).or_default().note = Some(Record::new(
+        peer_state.revision().unwrap(),
+        "Правка, ожидающая сохранения".into(),
+    ));
+    patch.plans.insert(id, updated);
+    let scope = delta::PeerScope::new(remote, peer_state.device);
+    let packet = SyncPacket {
+        device: peer_state.device,
+        workspace: remote.id,
+        port: peer.core.listen.port(),
+        calendar: patch,
+    };
+    let mut store = local.core.store.lock().unwrap();
+    let successor = thread::scope(|threads| {
+        let (waiting, started) = mpsc::sync_channel(0);
+        let core = &local.core;
+        let writer = threads.spawn(move || {
+            waiting.send(()).unwrap();
+            core.merge_received(packet, Some(scope), Some(base))
+        });
+        started.recv().unwrap();
+        // An already admitted network operation may still point at the
+        // retired store. The mutex and retired-profile fence must reject it.
+        store
+            .renew_workspace_key(&BTreeSet::from([peer_state.device]))
+            .unwrap();
+        let successor = store.successor_directory().unwrap();
+        drop(store);
+        let error = writer.join().unwrap().unwrap_err();
+        assert!(error.to_string().contains("Доступ перевыпущен"), "{error}");
+        successor
+    });
+    assert_eq!(&workspace(&local.core.snapshot()).unwrap().calendar, base);
+    let active = Store::open_existing(&successor).unwrap();
+    let state = active.lock().unwrap().snapshot();
+    let renewed = workspace(&state).unwrap();
+    assert!(renewed.is_revoked(peer_state.device));
+    assert_eq!(&renewed.calendar, base);
+}
+
+#[test]
+fn revocation_while_negotiating_cancels_both_mutual_and_full_fallback() {
+    // The first frame is SyncHello. The second is this initiator's accepted
+    // ID union or decline. Revoke after that frame reached the socket, before
+    // the unchanged transport can write any snapshot to the former member.
+    struct RevokeAfterAgreement<'a> {
+        connection: Connection<'a>,
+        remote: Id,
+        frames: usize,
+    }
+    impl Read for RevokeAfterAgreement<'_> {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.connection.read(buf)
+        }
+    }
+    impl Write for RevokeAfterAgreement<'_> {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.connection.write_all(buf)?;
+            self.frames += 1;
+            if self.frames == 2 {
+                let core = self.connection.core;
+                core.pause_for_renewal().unwrap();
+                core.store
+                    .lock()
+                    .unwrap()
+                    .renew_workspace_key(&BTreeSet::from([self.remote]))
+                    .unwrap();
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            self.connection.flush()
+        }
+    }
+    for (know_base, decline) in [(true, false), (false, false), (false, true)] {
+        let (left, right) = team(80);
+        measured_exchange(&left, &right);
+        if !know_base {
+            left.core.delta_baselines.clear_for_test();
+        }
+        for (idx, p) in [&left, &right].into_iter().enumerate() {
+            p.core
+                .store
+                .lock()
+                .unwrap()
+                .transaction(|state| {
+                    let rev = state.revision()?;
+                    let plan = state
+                        .workspace_mut()?
+                        .calendar
+                        .plans
+                        .values_mut()
+                        .nth(idx)
+                        .unwrap();
+                    plan.years.entry(2026).or_default().note =
+                        Some(Record::new(rev, format!("Локальная запись {idx}")));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        if decline {
+            // More than 64 local changes force the requester to decline the ID
+            // union even if the responder can supply its previous confirmation.
+            left.core
+                .store
+                .lock()
+                .unwrap()
+                .transaction(|state| {
+                    let revision = state.revision()?;
+                    for plan in state.workspace_mut()?.calendar.plans.values_mut().take(65) {
+                        plan.years.entry(2028).or_default().note =
+                            Some(Record::new(revision, "Большое изменение".to_owned()));
+                    }
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let prior = right.core.snapshot();
+        let captured = left.core.snapshot();
+        let ws = workspace(&captured).unwrap();
+        thread::scope(|threads| {
+            let inbound = threads.spawn(|| {
+                let (socket, _) = right.listener.accept().unwrap();
+                respond(&right.core, socket, Ipv4Addr::LOCALHOST)
+            });
+            let (connection, mut transport) = connect(
+                &left.core,
+                right.core.listen,
+                Operation::DigestSync,
+                ws.id,
+                ChannelKey::Group(&ws.key),
+                Instant::now() + SESSION_LIMIT,
+                None,
+            )
+            .unwrap();
+            assert!(connection.capabilities.contains(Capabilities::MUTUAL_DELTA));
+            let capabilities = connection.capabilities;
+            let mut peer = RevokeAfterAgreement {
+                connection,
+                remote: prior.device,
+                frames: 0,
+            };
+            assert!(
+                delta::exchange(
+                    &left.core,
+                    &mut peer,
+                    &mut transport,
+                    &captured,
+                    Ipv4Addr::LOCALHOST,
+                    delta::Role::Initiator,
+                    capabilities
+                )
+                .is_err()
+            );
+            assert_eq!(peer.frames, 2);
+            assert_eq!(
+                peer.connection.timeout().unwrap_err().kind(),
+                io::ErrorKind::ConnectionAborted
+            );
+            drop(peer);
+            assert!(inbound.join().unwrap().is_err());
+        });
+        assert_eq!(
+            workspace(&right.core.snapshot()).unwrap().calendar,
+            workspace(&prior).unwrap().calendar
+        );
+        let successor = left
+            .core
+            .store
+            .lock()
+            .unwrap()
+            .successor_directory()
+            .unwrap();
+        let active = Store::open_existing(&successor).unwrap();
+        let stored = active.lock().unwrap().snapshot();
+        assert!(
+            workspace(&stored)
+                .unwrap()
+                .require_device_access(prior.device)
+                .is_err()
+        );
+        assert_eq!(workspace(&stored).unwrap().calendar, ws.calendar);
+    }
+}
+
+#[test]
+fn one_cached_peer_handles_cold_changes_in_either_direction() {
+    for cold_initiates in [true, false] {
+        let (office, laptop) = team(1000);
+        measured_exchange(&office, &laptop);
+        laptop.core.delta_baselines.clear_for_test();
+        for (index, peer) in [&office, &laptop].into_iter().enumerate() {
+            peer.core
+                .store
+                .lock()
+                .unwrap()
+                .transaction(|state| {
+                    let revision = state.revision()?;
+                    let book = &mut state.workspace_mut()?.calendar;
+                    let plan = book.plans.values_mut().nth(index).unwrap();
+                    plan.years.entry(2026).or_default().note =
+                        Some(Record::new(revision, format!("Автономная запись {index}")));
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let mut expected = workspace(&office.core.snapshot()).unwrap().calendar.clone();
+        expected.merge(workspace(&laptop.core.snapshot()).unwrap().calendar.clone());
+        let (sent, received) = if cold_initiates {
+            measured_exchange(&laptop, &office)
+        } else {
+            measured_exchange(&office, &laptop)
+        };
+        assert!(sent + received < 12_000, "{sent} + {received}");
+        for peer in [&office, &laptop] {
+            assert_eq!(workspace(&peer.core.snapshot()).unwrap().calendar, expected);
+        }
+    }
+}
+
+#[test]
+fn office_forwards_an_independent_record_at_the_confirmed_sequence() {
+    let (office, colleague) = team(1000);
+    // team() creates its initial bulk import in a single revision. A normal
+    // subsequent office edit establishes a distinct, recent peer baseline.
+    office
+        .core
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|state| {
+            let revision = state.revision()?;
+            let plan = state
+                .workspace_mut()?
+                .calendar
+                .plans
+                .values_mut()
+                .next()
+                .unwrap();
+            plan.years.entry(2026).or_default().note =
+                Some(Record::new(revision, "Проверено офисом".into()));
+            Ok(())
+        })
+        .unwrap();
+    measured_exchange(&office, &colleague);
+    let floor = workspace(&office.core.snapshot())
+        .unwrap()
+        .calendar
+        .latest();
+    office
+        .core
+        .store
+        .lock()
+        .unwrap()
+        .transaction(|state| {
+            let mut revision = state.revision()?;
+            revision.sequence = floor;
+            let plan = state
+                .workspace_mut()?
+                .calendar
+                .plans
+                .values_mut()
+                .nth(3)
+                .unwrap();
+            plan.years.entry(2026).or_default().note =
+                Some(Record::new(revision, "Подтверждено до подключения".into()));
+            Ok(())
+        })
+        .unwrap();
+    let (sent, received) = measured_exchange(&office, &colleague);
+    assert!(sent + received < 12000, "{sent} + {received}");
+    assert_eq!(
+        workspace(&office.core.snapshot()).unwrap().calendar,
+        workspace(&colleague.core.snapshot()).unwrap().calendar
+    );
+}
+
+#[cfg(feature = "desktop")]
+#[test]
+fn window_observes_published_changes_and_first_peer_outside_locks() {
+    let (leader, member) = team(1);
+    let core = &leader.core;
+    let weak = Arc::downgrade(&core.store);
+    let count = Arc::new(AtomicUsize::default());
+    let seen = Arc::clone(&count);
+    let observer: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+        let store = weak.upgrade().unwrap();
+        assert!(store.try_lock().is_ok());
+        seen.fetch_add(1, Ordering::Relaxed);
+    });
+    core.reader.observe_window(&observer);
+    let state = member.core.snapshot();
+    let remote = workspace(&state).unwrap();
+    let packet = |calendar| SyncPacket {
+        device: state.device,
+        workspace: remote.id,
+        port: member.core.listen.port(),
+        calendar,
+    };
+    core.merge(packet(remote.calendar.clone())).unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    let mut changed = remote.calendar.clone();
+    let revision = state.revision().unwrap();
+    changed
+        .members
+        .insert(state.device, Record::new(revision, "Изменение".into()));
+    let mut outdated = remote.clone();
+    outdated.key_generation += 1;
+    assert!(
+        core.merge_in_scope(
+            packet(changed.clone()),
+            Some(delta::PeerScope::new(&outdated, state.device))
+        )
+        .is_err()
+    );
+    assert_eq!(count.load(Ordering::Relaxed), 0);
+    core.merge(packet(changed.clone())).unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    core.merge(packet(changed)).unwrap();
+    assert_eq!(count.load(Ordering::Relaxed), 1);
+    core.synchronized(state.device);
+    core.synchronized(state.device);
+    assert_eq!(count.load(Ordering::Relaxed), 2);
+    core.connected
+        .lock()
+        .unwrap()
+        .insert(state.device, Instant::now() - DISCOVERY_TTL);
+    core.synchronized(state.device);
+    assert_eq!(count.load(Ordering::Relaxed), 3);
+    drop(observer);
+    assert_eq!(Arc::strong_count(&count), 1);
 }

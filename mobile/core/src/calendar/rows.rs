@@ -5,6 +5,7 @@ use serde::{Serialize, Serializer};
 pub(super) struct Rows<'a> {
     pub calendar: &'a Calendar,
     pub occurrences: Vec<Occurrence<'a>>,
+    pub checklist_tuples: bool,
 }
 
 #[derive(Serialize)]
@@ -17,11 +18,25 @@ struct TaskRow<'a> {
     done: bool,
 }
 
-struct Checklist<'a>(Occurrence<'a>);
+struct Checklist<'a> {
+    event: Occurrence<'a>,
+    tuples: bool,
+}
 
 impl Serialize for Checklist<'_> {
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
-        let event = self.0;
+        let event = self.event;
+        if self.tuples {
+            return serializer.collect_seq(event.event.tasks.iter().map(|task| {
+                (
+                    task.id,
+                    &task.title,
+                    event.due(task),
+                    task.days_before,
+                    event.checked(task.id),
+                )
+            }));
+        }
         serializer.collect_seq(event.event.tasks.iter().map(|task| TaskRow {
             id: task.id,
             title: &task.title,
@@ -72,7 +87,10 @@ impl Serialize for Rows<'_> {
                     "{}:{}",
                     occurrence.revision.sequence, occurrence.revision.operation
                 ),
-                checklist: Checklist(occurrence),
+                checklist: Checklist {
+                    event: occurrence,
+                    tuples: self.checklist_tuples,
+                },
             }
         }))
     }

@@ -8,6 +8,7 @@ pub(super) struct Drafts {
     saved: Option<Document>,
     next_check: Option<Instant>,
     warning: Option<String>,
+    retry_write: bool,
     blocked: bool,
     restored: bool,
 }
@@ -127,8 +128,7 @@ impl EventDraft {
             scope: self.scope,
             initial_scope: self.initial_scope,
             error: None,
-            confirm_remove: false,
-            confirm_discard: false,
+            confirmation: None,
             focus_title: true,
             focus_new_task: false,
         };
@@ -160,8 +160,8 @@ impl Document {
         self.notes.len() <= MAX_NOTE_DRAFTS
             && self.notes.iter().all(|draft| {
                 (1900..=9999).contains(&draft.event.1)
-                    && draft.text.chars().count() <= 4000
-                    && draft.baseline.chars().count() <= 4000
+                    && draft.text.chars().count() <= MAX_NOTE_CHARS
+                    && draft.baseline.chars().count() <= MAX_NOTE_CHARS
                     && events.insert(draft.event)
             })
             && self.editor.as_ref().is_none_or(|draft| {
@@ -180,12 +180,12 @@ impl Document {
 fn draft_event_within_limits(event: &Event) -> bool {
     let mut task_ids = BTreeSet::new();
     (1900..=9999).contains(&event.date.year())
-        && event.title.chars().count() <= 160
-        && event.description.chars().count() <= 4000
-        && event.preparation_days <= 366
+        && event.title.chars().count() <= MAX_TITLE_CHARS
+        && event.description.chars().count() <= MAX_DESCRIPTION_CHARS
+        && event.preparation_days <= MAX_PREPARATION_DAYS
         && event.tasks.len() <= godovoy_plan::model::MAX_TASKS
         && event.tasks.iter().all(|task| {
-            task.title.chars().count() <= 160
+            task.title.chars().count() <= MAX_TITLE_CHARS
                 && task.days_before <= event.preparation_days
                 && task_ids.insert(task.id)
         })
@@ -285,31 +285,35 @@ impl App {
             (Some(live), Some(saved)) => live.matches(saved),
             _ => false,
         };
-        if !unchanged {
+        if !unchanged || self.drafts.retry_write {
             let next = next.map(LiveDrafts::document);
             if next.as_ref().is_some_and(|drafts| !drafts.within_limits()) {
                 let error = "Локальные черновики превышают допустимый размер.";
                 self.drafts.warning = Some(error.into());
                 return Err(error.into());
             }
-            let result = self.store.lock().unwrap().save_ui_drafts(next.as_ref());
-            self.drafts.warning = result
-                .as_ref()
-                .err()
-                .map(|error| format!("Не удалось сохранить локальные черновики. {error}"));
-            result?;
+            self.persist_local_drafts(next.as_ref())?;
             self.drafts.saved = next;
             return Ok(true);
         }
         Ok(false)
     }
 
+    fn persist_local_drafts(&mut self, next: Option<&Document>) -> Fallible<()> {
+        let result = self.store.lock().unwrap().save_ui_drafts(next);
+        // A failed directory flush can leave the new value visible. Reconcile even if
+        // the employee types the previous value again, or discards an unsaved draft.
+        self.drafts.retry_write = result.is_err();
+        self.drafts.warning = result
+            .as_ref()
+            .err()
+            .map(|error| format!("Не удалось сохранить локальные черновики. {error}"));
+        result
+    }
+
     pub fn discard_local_drafts(&mut self) -> Fallible<()> {
-        if !self.drafts.blocked && self.drafts.saved.is_some() {
-            self.store
-                .lock()
-                .unwrap()
-                .save_ui_drafts::<Document>(None)?;
+        if !self.drafts.blocked && (self.drafts.saved.is_some() || self.drafts.retry_write) {
+            self.persist_local_drafts(None)?;
         }
         self.drafts.saved = None;
         self.editor = None;
@@ -320,7 +324,11 @@ impl App {
     }
 
     pub(super) fn checkpoint_local_drafts(&mut self, ctx: &egui::Context) {
-        if self.drafts.blocked || (!self.has_unsaved_changes() && self.drafts.saved.is_none()) {
+        if self.drafts.blocked
+            || (!self.drafts.retry_write
+                && !self.has_unsaved_changes()
+                && self.drafts.saved.is_none())
+        {
             return;
         }
         let now = Instant::now();
@@ -368,20 +376,26 @@ impl App {
         }
     }
 
+    pub(super) fn park_active_note(&mut self) {
+        let Some(event) = self.note_event.filter(|_| self.note != self.note_baseline) else {
+            return;
+        };
+        self.note_drafts.push(NoteDraft {
+            event,
+            text: std::mem::take(&mut self.note),
+            baseline: std::mem::take(&mut self.note_baseline),
+            merging: self.note_merging,
+        });
+        self.note_event = None;
+        self.note_merging = false;
+    }
+
     pub(super) fn draft_banner(&mut self, ui: &mut Ui, calendar: &Calendar) {
         self.follow_note_drafts(calendar);
-        if let Some(event) = self.note_event
-            && self.note != self.note_baseline
-            && calendar.event(event.0, event.1).is_none()
-        {
-            self.note_drafts.push(NoteDraft {
-                event,
-                text: std::mem::take(&mut self.note),
-                baseline: std::mem::take(&mut self.note_baseline),
-                merging: self.note_merging,
-            });
-            self.note_event = None;
-            self.note_merging = false;
+        if self.note_event.is_some_and(|event| {
+            self.note != self.note_baseline && calendar.event(event.0, event.1).is_none()
+        }) {
+            self.park_active_note();
         }
         if let Some(warning) = &self.drafts.warning {
             ui.colored_label(RED, warning);
@@ -647,6 +661,30 @@ mod tests {
         assert_eq!(reopened.note_drafts.len(), 1);
         assert_eq!(reopened.note_drafts[0].event, missing);
         assert_eq!(reopened.note_drafts[0].text, "К удалённому событию");
+    }
+
+    #[test]
+    fn failed_checkpoint_is_reconciled_even_after_reverting_to_no_draft() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let mut app = open_team(&profile);
+        let file = profile.join("drafts-v1.json");
+        fs::create_dir(&file).unwrap();
+        app.editor = Some(planned(NaiveDate::from_ymd_opt(2026, 11, 23).unwrap()));
+        assert!(app.flush_local_drafts().is_err());
+        let visible = app.live_drafts().unwrap().document();
+        fs::remove_dir(&file).unwrap();
+        // Simulate the visible replacement which may precede a failed directory flush.
+        app.store
+            .lock()
+            .unwrap()
+            .save_ui_drafts(Some(&visible))
+            .unwrap();
+        app.editor = None;
+        assert!(app.flush_draft_changes().unwrap());
+        assert!(!file.exists());
+        assert!(!app.drafts.retry_write);
+        assert!(!app.flush_draft_changes().unwrap());
     }
 
     #[test]

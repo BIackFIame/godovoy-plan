@@ -3,8 +3,12 @@
 mod actions;
 #[path = "../online/admin.rs"]
 mod admin;
+#[path = "../online/assets.rs"]
+mod assets;
 #[path = "../online/host.rs"]
 mod host;
+#[path = "../online/http.rs"]
+mod http;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use godovoy_plan::{
@@ -17,7 +21,7 @@ use godovoy_plan::{
 };
 use std::{env, path::Path};
 
-const HELP: &str = "godovoy-online configure DIR [--backup-root PRIVATE_DIR]\ngodovoy-online protection-report DIR\ngodovoy-online backup DIR NEW_DEST\ngodovoy-online backup-verify BACKUP\ngodovoy-online backup-restore BACKUP NEW_DIR\ngodovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online grant DIR NAME --employee-id UUID --mcp [--mcp-write] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
+const HELP: &str = "godovoy-online start [DIR]\ngodovoy-online configure DIR [--backup-root PRIVATE_DIR]\ngodovoy-online protection-report DIR\ngodovoy-online backup DIR NEW_DEST\ngodovoy-online backup-verify BACKUP\ngodovoy-online backup-restore BACKUP NEW_DIR\ngodovoy-online init DIR NAME\ngodovoy-online init DIR --from-profile OLD_DIR\ngodovoy-online grant DIR NAME [--employee-id UUID] [--read-only] [--allow-remote]\ngodovoy-online grant DIR NAME --employee-id UUID --mcp [--mcp-write] [--allow-remote]\ngodovoy-online revoke DIR CREDENTIAL_ID\ngodovoy-online revoke-all DIR\ngodovoy-online prepare-revoke-space DIR (macOS/Linux)\ngodovoy-online revoke DIR CREDENTIAL_ID --use-reserve (macOS/Linux)\ngodovoy-online revoke-all DIR --use-reserve (macOS/Linux)\ngodovoy-online status DIR\ngodovoy-online audit DIR\ngodovoy-online standby-begin DIR --minutes N\ngodovoy-online standby-end DIR\ngodovoy-online serve DIR [--standby] [--port 45838] [--origin https://calendar.example] [--access office|remote]";
 fn describe_window(window: godovoy_plan::storage::online::StandbyWindow) {
     let deadline =
         DateTime::<Utc>::from_timestamp(window.deadline, 0).expect("validated standby deadline");
@@ -44,6 +48,58 @@ fn main() {
         std::process::exit(1);
     }
 }
+fn create_vault(
+    dir: &Path,
+    name: String,
+    calendar: Calendar,
+    employees: std::collections::BTreeMap<Id, String>,
+) -> Fallible<OnlineVault> {
+    let vault = OnlineVault::init(dir, name, calendar, employees)?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if let Err(error) = vault.lock().and_then(|lock| lock.prepare_revoke_space()) {
+        eprintln!("Календарь создан без резерва для срочного отзыва доступа. Проверьте место и выполните prepare-revoke-space: {error}");
+    }
+    Ok(vault)
+}
+
+fn start_local(dir: &Path) -> Fallible<()> {
+    use std::{fs, io::ErrorKind, io::IsTerminal, net::Ipv4Addr};
+    // Never write a freshly issued access key to a redirected stream or service log.
+    if !std::io::stdout().is_terminal() {
+        return Err("Запустите start в интерактивном терминале. Для службы используйте serve.".into());
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+    runtime.block_on(async {
+        let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
+        let address = listener.local_addr()?;
+        let (vault, key) = match fs::symlink_metadata(dir) {
+            Ok(_) => (OnlineVault::open(dir)?, None),
+            Err(error) if error.kind() == ErrorKind::NotFound => {
+                let vault = create_vault(dir, "Наш календарь".into(), Calendar::default(), Default::default())?;
+                let (_, _, key) = vault.lock()?.grant("Владелец", None, false)?;
+                (vault, Some(zeroize::Zeroizing::new(key)))
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let origin = format!("http://{address}");
+        let host = host::Host::new(vault, &origin, Some(host::EntryPoint::Office))?;
+        println!("Откройте календарь на этом компьютере: {origin}");
+        if let Some(key) = key {
+            print_first_key(key.as_str())?;
+        } else {
+            println!("Войдите с ранее выданным ключом. Для нового ключа используйте grant.");
+        }
+        host::serve_listener(listener, host::router(host)).await
+    })
+}
+
+fn print_first_key(key: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "Первый ключ доступа (показывается один раз):\n{key}")?;
+    out.flush()
+}
+
 fn run() -> Fallible<()> {
     let args = env::args().skip(1).collect::<Vec<_>>();
     if args == ["--version"] {
@@ -53,6 +109,11 @@ fn run() -> Fallible<()> {
     if args.is_empty() || args == ["--help"] || args == ["-h"] {
         println!("{HELP}");
         return Ok(());
+    }
+    match args.as_slice() {
+        [op] if op == "start" => return start_local(Path::new("team-calendar")),
+        [op, dir] if op == "start" && !dir.starts_with('-') => return start_local(Path::new(dir)),
+        _ => {}
     }
     let [op, dir, tail @ ..] = args.as_slice() else {
         return Err(HELP.into());
@@ -76,7 +137,7 @@ fn run() -> Fallible<()> {
             }
             _ => return Err(HELP.into()),
         };
-        OnlineVault::init(dir, name, calendar, employees)?;
+        create_vault(dir, name, calendar, employees)?;
         println!("Центральный календарь создан. Выдайте персональные ключи командой grant.");
         return Ok(());
     }
@@ -134,6 +195,13 @@ fn run() -> Fallible<()> {
                 "{}",
                 serde_json::to_string_pretty(&open()?.create_verified_backup(Path::new(dest))?)?
             );
+        }
+        #[cfg(unix)]
+        ("serve-office-socket", [socket, origin]) => {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()?
+                .block_on(host::serve_office_socket(open()?, Path::new(socket), origin))?;
         }
         ("serve", options) => {
             let mut port = None;
@@ -212,6 +280,21 @@ fn run() -> Fallible<()> {
                 "Сотрудник: {employee}\nID ключа для отзыва: {id}\nКлюч доступа (показывается один раз):\n{token}"
             );
         }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        ("prepare-revoke-space", []) => {
+            open()?.lock()?.prepare_revoke_space()?;
+            println!("На томе выделен резерв 2 МиБ для срочного отзыва доступа.");
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        ("revoke", [key, flag]) if flag == "--use-reserve" => {
+            open()?.lock()?.revoke_with_reserve(key.parse()?, true)?;
+            println!("Доступ по ключу отозван.");
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        ("revoke-all", [flag]) if flag == "--use-reserve" => {
+            let count = open()?.lock()?.revoke_all_with_reserve(true)?;
+            println!("Отозвано ключей: {count}.");
+        }
         ("revoke", [key]) => {
             let key = key.parse()?;
             open()?.lock()?.revoke(key)?;
@@ -234,6 +317,12 @@ fn run() -> Fallible<()> {
             let lock = vault.lock()?;
             let acl = lock.access()?;
             println!("Календарь: {}", acl.name.escape_debug());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            match lock.revoke_space_ready() {
+                Ok(true) => println!("Резерв отзыва: подготовлен (2 МиБ)."),
+                Ok(false) => println!("Резерв отзыва: не подготовлен."),
+                Err(_) => println!("Резерв отзыва: требуется проверка файла и прав."),
+            }
             if let Some(window) = lock.standby_status()? {
                 describe_window(window);
             } else {

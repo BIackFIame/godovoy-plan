@@ -237,7 +237,7 @@ pub fn view_option(ui: &mut Ui, name: &str, active: bool) -> bool {
     choice_button(ui, name, active, Some(BACK)).clicked()
 }
 
-fn choice_button(
+pub(crate) fn choice_button(
     ui: &mut Ui,
     name: &str,
     active: bool,

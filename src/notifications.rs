@@ -1,6 +1,8 @@
 use std::{
-    collections::BTreeSet,
-    sync::mpsc::{Receiver, TryRecvError, sync_channel},
+    sync::{
+        Arc,
+        mpsc::{Receiver, TryRecvError, sync_channel},
+    },
     time::{Duration, Instant},
 };
 
@@ -13,7 +15,7 @@ const RETRY_DELAYS: [Duration; 3] = [
 ];
 
 enum Kind {
-    Reminders(Vec<Reminder>),
+    Reminders(Arc<[Reminder]>),
     Test,
 }
 
@@ -55,7 +57,7 @@ pub enum TestStatus {
 
 #[derive(Default)]
 pub struct Delivery {
-    requested: BTreeSet<Reminder>,
+    requested: Option<Arc<[Reminder]>>,
     job: Option<Job>,
     retry_at: Option<Instant>,
     failures: usize,
@@ -75,19 +77,42 @@ impl Delivery {
         self.retry_at.is_some()
     }
 
-    pub fn new_reminders(&mut self, pending: &[Reminder]) -> Vec<Reminder> {
-        self.requested
-            .retain(|item| pending.binary_search(item).is_ok());
-        pending
+    fn needs_notification(&mut self, pending: &Arc<[Reminder]>) -> bool {
+        let Some(previous) = &self.requested else {
+            return !pending.is_empty();
+        };
+        if Arc::ptr_eq(previous, pending) {
+            return false;
+        }
+        // Both snapshots contain distinct reminder keys in their natural order.
+        let mut acknowledged = previous.iter();
+        if pending
             .iter()
-            .copied()
-            .filter(|item| !self.requested.contains(item))
-            .collect()
+            .all(|key| acknowledged.by_ref().any(|old| old == key))
+        {
+            self.requested = Some(Arc::clone(pending));
+            return false;
+        }
+        // Forget withdrawn reminders even if sending the new alert fails.
+        let mut current = pending.iter();
+        if !previous
+            .iter()
+            .all(|key| current.by_ref().any(|new| new == key))
+        {
+            self.requested = Some(
+                previous
+                    .iter()
+                    .copied()
+                    .filter(|key| pending.binary_search(key).is_ok())
+                    .collect(),
+            );
+        }
+        true
     }
 
-    pub fn reminders(&mut self, batch: Vec<Reminder>, now: Instant) {
-        if !batch.is_empty() {
-            self.start(Kind::Reminders(batch), now);
+    pub fn reminders(&mut self, pending: &Arc<[Reminder]>, now: Instant) {
+        if self.needs_notification(pending) {
+            self.start(Kind::Reminders(Arc::clone(pending)), now);
         }
     }
 
@@ -135,7 +160,7 @@ impl Delivery {
                 }
             }
             Kind::Reminders(batch) if accepted => {
-                self.requested.extend(batch);
+                self.requested = Some(batch);
                 self.retry_at = None;
                 self.failures = 0;
             }
@@ -181,7 +206,7 @@ mod tests {
         };
         for batch in [vec![preparation], vec![task], vec![preparation, task]] {
             assert_eq!(
-                Kind::Reminders(batch).system_message().body(),
+                Kind::Reminders(batch.into()).system_message().body(),
                 "Откройте раздел «Напоминания» в приложении."
             );
         }
@@ -194,7 +219,7 @@ mod tests {
     #[test]
     fn empty_reminder_batch_does_not_start_a_system_request() {
         let mut delivery = Delivery::default();
-        delivery.reminders(Vec::new(), Instant::now());
+        delivery.reminders(&Arc::from([]), Instant::now());
         assert!(!delivery.busy());
     }
 
@@ -207,19 +232,52 @@ mod tests {
             year: 2027,
             kind: Milestone::Preparation,
         };
+        let pending = Arc::from([item]);
         let mut delivery = Delivery::default();
-        assert_eq!(delivery.new_reminders(&[item]), [item]);
-        delivery.finish(Kind::Reminders(vec![item]), false, now);
+        assert!(delivery.needs_notification(&pending));
+        delivery.finish(Kind::Reminders(pending.clone()), false, now);
         assert!(!delivery.ready(now));
         assert!(delivery.has_error());
         assert!(delivery.ready(now + RETRY_DELAYS[0]));
-        assert_eq!(delivery.new_reminders(&[item]), [item]);
+        assert!(delivery.needs_notification(&pending));
         delivery.finish(Kind::Test, true, now);
-        assert_eq!(delivery.new_reminders(&[item]), [item]);
-        delivery.finish(Kind::Reminders(vec![item]), true, now);
+        assert!(delivery.needs_notification(&pending));
+        delivery.finish(Kind::Reminders(pending.clone()), true, now);
         assert!(!delivery.has_error());
-        assert!(delivery.new_reminders(&[item]).is_empty());
-        assert!(delivery.new_reminders(&[]).is_empty());
-        assert_eq!(delivery.new_reminders(&[item]), [item]);
+        assert!(!delivery.needs_notification(&pending));
+        assert!(!delivery.needs_notification(&Arc::from([])));
+        assert!(delivery.needs_notification(&pending));
+    }
+
+    #[test]
+    fn changed_snapshots_preserve_only_successfully_requested_visible_keys() {
+        let now = Instant::now();
+        let keys = |mask: u8| -> Arc<[Reminder]> {
+            (0..4)
+                .filter(|i| mask & (1 << i) != 0)
+                .map(|i| Reminder {
+                    date: NaiveDate::MIN,
+                    event: Id::from_u128(i),
+                    year: 2026,
+                    kind: Milestone::Preparation,
+                })
+                .collect()
+        };
+        for prior in 0..16 {
+            for next in 0..16 {
+                for accepted in [false, true] {
+                    let mut delivery = Delivery::default();
+                    delivery.finish(Kind::Reminders(keys(prior)), true, now);
+                    let pending = keys(next);
+                    let needed = delivery.needs_notification(&pending);
+                    assert_eq!(needed, next & !prior != 0);
+                    if needed {
+                        delivery.finish(Kind::Reminders(pending), accepted, now);
+                    }
+                    let retained = if accepted { next } else { prior & next };
+                    assert_eq!(delivery.requested.as_deref().unwrap(), &*keys(retained));
+                }
+            }
+        }
     }
 }

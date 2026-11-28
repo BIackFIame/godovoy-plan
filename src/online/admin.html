@@ -94,6 +94,12 @@
           </form>
         </div>
         <p id="staff-status" role="status"></p>
+        <details id="revoke-space" class="duties" hidden><summary>Место на диске для срочного отзыва</summary>
+          <p>Сервер может заранее выделить 2 МиБ для отзыва ключей при нехватке места. После использования резерв можно подготовить снова.</p>
+          <p id="revoke-space-state"></p>
+          <button id="prepare-space" type="button" disabled>Выделить 2 МиБ</button>
+          <span id="space-status" role="status"></span>
+        </details>
       </details>
       <details class="card" id="backup"><summary>Резервная копия</summary>
         <p>Сервер сохранит снимок календаря в каталоге, который администратор указал при запуске панели, и проверит сохранённую копию.</p>

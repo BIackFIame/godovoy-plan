@@ -1,5 +1,5 @@
 //! Host-enforced rules for the authoritative calendar, under the shared volume lock.
-use super::{ACCESS, ACCESS_LIMIT, Access, Id, LockedVault, save, sync_directory};
+use super::{Access, Id, LockedVault, save, sync_directory};
 use crate::Fallible;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::{fmt, fs, io::ErrorKind};
@@ -98,8 +98,7 @@ impl LockedVault<'_> {
         if policy.pending_audit {
             self.audit_protection("protection_applied", policy.change_id, policy.state)?;
             policy.pending_audit = false;
-            save(&self.directory.join(ACCESS), acl, ACCESS_LIMIT)?;
-            sync_directory(self.directory)?;
+            self.commit_registry(acl)?;
         }
         Ok(())
     }
@@ -138,8 +137,7 @@ impl LockedVault<'_> {
             change_id,
             pending_audit: true,
         });
-        save(&self.directory.join(ACCESS), &acl, ACCESS_LIMIT)?;
-        sync_directory(self.directory)?;
+        self.commit_registry(&acl)?;
         self.finish_protection(&mut acl)?;
         Ok(state)
     }

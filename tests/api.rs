@@ -3,7 +3,7 @@ mod secure;
 use godovoy_plan::api::{ApiKeyKind, ApiMethod, ApiSession};
 use std::{
     io::{BufRead, BufReader, Write},
-    net::{Ipv4Addr, TcpListener},
+    net::{Ipv4Addr, TcpListener, UdpSocket},
     path::Path,
     process::Command,
     sync::Arc,
@@ -30,10 +30,16 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
-        Self::on_ports(0..=0)
+        let (profile, store) = Self::profile();
+        let server = ApiServer::start(store.clone(), 0).unwrap();
+        Self {
+            server,
+            store,
+            profile,
+        }
     }
 
-    fn on_ports(ports: std::ops::RangeInclusive<u16>) -> Self {
+    fn profile() -> (TempDir, SharedStore) {
         let profile = tempfile::tempdir().unwrap();
         let store = Store::open(&profile.path().join("profile")).unwrap();
         store
@@ -50,25 +56,41 @@ impl Fixture {
                 Ok(())
             })
             .unwrap();
-        let server = ports
-            .into_iter()
-            .find_map(|port| match ApiServer::start(store.clone(), port) {
-                Ok(server) => Some(server),
+        (profile, store)
+    }
+
+    fn on_reserved_port(ports: std::ops::RangeInclusive<u16>) -> (Self, UdpSocket) {
+        let (profile, store) = Self::profile();
+        // A second test process can otherwise claim the TCP port between shutdown and rebind.
+        // Retain the matching loopback UDP port for the entire assertion in the caller.
+        for port in ports {
+            let reservation = match UdpSocket::bind((Ipv4Addr::LOCALHOST, port)) {
+                Ok(socket) => socket,
+                Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => continue,
+                Err(error) => panic!("Reserving test port failed: {error}"),
+            };
+            match ApiServer::start(store.clone(), port) {
+                Ok(server) => {
+                    return (
+                        Self {
+                            server,
+                            store,
+                            profile,
+                        },
+                        reservation,
+                    );
+                }
                 Err(error)
                     if error
                         .downcast_ref::<std::io::Error>()
                         .is_some_and(|e| e.kind() == std::io::ErrorKind::AddrInUse) =>
                 {
-                    None
+                    continue;
                 }
                 Err(error) => panic!("Starting test API failed: {error}"),
-            })
-            .expect("No available test API port");
-        Self {
-            server,
-            store,
-            profile,
+            }
         }
+        panic!("No available test API port");
     }
 }
 
@@ -148,8 +170,7 @@ async fn pending_import_releases_old_calendar_and_checks_changed_credentials() {
 
 #[tokio::test]
 async fn shutting_down_closes_an_incomplete_import_and_releases_the_port() {
-    // A port picked by bind(0) can be reused by another parallel test client immediately after close.
-    let fixture = Fixture::on_ports(30411..=30430);
+    let (fixture, _reservation) = Fixture::on_reserved_port(30411..=30430);
     let port = fixture.server.port();
     let (session, body) = start_pending_import(&fixture).await;
     fixture
@@ -578,8 +599,7 @@ async fn secure_import_spans_frames_and_keeps_the_external_identity() {
 
 #[test]
 fn repeated_requests_release_workers_and_listener() {
-    // A port picked by bind(0) can be reused by another parallel test client immediately after close.
-    let fixture = Fixture::on_ports(30431..=30450);
+    let (fixture, _reservation) = Fixture::on_reserved_port(30431..=30450);
     let port = fixture.server.port();
 
     for n in 0..400 {

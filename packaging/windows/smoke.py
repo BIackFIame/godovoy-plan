@@ -1,4 +1,4 @@
-"""Run published Windows executables in an isolated temporary profile on the runner."""
+"""Run Windows release executables in an isolated temporary profile on the runner."""
 import hashlib
 import http.client
 import json
@@ -9,6 +9,7 @@ import re
 import subprocess
 import shutil
 import threading
+import sys
 import urllib.request
 import uuid
 import zipfile
@@ -19,14 +20,56 @@ def cli(exe, *args):
         raise RuntimeError(f"{exe.name} {args[0]} failed ({result.returncode}): {result.stderr.strip()}")
     return result.stdout.strip()
 
-def extract_release(release, name, programs, directory):
+def release_asset(release, name):
     matches = [a for a in release["assets"] if a["name"] == name]
     assert len(matches) == 1
     asset = matches[0]
-    archive = directory / name
-    urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    assert asset["state"] == "uploaded"
+    assert isinstance(asset["id"], int) and re.fullmatch(r"sha256:[0-9a-f]{64}", asset["digest"])
+    assert isinstance(asset["size"], int) and asset["size"] > 0
+    return asset
+
+def verify_archive(asset, archive):
     digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     assert asset["digest"] == "sha256:" + digest and asset["size"] == archive.stat().st_size
+    return digest
+
+def package_names(version, arch):
+    desktop = f"GodovoyPlan-{version}-Windows-{arch}.zip"
+    if arch == "x64":
+        return desktop, f"GodovoyServer-{version}-Windows-x64.zip"
+    return (desktop,)
+
+def matching_draft(release, tag):
+    return release["draft"] and release["tag_name"] == tag and release["target_commitish"] == os.environ["GITHUB_SHA"]
+
+def fetch_draft(directory):
+    tag, arch = release_args()
+    draft = os.environ["RELEASE_DRAFT_ID"]
+    assert re.fullmatch(r"[0-9]+", draft)
+    api = "repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases"
+    raw = subprocess.check_output(["gh", "api", f"{api}/{draft}"], timeout=30)
+    release = json.loads(raw)
+    assert matching_draft(release, tag)
+    directory.mkdir()
+    for name in package_names(tag[1:], arch):
+        asset = release_asset(release, name)
+        archive = directory / name
+        with archive.open("xb") as file:
+            subprocess.run(["gh", "api", f"{api}/assets/{asset['id']}",
+                            "-H", "Accept: application/octet-stream"],
+                           stdout=file, check=True, timeout=90)
+        print(name, verify_archive(asset, archive), flush=True)
+    (directory / "release.json").write_bytes(raw)
+
+def extract_release(release, name, programs, directory, assets):
+    asset = release_asset(release, name)
+    if assets is None:
+        archive = directory / name
+        urllib.request.urlretrieve(asset["browser_download_url"], archive)
+    else:
+        archive = assets / name
+    digest = verify_archive(asset, archive)
     with zipfile.ZipFile(archive) as package:
         for prog in programs:
             assert package.namelist().count(prog) == 1
@@ -71,22 +114,34 @@ def server_flow(exe, directory):
         process.stderr.close()
     print("PASS: init, read-only session, year and revocation", flush=True)
 
-def main():
+def release_args():
     tag = os.environ["RELEASE_TAG"]
     arch = os.environ["PACKAGE_ARCH"]
-    assert os.name == "nt" and re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
+    assert re.fullmatch(r"v[0-9]+\.[0-9]+\.[0-9]+", tag)
     assert arch in ("x64", "x86", "ARM64")
+    return tag, arch
+
+def main():
+    assert os.name == "nt"
+    tag, arch = release_args()
     url = "https://api.github.com/repos/" + os.environ["GITHUB_REPOSITORY"] + "/releases/tags/" + tag
-    with urllib.request.urlopen(url, timeout=30) as response:
-        release = json.load(response)
-    assert release["tag_name"] == tag and not release["draft"]
+    assets = os.environ.get("RELEASE_ASSET_DIR")
+    if assets:
+        assets = Path(assets)
+        release = json.loads((assets / "release.json").read_bytes())
+        assert matching_draft(release, tag)
+    else:
+        with urllib.request.urlopen(url, timeout=30) as response:
+            release = json.load(response)
+        assert not release["draft"]
+    assert release["tag_name"] == tag
     version = tag[1:]
     # Inherit the dedicated NTFS volume ACL. TemporaryDirectory installs its own OWNER RIGHTS ACE.
     directory = Path(os.environ["GP_TEST_VOLUME"]) / ("GodovoyQA-" + uuid.uuid4().hex)
     directory.mkdir()
     try:
         extract_release(release, f"GodovoyPlan-{version}-Windows-{arch}.zip",
-                        ["godovoy-plan.exe", "godovoy-online.exe"], directory)
+                        ["godovoy-plan.exe", "godovoy-online.exe"], directory, assets)
         desktop = directory / "godovoy-plan.exe"
         assert cli(desktop, "--version").endswith(version)
         online = directory / "godovoy-online.exe"
@@ -96,7 +151,7 @@ def main():
             standalone = directory / "server"
             standalone.mkdir()
             extract_release(release, f"GodovoyServer-{version}-Windows-x64.zip",
-                            [online.name], standalone)
+                            [online.name], standalone, assets)
             server_flow(standalone / online.name, standalone)
         for dll in ("opengl32.dll", "libgallium_wgl.dll"):
             shutil.copyfile(Path(os.environ["GP_TEST_RENDERER"]) / dll, directory / dll)
@@ -107,4 +162,8 @@ def main():
         shutil.rmtree(directory)
 
 if __name__ == "__main__":
-    main()
+    if len(sys.argv) == 3 and sys.argv[1] == "--fetch-draft":
+        fetch_draft(Path(sys.argv[2]))
+    else:
+        assert len(sys.argv) == 1
+        main()

@@ -10,6 +10,8 @@ struct EventEditor: View {
     @EnvironmentObject var model: CalendarModel
     @Environment(\.dismiss) var dismiss
     let event: GPEvent?
+    private let viewYear: Int?
+    private let baseToken: String?
     @State private var title: String
     @State private var day: Date
     @State private var yearly: Bool
@@ -21,8 +23,10 @@ struct EventEditor: View {
     @State private var scope = "year"
     @State private var discard = false
 
-    init(event: GPEvent?, year: Int) {
+    init(event: GPEvent?, year: Int, viewYear: Int? = nil, baseToken: String? = nil) {
         self.event = event
+        self.viewYear = viewYear
+        self.baseToken = baseToken
         let initial = GPDate.gregorian.date(from: DateComponents(year: year, month: 1, day: 1, hour: 12)) ?? Date()
         _title = State(initialValue: event?.title ?? "")
         _day = State(initialValue: event.flatMap { GPDate.parse($0.date) } ?? (year == GPDate.year ? Date() : initial))
@@ -52,23 +56,23 @@ struct EventEditor: View {
                 }
                 TextField("Описание", text: $details, axis: .vertical).lineLimit(2...8)
             }
-            Section { Stepper("За \(prep) дн. до события", value: $prep, in: 0...366) } header: { Text("Начало подготовки") }
+            Section { Stepper("За \(prep) дн. до события", value: $prep, in: 0...GPMobileLimits.maxPreparationDays) } header: { Text("Начало подготовки") }
             Section("Чек-лист") {
                 ForEach($tasks) { $task in
                     VStack(alignment: .leading) {
                         TextField("Название пункта", text: $task.title)
-                        Stepper("Срок за \(task.days) дн.", value: $task.days, in: 0...366).font(.subheadline)
+                        Stepper("Срок за \(task.days) дн.", value: $task.days, in: 0...GPMobileLimits.maxPreparationDays).font(.subheadline)
                         if task.days > prep { Text("Срок раньше начала подготовки").font(.caption).foregroundStyle(.red) }
                     }
                 }.onDelete { tasks.remove(atOffsets: $0) }
-                Button { tasks.append(DraftTask(title: "", days: 0)) } label: { Label("Добавить пункт", systemImage: "plus") }.disabled(tasks.count >= 100)
+                Button { tasks.append(DraftTask(title: "", days: 0)) } label: { Label("Добавить пункт", systemImage: "plus") }.disabled(tasks.count >= GPMobileLimits.maxTasks)
             }
             if let issue = model.failure { Text(issue).foregroundStyle(.red) }
         }
         .navigationTitle(event == nil ? "Новое событие" : "Изменить событие").navigationBarTitleDisplayMode(.inline)
         .toolbar {
             ToolbarItem(placement: .cancellationAction) { Button("Отмена") { if modified { discard = true } else { dismiss() } }.disabled(model.busy) }
-            ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { Task { await save() } }.disabled(model.busy || title.isBlank || title.count > 160 || details.count > 4000 || tasks.contains { $0.title.isBlank || $0.days > prep || $0.title.count > 160 }).accessibilityIdentifier("eventSave") }
+            ToolbarItem(placement: .confirmationAction) { Button("Сохранить") { Task { await save() } }.disabled(model.busy || title.isBlank || !GPMobileLimits.withinTitleLimit(title) || !GPMobileLimits.withinDescriptionLimit(details) || tasks.contains { $0.title.isBlank || $0.days > prep || !GPMobileLimits.withinTitleLimit($0.title) }).accessibilityIdentifier("eventSave") }
         }
         .interactiveDismissDisabled(modified)
         .confirmationDialog("Закрыть без сохранения?", isPresented: $discard, titleVisibility: .visible) { Button("Закрыть без сохранения", role: .destructive) { dismiss() }; Button("Продолжить редактирование", role: .cancel) {} }
@@ -86,7 +90,16 @@ struct EventEditor: View {
         }
         let savedOwner = event?.employeeId == owner ? (event?.ownerId ?? owner) : owner
         var fields: GPCommand = ["title": .string(title), "date": .string(GPDate.iso(day)), "yearly": .flag(yearly), "preparationDays": .integer(prep), "ownerId": savedOwner.isEmpty ? .null : .string(savedOwner), "category": .string(category), "checklist": .list(checklist), "description": .string(details)]
-        if let event { fields["eventId"] = .string(event.id); fields["year"] = .integer(event.year); fields["revision"] = .string(event.revision); fields["scope"] = .string(event.yearly ? scope : "future") }
+        if let event {
+            fields["eventId"] = .string(event.id)
+            fields["year"] = .integer(event.year)
+            fields["revision"] = .string(event.revision)
+            fields["scope"] = .string(event.yearly ? scope : "future")
+            if let viewYear, let baseToken {
+                fields["viewYear"] = .integer(viewYear)
+                fields["baseToken"] = .string(baseToken)
+            }
+        }
         if await model.run(event == nil ? "createEvent" : "editEvent", fields) { model.year = GPDate.gregorian.component(.year, from: day); dismiss() }
     }
 }

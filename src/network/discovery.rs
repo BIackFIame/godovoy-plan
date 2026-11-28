@@ -1,4 +1,18 @@
 //! Discovery hints are authenticated separately from enrollment and sync sessions.
+use std::{
+    collections::BTreeMap,
+    io,
+    net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket},
+    sync::{Arc, atomic::Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+
+use chrono::Utc;
+use socket2::{Domain, Protocol, Socket, Type};
+
+use super::{Core, DISCOVERY_TTL, MAX_PEERS, Seen, Wait};
+
 use crate::{model::Id, storage::random_bytes};
 use blake2::{
     Blake2sMac256,
@@ -73,6 +87,134 @@ impl Key {
         ))
     }
 }
+pub(super) fn socket(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
+    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    socket.set_reuse_address(true)?;
+    #[cfg(unix)]
+    socket.set_reuse_port(true)?;
+    socket.set_broadcast(ip.is_unspecified())?;
+    socket.bind(&SocketAddrV4::new(ip, port).into())?;
+    socket.set_nonblocking(true)?;
+    Ok(socket.into())
+}
+
+pub(super) fn run(core: Arc<Core>, mut wait: Wait, port: u16) {
+    let inbound = core.inbound.get().unwrap();
+    let mut announce_at = Instant::now();
+    // One extra byte distinguishes oversized/truncated packets.
+    let mut packet = [0; LENGTH + 1];
+    while !core.stopped.load(Ordering::Relaxed) {
+        if !core.active() {
+            inbound.wait_for_resume(&core);
+            continue;
+        }
+        if Instant::now() >= announce_at {
+            announce_at = Instant::now() + Duration::from_secs(3);
+            let state = core.snapshot();
+            if let Some(team) = &state.workspace {
+                let mut keys = vec![Key::derive(&team.key, true, team.id)];
+                let mut invites = core.invites.lock().unwrap();
+                let now = Instant::now();
+                invites.retain(|_, invite| invite.expires > now);
+                keys.extend(
+                    invites
+                        .iter()
+                        .map(|(id, invite)| Key::derive(&invite.key, false, *id)),
+                );
+                drop(invites);
+                for key in keys {
+                    if !core.active() {
+                        break;
+                    }
+                    if let Some(message) = key.seal(
+                        state.device,
+                        team.id,
+                        core.advertised_port(),
+                        Utc::now().timestamp(),
+                    ) {
+                        inbound.announce(&message, port);
+                    }
+                }
+            }
+        }
+        let (registered, result) = inbound.receive(&mut packet);
+        let source = match result {
+            Ok((LENGTH, SocketAddr::V4(source))) if core.active() => source,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                wait.until(
+                    registered,
+                    announce_at.saturating_duration_since(Instant::now()),
+                );
+                continue;
+            }
+            Err(_) => {
+                thread::park_timeout(Duration::from_millis(40));
+                continue;
+            }
+            _ => continue,
+        };
+        if !core.active() || !core.permits_ip(*source.ip()) {
+            continue;
+        }
+        let state = core.snapshot();
+        let now = Utc::now().timestamp();
+        let packet = &packet[..LENGTH];
+        let hint = state
+            .workspace
+            .as_ref()
+            .and_then(|team| {
+                Key::derive(&team.key, true, team.id)
+                    .open(packet, now)
+                    .filter(|(_, group, _)| *group == team.id)
+            })
+            .or_else(|| {
+                let pending = core.pending_discovery.lock().unwrap();
+                let (host, key) = pending.as_ref()?;
+                key.open(packet, now).filter(|(from, _, _)| from == host)
+            });
+        let Some((from, remote_workspace, listen_port)) = hint else {
+            continue;
+        };
+        if from == state.device {
+            continue;
+        }
+        let address = SocketAddrV4::new(*source.ip(), listen_port);
+        let mut seen = core.discovered.lock().unwrap();
+        let new_route = seen.get(&address).is_none_or(|old| {
+            old.workspace != remote_workspace || old.time.elapsed() >= DISCOVERY_TTL
+        });
+        remember(
+            &mut seen,
+            address,
+            Seen {
+                device: from,
+                workspace: remote_workspace,
+                time: Instant::now(),
+            },
+        );
+        if new_route && seen.contains_key(&address) {
+            core.wake_sync();
+        }
+    }
+}
+
+pub(super) fn remember(
+    seen: &mut BTreeMap<SocketAddrV4, Seen>,
+    address: SocketAddrV4,
+    beacon: Seen,
+) {
+    seen.retain(|previous, record| {
+        let same_device = previous.ip() == address.ip()
+            && record.device == beacon.device
+            && record.workspace == beacon.workspace;
+        !same_device && beacon.time.saturating_duration_since(record.time) < DISCOVERY_TTL
+    });
+    let other_ports = seen.keys().filter(|key| key.ip() == address.ip()).count();
+    if seen.contains_key(&address) || (seen.len() < MAX_PEERS && other_ports < 3) {
+        seen.insert(address, beacon);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -1,12 +1,17 @@
+mod index;
 mod rows;
 use super::{Session, alerts, success, year_check};
 use chrono::{DateTime, Datelike, Local, NaiveDate};
 use godovoy_plan::{
     Fallible,
-    model::{Event, Id, Record},
-    planning::{Milestone, Reminder, due_reminders, personal_events},
+    model::{Calendar, Event, Id, Record},
+    planning::{
+        Milestone, Reminder, personal_event, personal_events, unread_reminder_count,
+        unread_reminders,
+    },
     storage::{LocalState, SharedStore, Store},
 };
+pub(super) use index::{agenda_card, reminder_page};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -21,6 +26,8 @@ struct ViewContext {
     address: Option<SocketAddrV4>,
     warning: Option<String>,
     paused: bool,
+    checklist_tuples: bool,
+    accepts_index: bool,
 }
 
 pub(super) struct LastState {
@@ -30,6 +37,7 @@ pub(super) struct LastState {
     last_sync: Option<i64>,
     token: Id,
     check_result: Option<(Weak<LocalState>, Id)>,
+    indexed: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -40,12 +48,72 @@ struct FullSnapshot<'a> {
     tasks: rows::Rows<'a>,
 }
 
+fn view_context(
+    session: &Session,
+    snapshot: &LocalState,
+    paused: bool,
+    year: i32,
+    accept_checklist_tuples: bool,
+    accept_agenda_index: bool,
+) -> (ViewContext, Option<i64>) {
+    let status = session
+        .network
+        .as_ref()
+        .map(|n| n.status())
+        .unwrap_or_default();
+    let today = Local::now().date_naive();
+    let context = ViewContext {
+        checklist_tuples: accept_checklist_tuples,
+        accepts_index: accept_agenda_index,
+        year,
+        today,
+        address: session.network.as_ref().and_then(|n| n.address()),
+        warning: session
+            .network_error
+            .clone()
+            .or(status.merge_error)
+            .or(status.warning)
+            .or(status.route_warning),
+        paused: session.network.as_ref().map_or(paused, |n| n.paused()),
+    };
+    (context, status.last_sync.or(snapshot.last_sync))
+}
+
+fn reminder_row(calendar: &Calendar, reminder: Reminder) -> Option<Value> {
+    let occurrence = calendar.event(reminder.event, reminder.year)?;
+    let event = occurrence.event;
+    let (title, task_id) = match reminder.kind {
+        Milestone::Task(id) => {
+            let task = event.tasks.iter().find(|task| task.id == id)?;
+            (format!("{} · {}", event.title, task.title), Some(id))
+        }
+        _ => (event.title.clone(), None),
+    };
+    Some(
+        json!({"eventId":reminder.event,"year":reminder.year,"title":title,"date":reminder.date,"taskId":task_id}),
+    )
+}
+
+#[derive(Default)]
+pub(super) struct CheckPatch {
+    pub full: bool,
+    pub indexed: bool,
+}
+
+impl CheckPatch {
+    fn accepts(&self, indexed: bool) -> bool {
+        if indexed { self.indexed } else { self.full }
+    }
+}
+
 pub(super) fn state(
     session: &mut Session,
     year: i32,
     if_token: Option<Id>,
     accept_sync_stamp: bool,
-    accept_check_patch: bool,
+    accept_check_patch: CheckPatch,
+    accept_checklist_tuples: bool,
+    accept_agenda_index: bool,
 ) -> Fallible<String> {
     year_check(year)?;
     let (snapshot, receipts, paused) = {
@@ -64,37 +132,27 @@ pub(super) fn state(
             guard.sync_paused(),
         )
     };
-    let status = session
-        .network
-        .as_ref()
-        .map(|n| n.status())
-        .unwrap_or_default();
-    let today = Local::now().date_naive();
-    let context = ViewContext {
+    let (context, last_sync) = view_context(
+        session,
+        &snapshot,
+        paused,
         year,
-        today,
-        address: session.network.as_ref().and_then(|n| n.address()),
-        warning: session
-            .network_error
-            .clone()
-            .or(status.merge_error)
-            .or(status.warning)
-            .or(status.route_warning),
-        paused: session.network.as_ref().map_or(paused, |n| n.paused()),
-    };
-    let last_sync = status.last_sync.or(snapshot.last_sync);
+        accept_checklist_tuples,
+        accept_agenda_index,
+    );
+    let today = context.today;
     // Weak identity survives address reuse, without retaining any retired keys or calendar data.
     let observed = Arc::downgrade(&snapshot);
     let acknowledged = Arc::downgrade(&receipts);
     let changed = session.last_state.as_ref().and_then(|prior| {
         let (after, id) = prior.check_result.as_ref()?;
-        (accept_check_patch
+        (accept_check_patch.accepts(prior.indexed)
             && Some(prior.token) == if_token
             && after.ptr_eq(&observed)
             && prior.receipts.ptr_eq(&acknowledged)
             && prior.context == context
             && prior.last_sync == last_sync)
-            .then_some((*id, prior.token))
+            .then_some((*id, prior.token, prior.indexed))
     });
     let previous = session.last_state.as_mut().filter(|item| {
         item.snapshot.ptr_eq(&observed)
@@ -129,8 +187,12 @@ pub(super) fn state(
         "lanEnabled":snapshot.lan_enabled(), "address":context.address, "networkError":context.warning, "paused":context.paused, "stateToken":token,
         "supportsSyncStamp":true,"supportsCheckPatch":true,"lastSync":timestamp(),
         "canManage":false,"accessManagerId":null});
+    if accept_checklist_tuples {
+        result["checklistFormat"] = json!("tuple-v1");
+    }
     session.last_state = Some(LastState {
         check_result: None,
+        indexed: false,
         snapshot: observed,
         receipts: acknowledged,
         context,
@@ -138,37 +200,35 @@ pub(super) fn state(
         token,
     });
     if let Some(w) = &snapshot.workspace {
-        let changed_row =
-            changed.and_then(|(id, base)| w.calendar.event(id, year).map(|row| (row, base)));
         let mut personal = personal_events(&w.calendar, today, snapshot.device);
+        let indexed = accept_agenda_index && index::large(&w.calendar, year, &personal);
+        let changed_row = changed
+            .filter(|(_, _, was_indexed)| *was_indexed == indexed)
+            .and_then(|(id, base, _)| w.calendar.event(id, year).map(|row| (row, base)));
         let mut reminder_positions = Vec::new();
         let mut reminder_count = 0;
-        let reminders = due_reminders(&personal, today)
-            .into_iter()
-            .filter(|r| !receipts.contains(r))
-            .filter_map(|r| {
-                if changed_row.is_some_and(|(row, _)| row.id != r.event) {
-                    // Each reminder was just derived from a visible live occurrence and its own task.
+        if indexed {
+            result["agendaIndex"] = json!(true);
+            result["supportsIndexCheckPatch"] = json!(true);
+            result["reminderCount"] = json!(unread_reminder_count(&personal, today, &receipts));
+        } else {
+            let reminders = unread_reminders(&personal, today, &receipts)
+                .into_iter()
+                .filter_map(|r| {
+                    if changed_row.is_some_and(|(row, _)| row.id != r.event) {
+                        reminder_count += 1;
+                        return None;
+                    }
+                    let row = reminder_row(&w.calendar, r)?;
+                    if changed_row.is_some() {
+                        reminder_positions.push(reminder_count);
+                    }
                     reminder_count += 1;
-                    return None;
-                }
-                let e = w.calendar.event(r.event, r.year)?;
-                let (title, task_id) = match r.kind {
-                    Milestone::Task(id) => e
-                        .event
-                        .tasks
-                        .iter()
-                        .find(|t| t.id == id)
-                        .map(|t| (format!("{} · {}", e.event.title, t.title), Some(id)))?,
-                    _ => (e.event.title.clone(), None),
-                };
-                if changed_row.is_some() {
-                    reminder_positions.push(reminder_count);
-                }
-                reminder_count += 1;
-                Some(json!({"eventId":r.event,"year":r.year,"title":title,"date":r.date,"taskId":task_id}))
-            })
-            .collect::<Vec<_>>();
+                    Some(row)
+                })
+                .collect();
+            result["reminders"] = Value::Array(reminders);
+        }
         result["notificationDates"] = json!(alerts::dates(&w.calendar, snapshot.device, today));
         result["employeeId"] = json!(w.calendar.person_for(snapshot.device));
         result["employees"] = Value::Array(
@@ -187,7 +247,6 @@ pub(super) fn state(
                 .map(|(id, n)| json!({"id":id,"name":n.value,"revoked":w.is_revoked(*id),"employeeId":w.calendar.person_for(*id)}))
                 .collect::<Vec<_>>()
         );
-        result["reminders"] = Value::Array(reminders);
         let events = if let Some((row, base)) = changed_row {
             let mut task_positions = Vec::new();
             let task_count = personal.len();
@@ -202,22 +261,44 @@ pub(super) fn state(
             });
             result["taskPositions"] = json!(task_positions);
             result["taskCount"] = json!(task_count);
-            result["reminderPositions"] = json!(reminder_positions);
-            result["reminderCount"] = json!(reminder_count);
             result["checkPatch"] = json!(true);
             result["baseToken"] = json!(base);
-            vec![row]
+            if !indexed {
+                result["reminderPositions"] = json!(reminder_positions);
+                result["reminderCount"] = json!(reminder_count);
+            }
+            Some(vec![row])
         } else {
-            w.calendar.year(year)
+            None
         };
+        if indexed {
+            let reply = if let Some(events) = events {
+                result["tasks"] = json!(index::personal_rows(&w.calendar, personal));
+                result["events"] = json!(rows::Rows {
+                    calendar: &w.calendar,
+                    occurrences: events,
+                    checklist_tuples: false
+                });
+                success(result)?
+            } else {
+                success(index::Snapshot::new(result, &w.calendar, year, personal))?
+            };
+            if let Some(view) = session.last_state.as_mut() {
+                view.indexed = true;
+            }
+            return Ok(reply);
+        }
+        let events = events.unwrap_or_else(|| w.calendar.year(year));
         return success(FullSnapshot {
             metadata: result,
             events: rows::Rows {
                 calendar: &w.calendar,
+                checklist_tuples: accept_checklist_tuples,
                 occurrences: events,
             },
             tasks: rows::Rows {
                 calendar: &w.calendar,
+                checklist_tuples: accept_checklist_tuples,
                 occurrences: personal,
             },
         });
@@ -251,15 +332,22 @@ pub(super) fn check(store: &SharedStore, id: Id, year: i32, task: Id, done: bool
     checked(&mut guard, id, year, task, done)
 }
 
-pub(super) fn check_from_view(
-    session: &mut Session,
-    token: Id,
+pub(super) fn require_event_view(
+    store: &Store,
+    prior: Option<&LastState>,
+    token: Option<Id>,
+    view_year: Option<i32>,
     id: Id,
     year: i32,
-    task: Id,
-    done: bool,
 ) -> Fallible<()> {
-    let mut store = session.store.lock().map_err(|_| "Профиль недоступен.")?;
+    let Some(token) = token else {
+        return if view_year.is_none() {
+            Ok(())
+        } else {
+            Err("Для правки из открытого календаря требуется актуальный снимок.".into())
+        };
+    };
+    let view_year = view_year.unwrap_or(year);
     let before = store.snapshot();
     let w = before.workspace.as_ref().ok_or("Профиль недоступен.")?;
     if store.successor_directory().is_some()
@@ -268,19 +356,49 @@ pub(super) fn check_from_view(
     {
         return Err("Доступ этого устройства к календарю закрыт.".into());
     }
-    let prior = session
-        .last_state
-        .as_mut()
+    let prior = prior
         .filter(|view| {
             view.token == token
-                && view.context.year == year
+                && view.context.year == view_year
+                && view
+                    .receipts
+                    .ptr_eq(&Arc::downgrade(&store.reminder_receipts()))
                 && view.context.today == Local::now().date_naive()
                 && view.snapshot.ptr_eq(&Arc::downgrade(&before))
         })
-        .ok_or("Календарь изменился. Проверьте обновлённый пункт перед отметкой.")?;
+        .ok_or("Календарь изменился. Откройте событие заново.")?;
+    if year != view_year
+        && personal_event(&w.calendar, prior.context.today, before.device, id, year).is_none()
+    {
+        return Err("Событие больше недоступно в личных задачах.".into());
+    }
+    Ok(())
+}
+
+pub(super) fn check_from_view(
+    session: &mut Session,
+    token: Id,
+    view_year: i32,
+    id: Id,
+    year: i32,
+    task: Id,
+    done: bool,
+) -> Fallible<()> {
+    let mut store = session.store.lock().map_err(|_| "Профиль недоступен.")?;
+    let before = store.snapshot();
+    require_event_view(
+        &store,
+        session.last_state.as_ref(),
+        Some(token),
+        Some(view_year),
+        id,
+        year,
+    )?;
+    let prior = session.last_state.as_mut().ok_or("Календарь изменился.")?;
     checked(&mut store, id, year, task, done)?;
     let after = store.snapshot();
-    prior.check_result = (!Arc::ptr_eq(&before, &after)).then(|| (Arc::downgrade(&after), id));
+    prior.check_result =
+        (year == view_year && !Arc::ptr_eq(&before, &after)).then(|| (Arc::downgrade(&after), id));
     Ok(())
 }
 fn checked(store: &mut Store, id: Id, year: i32, task: Id, done: bool) -> Fallible<()> {
@@ -310,7 +428,9 @@ fn checked(store: &mut Store, id: Id, year: i32, task: Id, done: bool) -> Fallib
 }
 
 pub(super) fn note(
-    store: &SharedStore,
+    session: &Session,
+    view_year: Option<i32>,
+    token: Option<Id>,
     id: Id,
     year: i32,
     text: &str,
@@ -321,7 +441,16 @@ pub(super) fn note(
     if text.chars().count() > 4000 {
         return Err("Максимальная длина заметки — 4000 символов.".into());
     }
-    store.lock().unwrap().transaction(|s| {
+    let mut store = session.store.lock().map_err(|_| "Профиль недоступен.")?;
+    require_event_view(
+        &store,
+        session.last_state.as_ref(),
+        token,
+        view_year,
+        id,
+        year,
+    )?;
+    store.transaction(|s| {
         let e = s.follow_event(id, year)?;
         if e.note() == text {
             return Ok(());
@@ -349,7 +478,16 @@ mod tests {
     use super::*;
 
     fn snapshot(session: &mut Session, year: i32, token: Option<Id>, compact: bool) -> Value {
-        let response = state(session, year, token, compact, false).unwrap();
+        let response = state(
+            session,
+            year,
+            token,
+            compact,
+            CheckPatch::default(),
+            false,
+            false,
+        )
+        .unwrap();
         let mut decoded: Value = serde_json::from_str(&response).unwrap();
         assert_eq!(decoded["ok"], true);
         decoded["data"].take()

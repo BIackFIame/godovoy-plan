@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
-#[cfg(feature = "desktop")]
+#[cfg(feature = "local-api")]
 pub mod api;
 pub mod exchange;
 pub mod hosted_address;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "local-api")]
 mod import_report;
 
 pub mod model;

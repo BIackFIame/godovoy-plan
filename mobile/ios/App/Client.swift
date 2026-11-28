@@ -7,8 +7,6 @@ actor CalendarClient {
     private var root: URL?
     private let documentIO = DispatchQueue(label: "local.godovoyplan.documents", qos: .utility)
     private var transferring = false
-    private struct Envelope<T: Decodable>: Decodable { let ok: Bool; let data: T?; let error: String? }
-
     private func profile() throws -> URL {
         if let root { return root }
         var dir = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true).appendingPathComponent("GodovoyPlan", isDirectory: true)
@@ -49,16 +47,27 @@ actor CalendarClient {
     }
 
     func value<T: Decodable>(_ input: GPCommand, as: T.Type) throws -> T {
-        let result = try JSONDecoder().decode(Envelope<T>.self, from: call(input))
-        guard result.ok, let data = result.data else { throw GPError(result.error ?? "Календарь вернул неполные данные.") }
+        let result = try JSONDecoder().decode(GPEnvelope<T>.self, from: call(input))
+        try result.requireSuccess(fallback: "Календарь вернул неполные данные.")
+        guard let data = result.data else { throw GPError("Календарь вернул неполные данные.") }
         return data
+    }
+
+    func agendaCard(id: String, viewYear: Int, eventYear: Int, token: String) throws -> GPAgendaCard {
+        try value(["op": .string("agendaCard"), "year": .integer(viewYear), "eventYear": .integer(eventYear),
+                   "eventId": .string(id), "baseToken": .string(token)], as: GPAgendaCard.self)
+    }
+
+    func reminderPage(year: Int, token: String, offset: Int, limit: Int = 64) throws -> GPReminderPage {
+        try value(["op": .string("reminderPage"), "year": .integer(year), "baseToken": .string(token),
+                   "offset": .integer(offset), "limit": .integer(limit)], as: GPReminderPage.self)
     }
 
     // The actor serializes write, read, decoding and merge. No suspension between the two ABI calls.
     func check(_ prior: GPState, context: GPCheckContext) throws -> GPState {
         try run(["op": .string("check"), "year": .integer(context.year), "eventId": .string(context.eventID),
                  "taskId": .string(context.taskID), "done": .flag(context.done), "baseToken": .string(context.token)])
-        let full: GPCommand = ["op": .string("state"), "year": .integer(context.year)]
+        let full: GPCommand = ["op": .string("state"), "year": .integer(context.year), "acceptChecklistTuples": .flag(true)]
         var request = full
         request["ifToken"] = .string(context.token)
         request["acceptCheckPatch"] = .flag(true)
@@ -77,9 +86,34 @@ actor CalendarClient {
         return next
     }
 
+    func check(_ prior: GPState, context: GPIndexedCheckContext) throws -> GPState {
+        try run(["op": .string("check"), "year": .integer(context.eventYear),
+                 "viewYear": .integer(context.viewYear), "eventId": .string(context.eventID),
+                 "taskId": .string(context.taskID), "done": .flag(context.done),
+                 "baseToken": .string(context.token)])
+        let full: GPCommand = ["op": .string("state"), "year": .integer(context.viewYear),
+                               "acceptChecklistTuples": .flag(true), "acceptAgendaIndex": .flag(true)]
+        var request = full
+        request["ifToken"] = .string(context.token)
+        request["acceptIndexCheckPatch"] = .flag(true)
+        do {
+            switch try value(request, as: GPSnapshot.self) {
+            case .check(let patch):
+                if let next = patch.applying(to: prior, for: context) { return next }
+            case .state(let next) where next.year == context.viewYear: return next
+            default: break
+            }
+        } catch is DecodingError {
+            // The mutation has already committed; recover with a fresh list read only.
+        }
+        guard case .state(let next) = try value(full, as: GPSnapshot.self), next.year == context.viewYear
+        else { throw GPError("Не удалось обновить календарь.") }
+        return next
+    }
+
     func run(_ command: GPCommand) throws {
-        let result = try JSONDecoder().decode(Envelope<JSONValue>.self, from: call(command))
-        if !result.ok { throw GPError(result.error ?? "Не удалось сохранить изменения.") }
+        let result = try JSONDecoder().decode(GPEnvelope<JSONValue>.self, from: call(command))
+        try result.requireSuccess(fallback: "Не удалось сохранить изменения.")
     }
 
     func lifecycle(foreground: Bool) throws {
@@ -148,7 +182,7 @@ actor CalendarClient {
         do {
             let metadata = try source.resourceValues(forKeys: [.fileSizeKey, .isRegularFileKey, .isSymbolicLinkKey])
             guard metadata.isRegularFile == true, metadata.isSymbolicLink != true,
-                  let size = metadata.fileSize, size <= 9 * 1024 * 1024 else {
+                  let size = metadata.fileSize, GPMobileLimits.withinExchangeLimit(size) else {
                 throw GPError("Нужен обычный файл обмена размером до 9 МиБ.")
             }
         } catch {
@@ -177,7 +211,7 @@ actor CalendarClient {
         var total = 0
         while let block = try source.read(upToCount: 64 * 1024), !block.isEmpty {
             total += block.count
-            guard total <= 9 * 1024 * 1024 else { throw GPError("Файл обмена превышает 9 МиБ.") }
+            guard GPMobileLimits.withinExchangeLimit(total) else { throw GPError("Файл обмена превышает 9 МиБ.") }
             try dest.write(contentsOf: block)
         }
     }

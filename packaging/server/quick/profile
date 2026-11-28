@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+state=/var/lib/godovoy-office
+if [ ! -e "$state/calendar" ]; then
+    stage=$(mktemp -d "$state/.init.XXXXXXXX")
+    trap 'rm -rf -- "$stage"' EXIT
+    /etc/godovoy-quick/godovoy-online init "$stage/calendar" 'Годовой план'
+    mv -T -n -- "$stage/calendar" "$state/calendar"
+fi
+mkdir -p -m 0700 "$state/snapshots"

@@ -4,10 +4,11 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Request, State},
     http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post, put},
 };
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
+use crate::http::{add_common_security_headers, problem};
 use godovoy_plan::{
     Fallible,
     model::Id,
@@ -43,10 +44,6 @@ struct Console {
     backup_root: Option<PathBuf>,
     backup: Arc<Mutex<BackupJob>>,
 }
-fn problem(code: StatusCode, msg: &str) -> Response {
-    (code, Json(json!({"error":msg}))).into_response()
-}
-
 async fn guard(State(c): State<Console>, req: Request, next: Next) -> Response {
     let h = req.headers();
     let unsafe_origin = h
@@ -87,14 +84,11 @@ async fn guard(State(c): State<Console>, req: Request, next: Next) -> Response {
             "content-security-policy",
             "default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'none'",
         ),
-        ("x-content-type-options", "nosniff"),
-        ("referrer-policy", "no-referrer"),
-        ("x-frame-options", "DENY"),
-        ("cross-origin-resource-policy", "same-origin"),
         ("cross-origin-opener-policy", "same-origin"),
     ] {
         h.insert(name, HeaderValue::from_static(value));
     }
+    add_common_security_headers(h);
     res
 }
 fn authorized(headers: &HeaderMap, secret: &str) -> bool {
@@ -169,7 +163,28 @@ async fn report(State(c): State<Console>) -> Response {
     .await
 }
 async fn employees(State(c): State<Console>) -> Response {
-    locked(c, |lock| lock.employee_directory()).await
+    locked(c, |lock| {
+        let directory = lock.employee_directory()?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let directory = {
+            let mut directory = directory;
+            directory["revokeSpace"] = json!(match lock.revoke_space_ready() {
+                Ok(true) => "ready",
+                Ok(false) => "absent",
+                Err(_) => "unavailable",
+            });
+            directory
+        };
+        Ok(directory)
+    }).await
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+async fn prepare_revoke_space(State(c): State<Console>) -> Response {
+    locked(c, |lock| {
+        lock.prepare_revoke_space()?;
+        Ok(json!({"revokeSpace": "ready"}))
+    }).await
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -328,25 +343,21 @@ async fn update_scope(
     .await
 }
 fn router(c: Console) -> Router {
-    Router::new()
-        .route("/", get(|| async { Html(include_str!("admin.html")) }))
+    let routes = Router::new();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    let routes = routes.route("/v1/revoke-space", post(prepare_revoke_space));
+    routes
+        .route(
+            "/",
+            get(|request: Request| async move { crate::assets::ADMIN.serve(request.headers()) }),
+        )
         .route(
             "/admin.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("admin.js"),
-                )
-            }),
+            get(|request: Request| async move { crate::assets::ADMIN_JS.serve(request.headers()) }),
         )
         .route(
             "/admin.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("admin.css"),
-                )
-            }),
+            get(|request: Request| async move { crate::assets::ADMIN_CSS.serve(request.headers()) }),
         )
         .route("/v1/settings", get(settings).put(apply_settings))
         .route("/v1/operator", get(operator).put(apply_operator))
@@ -531,6 +542,30 @@ mod tests {
         assert!(acl.authorize_for(token, GrantPurpose::Mcp).is_none());
         assert!(acl.authorize(&personal).is_some());
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn preparing_disk_space_requires_the_local_operator_and_its_origin() {
+        let fixture = Fixture::new();
+        let origin = Some(fixture.console.origin.as_str());
+        let admin = fixture.console.secret.as_str();
+        let path = "/v1/revoke-space";
+        let (_, _, employee) = fixture.console.vault.lock().unwrap()
+            .grant("Сотрудник", None, false).unwrap();
+
+        for (token, request_origin, status) in [
+            (employee.as_str(), origin, StatusCode::UNAUTHORIZED),
+            (admin, None, StatusCode::FORBIDDEN),
+            (admin, Some("https://other.invalid"), StatusCode::FORBIDDEN),
+        ] {
+            assert_eq!(fixture.request(Method::POST, path, token, request_origin, Value::Null).await.0, status);
+            assert!(!fixture.console.vault.lock().unwrap().revoke_space_ready().unwrap());
+        }
+        let result = fixture.request(Method::POST, path, admin, origin, Value::Null).await;
+        assert_eq!(result, (StatusCode::OK, json!({"revokeSpace": "ready"})));
+        let directory = fixture.request(Method::GET, "/v1/employees", admin, None, Value::Null).await;
+        assert_eq!(directory.1["revokeSpace"], "ready");
+    }
+
     #[tokio::test]
     async fn admin_secrets_are_separate_and_writes_require_local_origin() {
         let mut f = Fixture::new();

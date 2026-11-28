@@ -229,7 +229,7 @@ fn a_profile_is_saved_atomically_and_locked_for_single_process() {
 }
 
 #[test]
-fn failed_enrollment_response_can_be_recovered_with_fresh_code() {
+fn failed_enrollment_response_can_be_recovered_with_same_or_fresh_code() {
     let host = Device::new();
     let client = Device::new();
     host.store
@@ -243,16 +243,21 @@ fn failed_enrollment_response_can_be_recovered_with_fresh_code() {
         .unwrap();
     client.join(&initial, "Борис", None).unwrap();
     // Model a synthetic receiver that has retained its identity but could not save the response.
-    client
-        .store
-        .lock()
-        .unwrap()
-        .transaction(|state| {
-            state.workspace = None;
-            state.peers.clear();
-            Ok(())
-        })
-        .unwrap();
+    let prepare_retry = || {
+        client
+            .store
+            .lock()
+            .unwrap()
+            .transaction(|state| {
+                state.workspace = None;
+                state.peers.clear();
+                Ok(())
+            })
+            .unwrap();
+    };
+    prepare_retry();
+    client.join(&initial, "Борис", None).unwrap();
+    prepare_retry();
     let Device {
         network,
         store,

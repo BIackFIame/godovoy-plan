@@ -1,3 +1,4 @@
+import CoreTransferable
 import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
@@ -10,9 +11,15 @@ private struct ExchangeDocument: FileDocument {
     init(configuration: ReadConfiguration) throws { guard let data = configuration.file.regularFileContents else { throw GPError("Файл обмена недоступен.") }; self.data = data }
     func fileWrapper(configuration: WriteConfiguration) throws -> FileWrapper { FileWrapper(regularFileWithContents: data) }
 }
-private struct SharedFile: Identifiable {
+private struct SharedFile: Identifiable, Transferable {
     let url: URL
     var id: URL { url }
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .planExchange) { file in
+            SentTransferredFile(file.url)
+        }
+    }
 }
 private struct FileSharing: UIViewControllerRepresentable {
     let url: URL
@@ -33,13 +40,16 @@ struct SyncView: View {
     @State private var selected: Set<String> = []
     @State private var confirm = false
     @State private var exported: ExchangeDocument?
+    @State private var stagedExport: SharedFile?
     @State private var sharing: SharedFile?
     @State private var sharedURL: URL?
     @State private var showingExport = false
     @State private var showingImport = false
     @State private var workingFile = false
     @State private var message = ""
-    var body: some View {
+    var body: some View { exportPicker(form) }
+
+    private var form: some View {
         Form {
             if let state = model.state {
                 Section { NavigationLink("Серверный календарь") { HostedCalendarEntry() } }
@@ -111,9 +121,37 @@ struct SyncView: View {
         .fileImporter(isPresented: $showingImport, allowedContentTypes: [.planExchange]) { result in
             switch result { case .success(let url): Task { await importPlan(url) }; case .failure(let error): if (error as NSError).code != NSUserCancelledError { model.failure = error.localizedDescription } }
         }
-        .fileExporter(isPresented: $showingExport, document: exported, contentType: .planExchange, defaultFilename: "Годовой план.yrplan") { result in
-            exported = nil
-            switch result { case .success: message = "Файл обмена сохранён"; case .failure(let error): if (error as NSError).code != NSUserCancelledError { model.failure = error.localizedDescription } }
+    }
+
+    @ViewBuilder private func exportPicker<Content: View>(_ content: Content) -> some View {
+        let name = "Годовой план.yrplan"
+        if #available(iOS 17.0, *) {
+            content.fileExporter(
+                isPresented: $showingExport, item: stagedExport,
+                contentTypes: [.planExchange], defaultFilename: name,
+                onCompletion: finishExport, onCancellation: clearExport
+            )
+        } else {
+            content.fileExporter(
+                isPresented: $showingExport, document: exported,
+                contentType: .planExchange, defaultFilename: name,
+                onCompletion: finishExport
+            )
+        }
+    }
+
+    private func clearExport() {
+        if let stagedExport { try? FileManager.default.removeItem(at: stagedExport.url) }
+        stagedExport = nil
+        exported = nil
+    }
+
+    private func finishExport(_ result: Result<URL, Error>) {
+        clearExport()
+        switch result {
+        case .success: message = "Файл обмена сохранён"
+        case .failure(let error):
+            if (error as NSError).code != NSUserCancelledError { model.failure = error.localizedDescription }
         }
     }
     private var deviceLinks: some View {
@@ -159,8 +197,16 @@ struct SyncView: View {
         } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
     }
     private func exportPlan() async {
+        guard !workingFile, !showingExport, stagedExport == nil else { return }
         workingFile = true; defer { workingFile = false }
-        do { exported = ExchangeDocument(data: try await model.core.exportFile()); showingExport = true } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
+        do {
+            if #available(iOS 17.0, *) {
+                stagedExport = SharedFile(url: try await model.core.exportURL())
+            } else {
+                exported = ExchangeDocument(data: try await model.core.exportFile())
+            }
+            showingExport = true
+        } catch { model.failure = error.localizedDescription; await model.refresh(silent: true) }
     }
     private func importPlan(_ url: URL) async {
         workingFile = true; defer { workingFile = false }

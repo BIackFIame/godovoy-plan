@@ -69,12 +69,18 @@ pub unsafe extern "C" fn gp_request(handle: *mut c_void, input: *const c_char) -
         if bytes.len() > 256 * 1024 {
             return Err("Слишком большой запрос.".into());
         }
-        let cmd = serde_json::from_slice(bytes).map_err(|_| "Неверный JSON.")?;
+        let cmd = serde_json::from_slice(bytes).map_err(|error| {
+            if error.is_data() {
+                "Неверные параметры запроса."
+            } else {
+                "Неверный JSON."
+            }
+        })?;
         let handle = unsafe { &*handle.cast::<Mutex<Mobile>>() };
         handle
             .lock()
             .map_err(|_| "Откройте профиль заново.")?
-            .request(cmd)
+            .execute(cmd)
     }));
     let response = match result {
         Ok(Ok(data)) => data,

@@ -5,6 +5,9 @@ mod evidence;
 mod protection;
 #[path = "online_audit.rs"]
 mod security_audit;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[path = "online_revocation_reserve.rs"]
+mod revocation_reserve;
 #[path = "online_snapshot.rs"]
 mod snapshot;
 pub use protection::{ProtectionConflict, ProtectionSettings, ProtectionState};
@@ -35,6 +38,7 @@ use subtle::ConstantTimeEq;
 const ACCESS: &str = "online-access-v1.json";
 const DATA: &str = "online-calendar-v1.json";
 const LOCK: &str = "profile.lock";
+const AUDIT_LIMIT: usize = 1024;
 const ACCESS_LIMIT: usize = 512 * 1024;
 const DATA_LIMIT: usize = CALENDAR_MESSAGE_LIMIT + 512 * 1024;
 
@@ -53,8 +57,8 @@ pub fn record(
     employee: Id,
     event: Option<Id>,
 ) {
-    if log.len() == 1024 {
-        log.pop_front();
+    if log.len() >= AUDIT_LIMIT {
+        log.drain(..log.len() - (AUDIT_LIMIT - 1));
     }
     log.push_back(Audit {
         at: Utc::now().timestamp(),
@@ -130,6 +134,16 @@ impl Access {
     }
 
     pub fn authorize_for(&self, token: &str, purpose: GrantPurpose) -> Option<(Id, &Grant)> {
+        self.authorize_with_permissions(token, purpose)
+            .map(|(id, grant, _)| (id, grant))
+    }
+
+    /// Checks the credential and resolves its permissions against this access snapshot.
+    pub fn authorize_with_permissions(
+        &self,
+        token: &str,
+        purpose: GrantPurpose,
+    ) -> Option<(Id, &Grant, GrantPermissions)> {
         let (id, secret) = token.split_once('.')?;
         let id = Id::parse_str(id).ok()?;
         let grant = self.grants.get(&id)?;
@@ -137,12 +151,17 @@ impl Access {
             return None;
         }
         let digest = purpose.digest(secret);
-        if !bool::from(digest.ct_eq(&grant.digest))
-            || (purpose == GrantPurpose::Mcp && self.mcp_permissions(grant).is_none())
-        {
+        if !bool::from(digest.ct_eq(&grant.digest)) {
             return None;
         }
-        Some((id, grant))
+        let rights = match purpose {
+            GrantPurpose::Employee => GrantPermissions {
+                read_only: grant.read_only,
+                allow_remote: grant.allow_remote,
+            },
+            GrantPurpose::Mcp => self.mcp_permissions(grant)?,
+        };
+        Some((id, grant, rights))
     }
 
     pub fn active_employee(&self, id: Id) -> bool {
@@ -168,8 +187,15 @@ impl Access {
 }
 #[derive(Serialize, Deserialize)]
 pub struct Data {
+    #[serde(deserialize_with = "deserialize_calendar")]
     pub calendar: Calendar,
     pub audit: VecDeque<Audit>,
+}
+
+fn deserialize_calendar<'de, D: serde::Deserializer<'de>>(source: D) -> Result<Calendar, D::Error> {
+    let calendar = Calendar::deserialize(source)?;
+    calendar.validate().map_err(serde::de::Error::custom)?;
+    Ok(calendar)
 }
 
 #[derive(Clone)]
@@ -260,7 +286,7 @@ fn open_regular(path: &Path) -> Fallible<(File, fs::Metadata)> {
     access::open_regular(path, OpenOptions::new().read(true))
 }
 
-fn read_bounded_json<T: DeserializeOwned>(file: File, limit: usize) -> Fallible<T> {
+pub(super) fn read_bounded_json<T: DeserializeOwned>(file: File, limit: usize) -> Fallible<T> {
     let mut bounded = file.take(limit as u64 + 1);
     let value = serde_json::from_reader(std::io::BufReader::new(&mut bounded))?;
     if bounded.limit() == 0 {
@@ -282,6 +308,62 @@ pub struct CalendarFile<'vault> {
     metadata: fs::Metadata,
 }
 
+#[cfg(not(all(target_env = "musl", any(target_arch = "x86", target_arch = "x86_64"))))]
+fn equal_source(expected: &[u8], actual: &[u8]) -> bool {
+    expected == actual
+}
+
+// The portable musl memcmp used by the x86 Linux packages compares one byte
+// at a time. Whole words let LLVM use the target's ordinary vector registers.
+#[cfg(any(
+    test,
+    all(target_env = "musl", any(target_arch = "x86", target_arch = "x86_64"))
+))]
+fn equal_source_words(expected: &[u8], actual: &[u8]) -> bool {
+    if expected.len() != actual.len() {
+        return false;
+    }
+    let (expected, expected_tail) = expected.as_chunks::<8>();
+    let (actual, actual_tail) = actual.as_chunks::<8>();
+    let mut different = 0u64;
+    for (left, right) in expected.iter().zip(actual) {
+        different |= u64::from_ne_bytes(*left) ^ u64::from_ne_bytes(*right);
+    }
+    different == 0 && expected_tail == actual_tail
+}
+
+#[cfg(all(target_env = "musl", any(target_arch = "x86", target_arch = "x86_64")))]
+use equal_source_words as equal_source;
+
+fn file_matches_bytes(file: &mut File, expected: &[u8]) -> Fallible<bool> {
+    let mut offset = 0;
+    let mut chunk = [0; 16 * 1024];
+    loop {
+        let count = match file.read(&mut chunk) {
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            result => result?,
+        };
+        if count == 0 && offset == expected.len() {
+            return Ok(true);
+        }
+        if count == 0
+            || !expected
+                .get(offset..offset + count)
+                .is_some_and(|wanted| equal_source(wanted, &chunk[..count]))
+        {
+            file.rewind()?;
+            return Ok(false);
+        }
+        offset += count;
+    }
+}
+
+/// Compare all bytes of two calendar fragments, using the same implementation
+/// as exact file verification on each server target.
+pub fn same_calendar_bytes(expected: &[u8], actual: &[u8]) -> bool {
+    equal_source(expected, actual)
+}
+
 impl CalendarFile<'_> {
     pub fn byte_len(&self) -> usize {
         self.metadata.len() as usize
@@ -300,6 +382,48 @@ impl CalendarFile<'_> {
             return Err("Хранилище превышает допустимый размер.".into());
         }
         Ok(bytes)
+    }
+
+    /// Compare the opened file completely, including EOF. On a mismatch leave
+    /// it rewound so its actual contents can take the normal validation path.
+    pub fn matches_bytes(&mut self, expected: &[u8]) -> Fallible<bool> {
+        file_matches_bytes(&mut self.file, expected)
+    }
+
+    pub fn matches_snapshot(&mut self, expected: &[u8]) -> Fallible<bool> {
+        if self.byte_len() != expected.len() {
+            return Ok(false);
+        }
+        self.matches_bytes(expected)
+    }
+
+    /// Compare the current file, including EOF, to an independently encoded snapshot.
+    /// A mismatch leaves the file rewound for normal decoding under the vault lock.
+    pub fn matches_stream(&mut self, mut expected: impl Read) -> Fallible<bool> {
+        let mut actual = [0; 16 * 1024];
+        let mut reference = [0; 16 * 1024];
+        loop {
+            let count = match self.file.read(&mut actual) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                count => count?,
+            };
+            if count == 0 {
+                match expected.read(&mut reference[..1]) {
+                    Ok(0) => return Ok(true),
+                    Ok(_) => break,
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            match expected.read_exact(&mut reference[..count]) {
+                Ok(()) if equal_source(&actual[..count], &reference[..count]) => {}
+                Ok(()) => break,
+                Err(error) if error.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+        self.file.rewind()?;
+        Ok(false)
     }
 
     pub fn fingerprint(
@@ -330,9 +454,8 @@ impl LockedVault<'_> {
         let (file, _) = self.open_bounded(name, limit)?;
         read_bounded_json(file, limit)
     }
-    fn access_bytes(&self) -> Fallible<Vec<u8>> {
-        let (mut file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
-        let mut bytes = vec![0; metadata.len() as usize];
+    fn access_bytes(mut file: File, length: usize) -> Fallible<Vec<u8>> {
+        let mut bytes = vec![0; length];
         file.read_exact(&mut bytes)?;
         if file.read(&mut [0])? != 0 {
             return Err("Размер файла прав изменился во время чтения.".into());
@@ -361,18 +484,24 @@ impl LockedVault<'_> {
         Ok(acl)
     }
     pub fn access(&self) -> Fallible<Access> {
-        let mut acl = Self::decode_access(&self.access_bytes()?)?;
+        let (file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
+        let bytes = Self::access_bytes(file, metadata.len() as usize)?;
+        let mut acl = Self::decode_access(&bytes)?;
         self.finish_protection(&mut acl)?;
         Ok(acl)
     }
     pub fn session_access<'a>(&self, cache: &'a mut SessionAcl) -> Fallible<&'a Access> {
-        let bytes = self.access_bytes()?;
-        let hit = cache
-            .0
-            .as_ref()
-            .is_some_and(|(known, _)| known.as_deref() == Some(&bytes[..]));
+        let (mut file, metadata) = self.open_bounded(ACCESS, ACCESS_LIMIT)?;
+        let known = cache.0.as_ref().and_then(|(bytes, _)| bytes.as_deref());
+        let hit = match known {
+            Some(bytes) if bytes.len() as u64 == metadata.len() => {
+                file_matches_bytes(&mut file, bytes)?
+            }
+            _ => false,
+        };
         if !hit {
             cache.0 = None;
+            let bytes = Self::access_bytes(file, metadata.len() as usize)?;
             let acl = Self::decode_access(&bytes)?;
             // A journal recovery rewrites ACCESS. Its original bytes must always replay recovery.
             let cacheable = !acl.has_pending_protection();
@@ -381,6 +510,10 @@ impl LockedVault<'_> {
         let (_, acl) = cache.0.as_mut().ok_or("Не удалось прочитать права.")?;
         self.finish_protection(acl)?;
         Ok(acl)
+    }
+    fn commit_registry(&self, acl: &Access) -> Fallible<()> {
+        save(&self.directory.join(ACCESS), acl, ACCESS_LIMIT)?;
+        sync_directory(self.directory)
     }
     pub fn set_employee_scope(&self, employee: Id, assigned_only: bool) -> Fallible<()> {
         if self.standby_window()?.is_some() {
@@ -405,8 +538,7 @@ impl LockedVault<'_> {
         };
         if changed {
             self.audit_security(action, None, Some(employee), None)?;
-            save(&self.directory.join(ACCESS), &acl, ACCESS_LIMIT)?;
-            sync_directory(self.directory)?;
+            self.commit_registry(&acl)?;
         }
         Ok(())
     }
@@ -425,7 +557,7 @@ impl LockedVault<'_> {
         self.open_data()?.into_bytes()
     }
     pub fn save_data(&self, data: &Data) -> Fallible<()> {
-        self.persist_data(data, |_| {})
+        self.save_data_observed(data, |_| {})
     }
 
     /// Extend the caller's fingerprint with the exact bytes committed to disk.
@@ -434,11 +566,12 @@ impl LockedVault<'_> {
         data: &Data,
         mut hash: impl Digest<OutputSize = U32>,
     ) -> Fallible<[u8; 32]> {
-        self.persist_data(data, |bytes| hash.update(bytes))?;
+        self.save_data_observed(data, |bytes| hash.update(bytes))?;
         Ok(hash.finalize().into())
     }
 
-    fn persist_data(&self, data: &Data, observe: impl FnMut(&[u8])) -> Fallible<()> {
+    /// Observe bytes during staging. They identify a committed version only after success.
+    pub fn save_data_observed(&self, data: &Data, observe: impl FnMut(&[u8])) -> Fallible<()> {
         data.calendar.validate()?;
         let path = self.directory.join(DATA);
         let (staging, _) = super::stage_observed(&path, data, DATA_LIMIT, observe)?;
@@ -551,32 +684,62 @@ impl LockedVault<'_> {
         };
         self.audit_security(request, Some(id), Some(employee), None)?;
         record(&mut access.audit, action, id, employee, None);
-        save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
-        sync_directory(self.directory)?;
+        self.commit_registry(&access)?;
         Ok((id, employee, format!("{id}.{secret}")))
     }
     /// Before opening a restored backup to clients, invalidate every restored
     /// credential in one ledger commit without changing employee assignments.
     pub fn revoke_all(&self) -> Fallible<usize> {
+        self.revoke_all_with_reserve(false)
+    }
+
+    pub fn revoke_all_with_reserve(&self, force: bool) -> Fallible<usize> {
+        self.revoke_grants(None, force)
+    }
+
+    pub fn revoke_employee_keys(&self, employee: Id) -> Fallible<usize> {
+        self.revoke_grants(Some(employee), false)
+    }
+
+    fn revoke_grants(&self, employee: Option<Id>, force: bool) -> Fallible<usize> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if force { return Err("Резерв отзыва недоступен на этой платформе.".into()); }
         let mut access = self.access()?;
-        self.audit_security("revoke_all_requested", None, None, None)?;
-        let count = access.grants.len();
+        if employee.is_some_and(|id| !access.employees.contains_key(&id)) {
+            return Err(OperatorInput.into());
+        }
+        let matches = |grant: &Grant| employee.is_none_or(|id| grant.employee == id);
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if access.grants.values().any(matches) {
+            self.release_revoke_space(force);
+        }
+        let action = if employee.is_some() { "revoke_employee_requested" } else { "revoke_all_requested" };
+        self.audit_security(action, None, employee, None)?;
+        let before = access.grants.len();
+        for (id, grant) in access.grants.extract_if(.., |_, grant| matches(grant)) {
+            record(&mut access.audit, "revoke", id, grant.employee, None);
+        }
+        let count = before - access.grants.len();
         if count != 0 {
-            for (id, grant) in std::mem::take(&mut access.grants) {
-                record(&mut access.audit, "revoke", id, grant.employee, None);
-            }
-            save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
-            sync_directory(self.directory)?;
+            self.commit_registry(&access)?;
         }
         Ok(count)
     }
 
     pub fn revoke(&self, id: Id) -> Fallible<()> {
+        self.revoke_with_reserve(id, false)
+    }
+
+    pub fn revoke_with_reserve(&self, id: Id, force: bool) -> Fallible<()> {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        if force { return Err("Резерв отзыва недоступен на этой платформе.".into()); }
         let mut access = self.access()?;
         let grant = access
             .grants
             .remove(&id)
             .ok_or("Такого действующего ключа нет.")?;
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        self.release_revoke_space(force);
         self.audit_security("revoke_requested", Some(id), Some(grant.employee), None)?;
         record(&mut access.audit, "revoke", id, grant.employee, None);
         access.grants.retain(|child_id, child| {
@@ -593,8 +756,7 @@ impl LockedVault<'_> {
                 true
             }
         });
-        save(&self.directory.join(ACCESS), &access, ACCESS_LIMIT)?;
-        sync_directory(self.directory)
+        self.commit_registry(&access)
     }
 }
 
@@ -602,6 +764,31 @@ impl LockedVault<'_> {
 mod file_guards {
     use super::*;
     use std::io::{Seek, Write};
+
+    #[test]
+    fn appending_to_an_oversized_summary_retains_the_latest_entries_in_order() {
+        for previous in [0, AUDIT_LIMIT - 1, AUDIT_LIMIT, AUDIT_LIMIT + 9] {
+            let id = Id::nil();
+            let mut log = (0..previous)
+                .map(|i| Audit {
+                    at: i as i64,
+                    action: String::new(),
+                    credential: id,
+                    employee: id,
+                    event: None,
+                })
+                .collect();
+            record(&mut log, "revoke", id, id, None);
+            assert_eq!(log.back().unwrap().action, "revoke");
+            log.pop_back();
+            let retained = previous.min(AUDIT_LIMIT - 1);
+            assert!(
+                log.iter()
+                    .map(|entry| entry.at as usize)
+                    .eq(previous - retained..previous)
+            );
+        }
+    }
 
     #[test]
     fn bounded_json_checks_actual_bytes_after_open() {
@@ -617,5 +804,56 @@ mod file_guards {
         file.write_all(b" ").unwrap();
         file.rewind().unwrap();
         assert!(read_bounded_json::<u8>(file, metadata_len).is_err());
+    }
+}
+
+#[cfg(test)]
+mod exact_source_tests {
+    use super::equal_source_words;
+
+    #[test]
+    fn compare_open_file_observes_growth_truncation_and_rewinds_mismatches() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("calendar");
+        let expected = vec![b'q'; 16 * 1024 + 7];
+        for replacement in [
+            expected[..expected.len() - 1].to_vec(),
+            [expected.as_slice(), b"suffix"].concat(),
+            {
+                let mut changed = expected.clone();
+                *changed.last_mut().unwrap() ^= 1;
+                changed
+            },
+        ] {
+            std::fs::write(&path, &expected).unwrap();
+            let file = std::fs::File::open(&path).unwrap();
+            let mut calendar = super::CalendarFile {
+                metadata: file.metadata().unwrap(),
+                file,
+                _vault: std::marker::PhantomData,
+            };
+            std::fs::write(&path, &replacement).unwrap();
+            assert!(!calendar.matches_bytes(&expected).unwrap());
+            assert!(!calendar.matches_stream(expected.as_slice()).unwrap());
+            assert_eq!(calendar.into_bytes().unwrap(), replacement);
+        }
+    }
+
+    #[test]
+    fn file_comparison_includes_unaligned_prefix_tail_and_length() {
+        for len in [0, 1, 7, 8, 9, 16, 127, 16 * 1024 - 1, 16 * 1024] {
+            let stored = vec![17; len + 1];
+            let expected = &stored[1..];
+            let mut data = expected.to_vec();
+            assert!(equal_source_words(expected, &data));
+            assert!(!equal_source_words(expected, &stored));
+            for position in [0, len / 2, len.saturating_sub(1)] {
+                if position < len {
+                    data[position] ^= 0x80;
+                    assert!(!equal_source_words(expected, &data));
+                    data[position] ^= 0x80;
+                }
+            }
+        }
     }
 }

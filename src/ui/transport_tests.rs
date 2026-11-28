@@ -1,6 +1,6 @@
 use super::*;
 use godovoy_plan::storage::Store;
-use std::net::{Ipv4Addr, TcpStream};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpStream};
 use tempfile::tempdir;
 
 #[test]

@@ -2,9 +2,8 @@ use std::{
     collections::BTreeSet,
     sync::{
         Arc,
-        mpsc::{Receiver, TryRecvError, sync_channel},
+        mpsc::{Receiver, TryRecvError},
     },
-    thread,
 };
 
 use chrono::NaiveDate;
@@ -14,6 +13,8 @@ use godovoy_plan::{
     planning::Reminder,
     storage::{ReminderRecovery, ReminderStore},
 };
+
+use super::spawn_worker;
 
 #[derive(Default)]
 pub(super) struct ReminderWork {
@@ -147,26 +148,20 @@ impl ReminderWork {
     }
 
     fn start(&mut self, operation: Operation, store: &Arc<ReminderStore>, ctx: &egui::Context) {
-        let (send, result) = sync_channel(1);
         let worker_operation = operation.clone();
         let store = Arc::clone(store);
-        let worker_ctx = ctx.clone();
-        self.progress =
-            match thread::Builder::new()
-                .name("reminder-write".into())
-                .spawn(move || {
-                    let outcome = match worker_operation {
-                        Operation::Repair => store.recover().map(Outcome::Recovered),
-                        Operation::Save { today, keys } => {
-                            store.acknowledge(today, &keys).map(|()| Outcome::Saved)
-                        }
-                    };
-                    let _ = send.send(outcome);
-                    worker_ctx.request_repaint();
-                }) {
-                Ok(_) => Progress::Running { operation, result },
-                Err(error) => Progress::Finished(Err(operation.error(&error.to_string()))),
+        self.progress = match spawn_worker("reminder-write", ctx, move || {
+            let outcome = match worker_operation {
+                Operation::Repair => store.recover().map(Outcome::Recovered),
+                Operation::Save { today, keys } => {
+                    store.acknowledge(today, &keys).map(|()| Outcome::Saved)
+                }
             };
+            Some(outcome)
+        }) {
+            Ok(result) => Progress::Running { operation, result },
+            Err(error) => Progress::Finished(Err(operation.error(&error.to_string()))),
+        };
         ctx.request_repaint();
     }
 }
@@ -183,6 +178,7 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use godovoy_plan::{model::Id, planning::Milestone};
+    use std::sync::mpsc::sync_channel;
 
     use super::*;
 

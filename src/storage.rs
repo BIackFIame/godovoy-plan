@@ -22,18 +22,19 @@ use crate::{
 
 mod access;
 mod generations;
+use generations::sync_directory;
 #[cfg(feature = "server")]
 pub mod online;
 use access::{check_directory as check_private_directory, validate_profile_access};
 mod backup;
 pub use backup::{BackupEntry, RestoreResult, RestoredProfile};
-#[cfg(feature = "desktop")]
+#[cfg(feature = "local-api")]
 mod import_status;
-#[cfg(feature = "desktop")]
+#[cfg(feature = "local-api")]
 pub use import_status::{
     BridgeRunStatus, ImportFailure, ImportResultKind, ImportStatus, ImportSuccess,
 };
-#[cfg(feature = "desktop")]
+#[cfg(feature = "local-api")]
 pub(crate) use import_status::{ImportLog, valid_source};
 mod peer_routes;
 pub(crate) use peer_routes::PeerRoutes;
@@ -216,9 +217,11 @@ impl Workspace {
 }
 
 impl LocalState {
-    /// Legacy calendars already had LAN exchange; an empty legacy profile did not choose a group.
+    /// A legacy profile may have been used entirely offline, even with several members.
     pub fn lan_enabled(&self) -> bool {
-        self.lan_enabled.unwrap_or(self.workspace.is_some())
+        self.lan_enabled.unwrap_or_else(|| {
+            self.workspace.is_some() && (!self.peers.is_empty() || self.last_sync.is_some())
+        })
     }
 
     pub fn create_workspace(&mut self, name: String, employee: String) -> Fallible<()> {
@@ -343,29 +346,52 @@ pub struct ProfileSnapshot {
     pub reminder_issue: Option<ReminderFileIssue>,
 }
 
+#[cfg(feature = "desktop")]
+type WindowCallback = dyn Fn() + Send + Sync;
+
 #[derive(Clone)]
-pub struct StoreReader(
-    Arc<RwLock<ProfileSnapshot>>,
-    #[cfg(feature = "desktop")] Arc<RwLock<import_status::View>>,
-);
+pub struct StoreReader {
+    published: Arc<RwLock<ProfileSnapshot>>,
+    #[cfg(feature = "local-api")]
+    imports: Arc<RwLock<import_status::View>>,
+    #[cfg(feature = "desktop")]
+    window: Arc<Mutex<Option<Weak<WindowCallback>>>>,
+}
 
 impl StoreReader {
+    /// A reopened window replaces the observer without extending the lifetime of the old UI.
+    #[cfg(feature = "desktop")]
+    pub fn observe_window(&self, observer: &Arc<dyn Fn() + Send + Sync>) {
+        *self.window.lock().unwrap() = Some(Arc::downgrade(observer));
+    }
+
+    /// Call after publishing data and releasing store, network, or admission locks.
+    pub(crate) fn repaint_window(&self) {
+        #[cfg(feature = "desktop")]
+        {
+            let observer = self.window.lock().unwrap().as_ref().and_then(Weak::upgrade);
+            if let Some(observer) = observer {
+                observer();
+            }
+        }
+    }
+
     pub fn snapshot(&self) -> ProfileSnapshot {
-        self.0.read().unwrap().clone()
+        self.published.read().unwrap().clone()
     }
 
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "local-api")]
     pub fn import_status(&self) -> Arc<[ImportStatus]> {
-        self.1.read().unwrap().statuses()
+        self.imports.read().unwrap().statuses()
     }
 
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "local-api")]
     pub fn import_status_warning(&self) -> bool {
-        self.1.read().unwrap().has_warning()
+        self.imports.read().unwrap().has_warning()
     }
 }
 
-// A weak subscription lets the network worker go away without retaining the profile.
+// Each active transport consumes its own edit notification. The store holds only weak references.
 pub(crate) struct CalendarWake {
     worker: thread::Thread,
     changed: AtomicBool,
@@ -379,12 +405,14 @@ impl CalendarWake {
 
 pub struct Store {
     pub(crate) last_import_digest: Option<[u8; 32]>,
-    calendar_wake: Weak<CalendarWake>,
+    calendar_wakes: Vec<Weak<CalendarWake>>,
     successor: Option<PathBuf>,
+    directory_sync_pending: bool,
+    draft_commit: Mutex<PendingSidecar>,
     state: Arc<LocalState>,
     path: PathBuf,
     reader: StoreReader,
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "local-api")]
     import_log: Arc<ImportLog>,
     reminders: Arc<ReminderStore>,
 }
@@ -395,10 +423,29 @@ pub enum ReminderRecovery {
     Reset,
 }
 
+// A rename or unlink can already be visible even when its directory flush fails.
+#[derive(Default)]
+struct PendingSidecar {
+    changed: bool,
+}
+
+impl PendingSidecar {
+    fn confirm(&mut self, path: &Path, sync: impl FnOnce(&Path) -> io::Result<()>) -> Fallible<()> {
+        if self.changed {
+            let parent = path.parent().ok_or("Не указана папка профиля.")?;
+            sync(parent).map_err(|error| {
+                format!("Изменение применено. Накопитель не подтвердил сохранение: {error}")
+            })?;
+            self.changed = false;
+        }
+        Ok(())
+    }
+}
+
 pub struct ReminderStore {
     path: PathBuf,
     reader: StoreReader,
-    writer: Mutex<()>,
+    writer: Mutex<PendingSidecar>,
     // A background repair may outlive the window that started it.
     _profile_lock: ProfileLock,
 }
@@ -481,6 +528,7 @@ impl Store {
             }
             Err(error) => return Err(error),
         };
+        sync_directory(directory)?;
         Self::open_saved_profile(directory, state, profile_bytes, profile_lock)
     }
 
@@ -504,32 +552,36 @@ impl Store {
             Err(issue) => (BTreeSet::new(), Some(issue)),
         };
         let state = Arc::new(state);
-        #[cfg(feature = "desktop")]
+        #[cfg(feature = "local-api")]
         let import_log = Arc::new(ImportLog::open(directory.join("imports-v1.json"), &state));
-        let reader = StoreReader(
-            Arc::new(RwLock::new(ProfileSnapshot {
+        let reader = StoreReader {
+            published: Arc::new(RwLock::new(ProfileSnapshot {
                 usage: ProfileUsage::from_state(&state, profile_bytes),
                 state: Arc::clone(&state),
                 reminder_receipts: Arc::new(read_reminders),
                 reminder_issue,
             })),
+            #[cfg(feature = "local-api")]
+            imports: Arc::clone(&import_log.view),
             #[cfg(feature = "desktop")]
-            Arc::clone(&import_log.view),
-        );
+            window: Arc::default(),
+        };
         let reminders = Arc::new(ReminderStore {
             path: reminder_path,
             reader: reader.clone(),
-            writer: Mutex::new(()),
+            writer: Mutex::default(),
             _profile_lock: profile_lock,
         });
         Ok(Arc::new(Mutex::new(Self {
             last_import_digest: None,
-            calendar_wake: Weak::new(),
+            calendar_wakes: Vec::new(),
             successor: None,
+            directory_sync_pending: false,
+            draft_commit: Mutex::default(),
             state,
             path: directory.join("calendar.json"),
             reader,
-            #[cfg(feature = "desktop")]
+            #[cfg(feature = "local-api")]
             import_log,
             reminders,
         })))
@@ -540,7 +592,9 @@ impl Store {
             worker: thread::current(),
             changed: AtomicBool::new(false),
         });
-        self.calendar_wake = Arc::downgrade(&wake);
+        self.calendar_wakes
+            .retain(|entry| entry.strong_count() != 0);
+        self.calendar_wakes.push(Arc::downgrade(&wake));
         wake
     }
 
@@ -548,20 +602,19 @@ impl Store {
         self.reader.clone()
     }
 
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "local-api")]
     pub(crate) fn import_log(&self) -> Arc<ImportLog> {
         Arc::clone(&self.import_log)
     }
 
     pub fn load_ui_drafts<T: DeserializeOwned>(&self) -> Fallible<Option<T>> {
         let path = self.path.with_file_name("drafts-v1.json");
-        check_profile_file(&path)?;
-        let file = match File::open(path) {
-            Ok(file) => file,
+        let (file, metadata) = match access::open_profile_reader(&path) {
+            Ok(opened) => opened,
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(error.into()),
         };
-        if file.metadata()?.len() > UI_DRAFT_LIMIT as u64 {
+        if metadata.len() > UI_DRAFT_LIMIT as u64 {
             return Err("Файл черновиков слишком большой.".into());
         }
         let mut limited = file.take(UI_DRAFT_LIMIT as u64 + 1);
@@ -573,16 +626,31 @@ impl Store {
     }
 
     pub fn save_ui_drafts<T: Serialize>(&self, drafts: Option<&T>) -> Fallible<()> {
+        self.save_ui_drafts_with(drafts, sync_directory)
+    }
+
+    fn save_ui_drafts_with<T: Serialize>(
+        &self,
+        drafts: Option<&T>,
+        sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Fallible<()> {
         let path = self.path.with_file_name("drafts-v1.json");
+        let mut pending = self
+            .draft_commit
+            .lock()
+            .map_err(|_| "Файл черновиков недоступен.")?;
         check_profile_file(&path)?;
         if let Some(drafts) = drafts {
             save(&path, drafts, UI_DRAFT_LIMIT)?;
-        } else if let Err(error) = fs::remove_file(path)
-            && error.kind() != io::ErrorKind::NotFound
-        {
-            return Err(error.into());
+            pending.changed = true;
+        } else {
+            match fs::remove_file(&path) {
+                Ok(()) => pending.changed = true,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error.into()),
+            }
         }
-        Ok(())
+        pending.confirm(&path, sync)
     }
 
     pub(crate) fn peer_routes(&self, capacity: usize) -> PeerRoutes {
@@ -698,7 +766,16 @@ impl Store {
         &mut self,
         change: impl FnOnce(&mut LocalState) -> Fallible<T>,
     ) -> Fallible<T> {
+        self.transaction_with_sync(change, sync_directory)
+    }
+
+    fn transaction_with_sync<T>(
+        &mut self,
+        change: impl FnOnce(&mut LocalState) -> Fallible<T>,
+        sync: impl Fn(&Path) -> io::Result<()>,
+    ) -> Fallible<T> {
         self.ensure_current_generation()?;
+        self.finish_directory_sync(&sync)?;
         let mut next = (*self.state).clone();
         let result = change(&mut next)?;
         if next != *self.state {
@@ -720,29 +797,68 @@ impl Store {
                 }
             }
             let bytes = save_profile(&self.path, &next)?;
-            self.publish_calendar(next, bytes);
+            self.publish_replaced_profile(next, bytes, sync)?;
         }
         Ok(result)
+    }
+
+    fn publish_replaced_profile(
+        &mut self,
+        next: LocalState,
+        bytes: usize,
+        sync: impl FnOnce(&Path) -> io::Result<()>,
+    ) -> Fallible<()> {
+        self.directory_sync_pending = true;
+        let durability = self.finish_directory_sync(sync);
+        // Rename already replaced the visible file. Even on a flush error,
+        // publish that state and retry the directory flush before the next edit.
+        self.publish_calendar(next, bytes);
+        durability
+    }
+
+    fn finish_directory_sync(&mut self, sync: impl FnOnce(&Path) -> io::Result<()>) -> Fallible<()> {
+        if self.directory_sync_pending {
+            let directory = self.path.parent().ok_or("Не указана папка профиля.")?;
+            sync(directory).map_err(|error| {
+                format!("Файл календаря обновлён. Накопитель не подтвердил сохранение: {error}")
+            })?;
+            self.directory_sync_pending = false;
+        }
+        Ok(())
     }
 
     fn publish_calendar(&mut self, next: LocalState, bytes: usize) {
         self.last_import_digest = None;
         self.state = Arc::new(next);
-        let mut view = self.reader.0.write().unwrap();
+        let mut view = self.reader.published.write().unwrap();
         view.usage = ProfileUsage::from_state(&self.state, bytes);
         let previous = std::mem::replace(&mut view.state, Arc::clone(&self.state));
         drop(view);
-        if let Some(wake) = self.calendar_wake.upgrade()
-            && !previous
+        if !self.calendar_wakes.is_empty() {
+            let calendar_changed = !previous
                 .workspace
                 .as_ref()
                 .zip(self.state.workspace.as_ref())
                 .is_some_and(|(a, b)| Arc::ptr_eq(a, b))
-            && previous.workspace.as_ref().map(|w| &w.calendar)
-                != self.state.workspace.as_ref().map(|w| &w.calendar)
-            && !wake.changed.swap(true, Ordering::AcqRel)
-        {
-            wake.worker.unpark();
+                && previous.workspace.as_ref().map(|w| &w.calendar)
+                    != self.state.workspace.as_ref().map(|w| &w.calendar);
+            // An authenticated discovery hint may become usable after joining its workspace.
+            let routes_changed = previous.peers != self.state.peers
+                || previous.workspace.as_ref().map(|w| w.id)
+                    != self.state.workspace.as_ref().map(|w| w.id);
+            if calendar_changed || routes_changed {
+                self.calendar_wakes.retain(|entry| {
+                    let Some(wake) = entry.upgrade() else {
+                        return false;
+                    };
+                    // Route-only changes leave existing peers' backoff intact.
+                    let new_edit = calendar_changed && !wake.changed.swap(true, Ordering::AcqRel);
+                    if new_edit || routes_changed {
+                        wake.worker.unpark();
+                    }
+                    true
+                });
+            }
         }
         drop(previous);
     }
@@ -757,7 +873,16 @@ impl ReminderStore {
         &self,
         link: impl FnOnce(&Path, &Path) -> io::Result<()>,
     ) -> Fallible<ReminderRecovery> {
-        let _writer = self.lock_writer()?;
+        self.recover_with_sync(link, sync_directory)
+    }
+
+    fn recover_with_sync(
+        &self,
+        link: impl FnOnce(&Path, &Path) -> io::Result<()>,
+        sync: impl Fn(&Path) -> io::Result<()>,
+    ) -> Fallible<ReminderRecovery> {
+        let mut pending = self.lock_writer()?;
+        pending.confirm(&self.path, &sync)?;
         let (receipts, result) = match load_reminder_file(&self.path) {
             Ok(receipts) => (receipts, ReminderRecovery::Reloaded),
             Err(issue) if issue.can_recover() => {
@@ -766,22 +891,31 @@ impl ReminderStore {
                     uuid::Builder::from_random_bytes(random_bytes()?).into_uuid()
                 );
                 let backup = self.path.with_file_name(filename);
+                let receipts = BTreeSet::<Reminder>::new();
+                let (healthy, _) = stage(&self.path, &receipts, REMINDER_LIMIT)?;
                 // Publish the healthy replacement only after retaining its predecessor.
                 preserve_original(&self.path, &backup, REMINDER_LIMIT, link)?;
-                let receipts = BTreeSet::<Reminder>::new();
-                save(&self.path, &receipts, REMINDER_LIMIT)?;
+                if let Err(error) = sync(backup.parent().ok_or("Не указана папка профиля.")?)
+                {
+                    // The damaged original is still intact. Only our new link/copy is disposable.
+                    let _ = fs::remove_file(&backup);
+                    return Err(error.into());
+                }
+                healthy.persist(&self.path)?;
+                pending.changed = true;
                 (receipts, ReminderRecovery::Reset)
             }
             Err(issue) => return Err(issue.message().into()),
         };
         self.publish(receipts);
+        pending.confirm(&self.path, sync)?;
         Ok(result)
     }
 
     pub fn acknowledge(&self, today: chrono::NaiveDate, acknowledged: &[Reminder]) -> Fallible<()> {
         self.acknowledge_with(today, acknowledged, |receipts| {
             save(&self.path, receipts, REMINDER_LIMIT).map(|_| ())
-        })
+        }, sync_directory)
     }
 
     fn acknowledge_with(
@@ -789,8 +923,10 @@ impl ReminderStore {
         today: chrono::NaiveDate,
         acknowledged: &[Reminder],
         write: impl FnOnce(&BTreeSet<Reminder>) -> Fallible<()>,
+        sync: impl Fn(&Path) -> io::Result<()>,
     ) -> Fallible<()> {
-        let _writer = self.lock_writer()?;
+        let mut pending = self.lock_writer()?;
+        pending.confirm(&self.path, &sync)?;
         let snapshot = self.reader.snapshot();
         if let Some(issue) = snapshot.reminder_issue {
             return Err(issue.message().into());
@@ -808,12 +944,14 @@ impl ReminderStore {
             .collect();
         if next != *snapshot.reminder_receipts {
             write(&next)?;
+            pending.changed = true;
             self.publish(next);
+            pending.confirm(&self.path, sync)?;
         }
         Ok(())
     }
 
-    fn lock_writer(&self) -> Fallible<std::sync::MutexGuard<'_, ()>> {
+    fn lock_writer(&self) -> Fallible<std::sync::MutexGuard<'_, PendingSidecar>> {
         self.writer.try_lock().map_err(|error| match error {
             std::sync::TryLockError::WouldBlock => {
                 "Дождитесь завершения работы с файлом отметок.".into()
@@ -823,7 +961,7 @@ impl ReminderStore {
     }
 
     fn publish(&self, receipts: BTreeSet<Reminder>) {
-        let mut view = self.reader.0.write().unwrap();
+        let mut view = self.reader.published.write().unwrap();
         let previous = std::mem::replace(&mut view.reminder_receipts, Arc::new(receipts));
         view.reminder_issue = None;
         drop(view);
@@ -832,15 +970,12 @@ impl ReminderStore {
 }
 
 fn load_reminder_file(path: &Path) -> Result<BTreeSet<Reminder>, ReminderFileIssue> {
-    let unavailable = |_| ReminderFileIssue::Unavailable;
-    match fs::symlink_metadata(path) {
-        Ok(metadata) if !metadata.is_file() => return Err(ReminderFileIssue::Unavailable),
-        Ok(_) => {}
+    let (file, metadata) = match access::open_profile_reader(path) {
+        Ok(opened) => opened,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(BTreeSet::new()),
         Err(_) => return Err(ReminderFileIssue::Unavailable),
-    }
-    let file = File::open(path).map_err(unavailable)?;
-    let size = file.metadata().map_err(unavailable)?.len();
+    };
+    let size = metadata.len();
     read_profile_json(file, size, REMINDER_LIMIT)
         .map(|(receipts, _)| receipts)
         .map_err(|error| match error {
@@ -887,16 +1022,15 @@ fn open_profile_lock(directory: &Path) -> Fallible<ProfileLock> {
 }
 
 fn read_calendar_file(path: &Path) -> Fallible<(LocalState, usize)> {
-    check_profile_file(path)?;
-    let file = match File::open(path) {
-        Ok(file) => file,
+    let (file, metadata) = match access::open_profile_reader(path) {
+        Ok(opened) => opened,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             return Err(ProfileOpenIssue::CalendarMissing.into());
         }
         Err(error) => return Err(error.into()),
     };
-    let size = file.metadata()?.len();
-    let (state, bytes) = match read_profile_json::<LocalState>(file, size, PROFILE_LIMIT) {
+    let size = metadata.len();
+    let (mut state, bytes) = match read_profile_json::<LocalState>(file, size, PROFILE_LIMIT) {
         Ok(decoded) => decoded,
         Err(ProfileJsonError::Io(error)) => return Err(error.into()),
         Err(ProfileJsonError::Syntax) => return Err(ProfileOpenIssue::InvalidCalendar.into()),
@@ -917,6 +1051,9 @@ fn read_calendar_file(path: &Path) -> Fallible<(LocalState, usize)> {
         crate::network::validate_enrollment_size(state.device, workspace)
             .map_err(|_| ProfileOpenIssue::CalendarTooLarge)?;
     }
+    // Preserve the decision in memory before a normal edit can clear old routes
+    // or the last exchange time. The next ordinary save persists it.
+    state.lan_enabled = Some(state.lan_enabled());
     Ok((state, bytes))
 }
 
@@ -994,8 +1131,8 @@ fn preserve_original(
         Err(_) => {}
     }
     const TOO_LARGE: &str = "Предыдущий файл слишком велик для отдельного копирования.";
-    let input = File::open(source)?;
-    if input.metadata()?.len() > limit as u64 {
+    let (input, metadata) = access::open_profile_reader(source)?;
+    if metadata.len() > limit as u64 {
         return Err(TOO_LARGE.into());
     }
     let mut options = OpenOptions::new();
@@ -1175,6 +1312,101 @@ mod tests {
     use super::*;
 
     #[test]
+    fn directory_flush_error_keeps_the_replaced_profile_and_retries_before_an_edit() {
+        let folder = tempfile::tempdir().unwrap();
+        let profile = folder.path().join("office");
+        let shared = Store::open(&profile).unwrap();
+        let mut store = shared.lock().unwrap();
+        let error = store.transaction_with_sync(
+            |state| state.create_workspace("Офис".into(), "Анна".into()),
+            |_| Err(io::Error::other("flush fault")),
+        ).unwrap_err();
+        assert!(error.to_string().contains("Накопитель не подтвердил"));
+        assert!(store.directory_sync_pending);
+        let disk = read_calendar_file(&profile.join("calendar.json")).unwrap().0;
+        assert_eq!(store.reader().snapshot().state.as_ref(), &disk);
+        assert_eq!(store.state(), &disk);
+
+        let calls = std::cell::Cell::new(0);
+        let result = store.transaction_with_sync(
+            |_| -> Fallible<()> { panic!("edit after failed sync") },
+            |_| Err(io::Error::other("still unavailable")),
+        );
+        assert!(result.is_err());
+        store.transaction_with_sync(|_| Ok(()), |dir| {
+            assert_eq!(dir, profile);
+            calls.set(calls.get() + 1);
+            sync_directory(dir)
+        }).unwrap();
+        assert_eq!(calls.get(), 1);
+        assert!(!store.directory_sync_pending);
+        store.transaction_with_sync(|_| Ok(()), |_| panic!("redundant flush")).unwrap();
+    }
+
+    #[test]
+    fn old_profile_needs_network_evidence_to_start_listening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("office");
+        let profile = Store::open(&path).unwrap();
+        profile
+            .lock()
+            .unwrap()
+            .transaction(|s| {
+                s.create_workspace("Офис".into(), "Анна".into())?;
+                let revision = s.revision()?;
+                s.workspace_mut()?
+                    .calendar
+                    .members
+                    .insert(Id::new_v4(), Record::new(revision, "Коллега".into()));
+                Ok(())
+            })
+            .unwrap();
+        drop(profile);
+        let file = path.join("calendar.json");
+        let mut original: serde_json::Value =
+            serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+        original.as_object_mut().unwrap().remove("lan_enabled");
+        for (explicit, saved_address, last_exchange, paused, wanted) in [
+            (None, false, false, false, false),
+            (None, true, false, false, true),
+            (None, false, true, false, true),
+            (None, true, true, true, true),
+            (Some(false), true, true, false, false),
+            (Some(true), false, false, false, true),
+        ] {
+            let mut fixture = original.clone();
+            if let Some(value) = explicit {
+                fixture["lan_enabled"] = value.into();
+            }
+            if saved_address {
+                fixture["peers"] = serde_json::json!(["127.0.0.1:45736"]);
+            }
+            if last_exchange {
+                fixture["last_sync"] = 1.into();
+            }
+            fixture["sync_paused"] = paused.into();
+            let raw = serde_json::to_vec(&fixture).unwrap();
+            fs::write(&file, &raw).unwrap();
+            let store = Store::open_existing(&path).unwrap();
+            let mut store = store.lock().unwrap();
+            assert_eq!(store.state().lan_enabled(), wanted);
+            assert_eq!(store.sync_paused(), paused);
+            assert_eq!(fs::read(&file).unwrap(), raw);
+            store
+                .transaction(|state| {
+                    state.peers.clear();
+                    state.last_sync = None;
+                    state.sync_paused = !paused;
+                    Ok(())
+                })
+                .unwrap();
+            let saved: serde_json::Value =
+                serde_json::from_slice(&fs::read(&file).unwrap()).unwrap();
+            assert_eq!(saved["lan_enabled"], wanted);
+        }
+    }
+
+    #[test]
     fn bounded_profile_json_uses_actual_input_length() {
         let limit = 8;
         for reported_size in [0, 3, limit as u64] {
@@ -1198,7 +1430,7 @@ mod tests {
     }
 
     #[test]
-    fn calendar_subscription_wakes_only_for_committed_calendar_changes() {
+    fn calendar_subscription_marks_only_committed_calendar_edits() {
         let tmp = tempfile::tempdir().unwrap();
         let profile = Store::open(&tmp.path().join("office")).unwrap();
         let mut store = profile.lock().unwrap();
@@ -1241,6 +1473,16 @@ mod tests {
         assert!(store.transaction(|s| rename(s, "")).is_err());
         assert!(Arc::ptr_eq(&metadata_only, &store.snapshot()));
         assert!(!subscription.take_change());
+        store
+            .transaction(|s| {
+                s.peers.insert("127.0.0.1:45736".parse()?);
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            !subscription.take_change(),
+            "a route change must preserve peer backoff"
+        );
         store.transaction(|s| rename(s, "Ольга")).unwrap();
         assert!(subscription.take_change());
         assert_eq!(
@@ -1336,6 +1578,118 @@ mod tests {
 
     fn unsuitable_filesystem(_: &Path, _: &Path) -> io::Result<()> {
         Err(io::ErrorKind::Unsupported.into())
+    }
+
+    #[test]
+    fn failed_draft_confirmation_is_retried_after_an_already_visible_deletion() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let shared = Store::open(&profile).unwrap();
+        let store = shared.lock().unwrap();
+        let fail = |_: &Path| Err(io::Error::other("induced directory failure"));
+        let avoid_flush = |_: &Path| panic!("redundant directory flush");
+        store
+            .save_ui_drafts_with::<String>(None, avoid_flush)
+            .unwrap();
+        assert!(store.save_ui_drafts_with(Some(&"new"), fail).is_err());
+        assert_eq!(
+            store.load_ui_drafts::<String>().unwrap().as_deref(),
+            Some("new")
+        );
+        assert!(store.save_ui_drafts_with::<String>(None, fail).is_err());
+        assert!(store.load_ui_drafts::<String>().unwrap().is_none());
+        assert!(store.save_ui_drafts_with::<String>(None, fail).is_err());
+        store
+            .save_ui_drafts_with::<String>(None, sync_directory)
+            .unwrap();
+        store
+            .save_ui_drafts_with::<String>(None, avoid_flush)
+            .unwrap();
+    }
+
+    #[test]
+    fn visible_receipts_and_repeated_ack_wait_for_directory_confirmation() {
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        let shared = Store::open(&profile).unwrap();
+        shared
+            .lock()
+            .unwrap()
+            .transaction(|s| s.create_workspace("Офис".into(), "Ира".into()))
+            .unwrap();
+        drop(shared);
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+        let old = Reminder {
+            date: today,
+            event: Id::new_v4(),
+            year: 2026,
+            kind: planning::Milestone::Preparation,
+        };
+        save(
+            &profile.join("reminders-v1.json"),
+            &BTreeSet::from([old]),
+            REMINDER_LIMIT,
+        )
+        .unwrap();
+        let shared = Store::open_existing(&profile).unwrap();
+        let rs = shared.lock().unwrap().reminder_store();
+        let fail = |_: &Path| Err(io::Error::other("induced directory failure"));
+        let no_write = |_: &BTreeSet<Reminder>| panic!("receipts were already replaced");
+        let write = |set: &BTreeSet<Reminder>| save(&rs.path, set, REMINDER_LIMIT).map(|_| ());
+        assert!(rs.acknowledge_with(today, &[], write, fail).is_err());
+        assert!(rs.reader.snapshot().reminder_receipts.is_empty());
+        assert_eq!(fs::read(&rs.path).unwrap(), b"[]");
+        assert!(rs.acknowledge_with(today, &[], no_write, fail).is_err());
+        rs.acknowledge_with(today, &[], no_write, sync_directory)
+            .unwrap();
+        rs.acknowledge_with(today, &[], no_write, |_| panic!("already confirmed"))
+            .unwrap();
+    }
+
+    #[test]
+    fn failed_repair_confirmation_preserves_the_original_and_skips_duplicate_backups() {
+        use std::cell::Cell;
+        let temp = tempfile::tempdir().unwrap();
+        let profile = temp.path().join("profile");
+        drop(Store::open(&profile).unwrap());
+        let path = profile.join("reminders-v1.json");
+        fs::write(&path, b"damaged").unwrap();
+        let shared = Store::open_existing(&profile).unwrap();
+        let rs = shared.lock().unwrap().reminder_store();
+        let link = |source: &Path, target: &Path| fs::hard_link(source, target);
+        let fail = |_: &Path| Err(io::Error::other("induced directory failure"));
+        let count = || {
+            fs::read_dir(&profile)
+                .unwrap()
+                .flatten()
+                .filter(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with("reminders-damaged-")
+                })
+                .count()
+        };
+        assert!(rs.recover_with_sync(link, fail).is_err());
+        assert_eq!(fs::read(&path).unwrap(), b"damaged");
+        assert_eq!(count(), 0);
+        let calls = Cell::new(0);
+        assert!(
+            rs.recover_with_sync(link, |dir| {
+                calls.set(calls.get() + 1);
+                if calls.get() == 1 {
+                    sync_directory(dir)
+                } else {
+                    fail(dir)
+                }
+            })
+            .is_err()
+        );
+        assert_eq!(count(), 1);
+        assert_eq!(fs::read(&path).unwrap(), b"[]");
+        assert!(rs.reader.snapshot().reminder_issue.is_none());
+        assert!(rs.recover_with_sync(link, fail).is_err());
+        assert_eq!(rs.recover().unwrap(), ReminderRecovery::Reloaded);
+        assert_eq!(count(), 1);
     }
 
     #[test]
@@ -1569,7 +1923,7 @@ mod tests {
                     started.send(()).unwrap();
                     paused.recv_timeout(timeout).unwrap();
                     save(&receipts.path, next, REMINDER_LIMIT).map(|_| ())
-                })
+                }, sync_directory)
             });
             ready.recv_timeout(timeout).unwrap();
             assert!(!receipts.reader.snapshot().reminder_receipts.contains(&old));
