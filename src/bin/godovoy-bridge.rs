@@ -5,7 +5,7 @@ use std::{
     ffi::OsString,
     fmt,
     fs::File,
-    io::{BufReader, Read},
+    io::{self, BufReader, Read, Write},
     process::ExitCode,
     thread,
     time::{Duration, Instant},
@@ -140,7 +140,10 @@ fn single_request(mut args: impl Iterator<Item = OsString>) -> Fallible<()> {
 }
 
 fn run() -> Fallible<()> {
-    if std::env::args_os().skip(1).eq([std::ffi::OsStr::new("--version")]) {
+    if std::env::args_os()
+        .skip(1)
+        .eq([std::ffi::OsStr::new("--version")])
+    {
         println!("godovoy-bridge {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
@@ -445,6 +448,20 @@ fn prepare_poll(
     prepare_batches(items)
 }
 
+// Count the bytes emitted by the same JSON serializer used by the transfer.
+struct JsonLength(usize);
+
+impl Write for JsonLength {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0 = self.0.saturating_add(bytes.len());
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 fn prepare_batches(items: Vec<ImportItem>) -> Result<(u16, Vec<ImportBatch>), PollFailure> {
     let count = u16::try_from(items.len())
         .ok()
@@ -456,11 +473,11 @@ fn prepare_batches(items: Vec<ImportItem>) -> Result<(u16, Vec<ImportBatch>), Po
     let mut batch = Vec::new();
     let mut size = 16;
     for item in items {
-        let bytes = serde_json::to_vec(&item)
-            .map_err(|_| PollFailure::InvalidSource("Не удалось подготовить событие к импорту."))?
-            .len()
-            + 1;
-        if bytes + 16 >= BODY_LIMIT {
+        let mut length = JsonLength(0);
+        serde_json::to_writer(&mut length, &item)
+            .map_err(|_| PollFailure::InvalidSource("Не удалось подготовить событие к импорту."))?;
+        let bytes = length.0.saturating_add(1);
+        if bytes >= BODY_LIMIT - 16 {
             return Err(PollFailure::InvalidSource(
                 "Одно событие превышает размер пакета API.",
             ));
@@ -616,6 +633,7 @@ struct BitrixResponse {
 #[derive(Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 struct BitrixEvent {
+    private_event: BitrixPrivacy,
     id: serde_json::Value,
     name: String,
     date_from: Option<String>,
@@ -624,9 +642,20 @@ struct BitrixEvent {
     rrule: Option<serde_json::Value>,
 }
 
+#[derive(Deserialize)]
+enum BitrixPrivacy {
+    #[serde(rename = "Y")]
+    Private,
+    #[serde(rename = "N", alias = "")]
+    Public,
+}
+
 fn bitrix_records(response: BitrixResponse) -> Result<Vec<ImportItem>, PollFailure> {
     let mut records = std::collections::BTreeMap::new();
     for row in response.result {
+        if matches!(row.private_event, BitrixPrivacy::Private) {
+            continue;
+        }
         let id = source_id(&row.id).ok_or(PollFailure::InvalidSource(
             "Bitrix24 вернул событие без ID.",
         ))?;
@@ -708,6 +737,49 @@ mod tests {
             (report.fetched, report.confirmed, report.changed),
             (0, 0, 0)
         );
+    }
+
+    #[test]
+    fn batch_boundaries_count_encoded_json_bytes() {
+        fn item(target_bytes: usize) -> ImportItem {
+            let mut row: ImportItem = serde_json::from_value(serde_json::json!({
+                "externalId": "№1",
+                "event": {
+                    "title": "Проверить \"акт\" 🗓",
+                    "date": "2026-12-01",
+                    "description": "Первая строка\nВторая\t\\\u{0000}",
+                    "checklist": [{"key": "é", "title": "Сверить сумму", "daysBefore": 2}]
+                }
+            }))
+            .unwrap();
+            let fixed = serde_json::to_vec(&row).unwrap().len();
+            row.event.title.push_str(&"x".repeat(target_bytes - fixed));
+            assert_eq!(serde_json::to_vec(&row).unwrap().len(), target_bytes);
+            row
+        }
+        let first = 1024;
+        let second = BODY_LIMIT - 16 - 2 - first;
+        let (_, fitting) = prepare_batches(vec![item(first), item(second - 1)]).unwrap();
+        assert_eq!(fitting.len(), 1);
+        let (_, split) = prepare_batches(vec![item(first), item(second)]).unwrap();
+        assert_eq!(
+            split
+                .iter()
+                .map(|part| part.events.len())
+                .collect::<Vec<_>>(),
+            [1, 1]
+        );
+        assert!(prepare_batches(vec![item(BODY_LIMIT - 18)]).is_ok());
+
+        // A later oversized item rejects the poll even after a complete batch.
+        let mut rows: Vec<_> = (0..=BATCH_LIMIT).map(|_| item(first)).collect();
+        rows.push(item(BODY_LIMIT - 17));
+        assert!(matches!(
+            prepare_batches(rows),
+            Err(PollFailure::InvalidSource(
+                "Одно событие превышает размер пакета API."
+            ))
+        ));
     }
 
     #[test]
@@ -808,11 +880,37 @@ mod tests {
     }
 
     #[test]
+    fn bitrix_requires_explicit_visibility_before_import() {
+        let private =
+            serde_json::json!({"ID":"private", "NAME":"private detail", "PRIVATE_EVENT":"Y"});
+        let public = serde_json::json!({"ID":"public", "NAME":"Meeting", "DATE_FROM":"2026-12-07", "PRIVATE_EVENT":""});
+        let input = serde_json::json!({"result":[private,public]});
+        let rows = bitrix_records(serde_json::from_value(input.clone()).unwrap()).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].external_id, "public");
+        for flag in [
+            serde_json::Value::Null,
+            serde_json::json!("unknown"),
+            serde_json::json!(false),
+        ] {
+            let mut invalid = input.clone();
+            invalid["result"][1]["PRIVATE_EVENT"] = flag;
+            assert!(serde_json::from_value::<BitrixResponse>(invalid).is_err());
+        }
+        let mut missing = input;
+        missing["result"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("PRIVATE_EVENT");
+        assert!(serde_json::from_value::<BitrixResponse>(missing).is_err());
+    }
+
+    #[test]
     fn converts_company_calendar_dates_and_stable_ids() {
         let wire = serde_json::json!({"result":[
-            {"ID":"123","NAME":"Планирование","DATE_FROM":"07.12.2026 10:30:00","DESCRIPTION":"Описание"},
-            {"ID":456,"NAME":"Повтор","DATE_FROM":"2026-12-15T10:30:00+03:00","RRULE":{"FREQ":"WEEKLY"}},
-            {"ID":456,"NAME":"Повтор","DATE_FROM_ISO":"2026-12-22T10:30:00+03:00","RRULE":{"FREQ":"WEEKLY"}}
+            {"PRIVATE_EVENT":"N","ID":"123","NAME":"Планирование","DATE_FROM":"07.12.2026 10:30:00","DESCRIPTION":"Описание"},
+            {"PRIVATE_EVENT":"N","ID":456,"NAME":"Повтор","DATE_FROM":"2026-12-15T10:30:00+03:00","RRULE":{"FREQ":"WEEKLY"}},
+            {"PRIVATE_EVENT":"","ID":456,"NAME":"Повтор","DATE_FROM_ISO":"2026-12-22T10:30:00+03:00","RRULE":{"FREQ":"WEEKLY"}}
         ]});
         let items = bitrix_records(serde_json::from_value(wire).unwrap()).unwrap();
         assert_eq!(items.len(), 3);

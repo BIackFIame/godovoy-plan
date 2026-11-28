@@ -1,6 +1,8 @@
 "use strict";
 
 (() => {
+    // Resource Timing retains request URLs, including record IDs, in this document.
+    window.performance?.setResourceTimingBufferSize?.(0);
     const el = (id) => document.getElementById(id);
     const fields = {
         organization: "Название организации", contact: "Служебный контакт ответственного",
@@ -35,6 +37,8 @@
         backupSequence++;
         el("start-backup").disabled = true;
         el("backup-location").hidden = true;
+        renderRevokeSpace(null);
+        el("space-status").textContent = "";
         secret = "";
         active = false;
         clearMcpKey();
@@ -64,7 +68,10 @@
         try {
             const headers = {Authorization: "Bearer " + secret};
             if (body !== undefined) headers["Content-Type"] = "application/json";
-            const res = await fetch(path, {method, headers, body: JSON.stringify(body), mode: "same-origin",
+            const url = new URL(path, location.origin);
+            if (url.origin !== location.origin) throw new Error("Unexpected API origin");
+            // Firefox needs CORS mode to send Origin on writes with no Referer.
+            const res = await fetch(url, {method, headers, body: JSON.stringify(body), mode: method === "GET" ? "same-origin" : "cors",
                 cache: "no-store", referrerPolicy: "no-referrer", credentials: "omit", redirect: "error", signal: abort.signal});
             if (res.status === 401 || res.status === 403) {
                 if (sent === epoch) reset("Доступ к панели закрыт. Запустите панель на сервере и введите действующий ключ.");
@@ -300,10 +307,30 @@
         const result = await request("/v1/employees");
         if (!Array.isArray(result?.employees) || !result.employees.every(p => typeof p.id === "string" &&
             typeof p.name === "string" && Number.isSafeInteger(p.keys))) throw new Error("Сервер вернул неизвестный формат реестра.");
+        renderRevokeSpace(result.revokeSpace);
         employees = result.employees;
         showPerson(employees.find(p => p.id === id) || null);
         staffList();
     }
+    function renderRevokeSpace(state) {
+        const messages = {
+            ready: "Резерв готов.",
+            absent: "Резерв ещё не подготовлен.",
+            unavailable: "Проверить резерв не удалось. Проверьте хранилище на сервере."
+        };
+        const supported = Object.hasOwn(messages, state);
+        el("revoke-space").hidden = !supported;
+        el("revoke-space-state").textContent = supported ? messages[state] : "";
+        el("prepare-space").disabled = state !== "absent";
+    }
+    el("prepare-space").addEventListener("click", () => {
+        action("space-status", async () => {
+            const result = await request("/v1/revoke-space", "POST");
+            if (result?.revokeSpace !== "ready") throw new Error("Сервер не подтвердил подготовку резерва.");
+            renderRevokeSpace(result.revokeSpace);
+            return "На сервере выделено 2 МиБ.";
+        });
+    });
     el("employees").addEventListener("toggle", () => {
         if (el("employees").open && secret) action("staff-status", () => reloadEmployees(null));
     });

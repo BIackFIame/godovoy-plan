@@ -35,13 +35,8 @@ import UserNotifications
                 var requests = [String: UNNotificationRequest]()
                 if authorized {
                     for date in desired {
-                        let numbers = date.split(separator: "-").compactMap { Int($0) }
-                        guard numbers.count == 3 else { continue }
-                        var parts = DateComponents()
-                        parts.calendar = Calendar(identifier: .gregorian)
-                        parts.year = numbers[0]
-                        parts.month = numbers[1]
-                        parts.day = numbers[2]
+                        guard var parts = GPDate.components(date) else { continue }
+                        parts.calendar = GPDate.gregorian
                         parts.hour = 9
                         parts.minute = 0
                         let trigger = UNCalendarNotificationTrigger(dateMatching: parts, repeats: false)

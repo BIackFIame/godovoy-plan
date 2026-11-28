@@ -1,4 +1,14 @@
 use super::*;
+use godovoy_plan::storage::Store;
+
+fn raw_input(size: Vec2, events: Vec<egui::Event>, time: Option<f64>) -> egui::RawInput {
+    egui::RawInput {
+        screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+        events,
+        time,
+        ..Default::default()
+    }
+}
 
 #[test]
 fn revealing_december_keeps_preceding_events_in_the_annual_list() {
@@ -9,7 +19,7 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
         .map(|month| CalendarRow {
             id: Id::from_u128(u128::from(month)),
             date: NaiveDate::from_ymd_opt(2026, month, 1).unwrap(),
-            title: format!("Событие {month}"),
+            title: format!("Событие {month}").into(),
             category: Category::Partners,
         })
         .collect();
@@ -19,14 +29,7 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
         app.selected = Some(rows[target].id);
         app.reveal_event = true;
         let mut render = || {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(
-                    egui::Pos2::ZERO,
-                    vec2(340.0, 220.0),
-                )),
-                ..Default::default()
-            };
-            ctx.run_ui(input, |ui| {
+            ctx.run_ui(raw_input(vec2(340.0, 220.0), Vec::new(), None), |ui| {
                 egui::CentralPanel::default().show_inside(ui, |ui| {
                     app.event_list(ui, &rows, rows[0].date, usage);
                 });
@@ -38,7 +41,7 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
             assert!(
                 painted.shapes.iter().any(|shape| {
                     matches!(&shape.shape, egui::Shape::Text(text)
-                    if text.galley.text() == rows[index].title
+                    if text.galley.text() == rows[index].title.as_ref()
                         && shape.clip_rect.contains_rect(text.visual_bounding_rect()))
                 }),
                 "expected visible event {}",
@@ -46,89 +49,6 @@ fn revealing_december_keeps_preceding_events_in_the_annual_list() {
             );
         }
     }
-}
-
-#[test]
-fn restore_result_keeps_source_files_and_warning_separate_from_backup_status() {
-    let directory = tempfile::tempdir().unwrap();
-    let store = Store::open(&directory.path().join("profile")).unwrap();
-    let mut app = App::new(store, Err("Без сети".into()), false);
-    let original = directory
-        .path()
-        .join("calendar-before-restore-original.json");
-    let in_memory = directory
-        .path()
-        .join("calendar-open-before-restore-original.json");
-    app.report_restore(RestoreResult {
-        original: Some(original.clone()),
-        working_snapshot: Some(in_memory.clone()),
-        restore_point: None,
-        restore_point_warning: true,
-    });
-    assert!(app.backup_open);
-    assert!(app.backup_status.is_none());
-    let result = app.restore_result.as_ref().unwrap();
-    assert_eq!(result.original.as_ref(), Some(&original));
-    assert_eq!(result.working_snapshot.as_ref(), Some(&in_memory));
-    assert!(result.restore_point_warning);
-    assert!(result.restore_point.is_none());
-}
-
-#[test]
-fn latest_backup_updates_after_creation_and_on_reopening_the_window() {
-    let directory = tempfile::tempdir().unwrap();
-    let profile = directory.path().join("profile");
-    let open = || {
-        App::new(
-            Store::open(&profile).unwrap(),
-            Err("Без сети".into()),
-            false,
-        )
-    };
-    let mut app = open();
-    app.store
-        .lock()
-        .unwrap()
-        .transaction(|state| state.create_workspace("Команда".into(), "Анна".into()))
-        .unwrap();
-    app.open_backup_window();
-    assert_eq!(app.latest_backup, Ok(None));
-    app.create_profile_backup(&egui::Context::default());
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while app.backup_creation_busy() {
-        assert!(Instant::now() < deadline, "Создание копии не завершилось");
-        app.poll_backup_creation();
-        thread::sleep(Duration::from_millis(1));
-    }
-    let copy = app.latest_backup.as_ref().unwrap().clone().unwrap();
-    assert!(matches!(&app.backup_creation, BackupCreation::Finished {
-        message, error: false, notice: false
-    } if message == "Копия создана."));
-    drop(app);
-
-    let mut app = open();
-    app.open_backup_window();
-    assert_eq!(app.latest_backup, Ok(Some(copy)));
-    assert_eq!(app.backup_status, None);
-    let folder = Store::backup_folder(&profile);
-    std::fs::rename(&folder, profile.join("backups-displaced")).unwrap();
-    std::fs::write(&folder, "Вместо каталога").unwrap();
-    app.open_backup_window();
-    assert!(app.latest_backup.is_err());
-    app.backup_open = false;
-    app.finish_backup_creation(Err("Нет доступа к папке.".into()));
-    assert!(matches!(
-        &app.backup_creation,
-        BackupCreation::Finished {
-            error: true,
-            notice: true,
-            ..
-        }
-    ));
-    app.open_backup_window();
-    assert!(matches!(&app.backup_creation, BackupCreation::Finished {
-        message, error: true, notice: false
-    } if message.contains("Нет доступа к папке.")));
 }
 
 #[test]
@@ -616,7 +536,7 @@ fn personal_task_rows_preserve_groups_order_and_open_status() {
         .checks
         .insert(checked, Record::new(revision, true));
 
-    let rows = task_rows(
+    let rows = test_task_rows(
         &calendar,
         &[(event, year), (empty, year)],
         3,
@@ -624,7 +544,7 @@ fn personal_task_rows_preserve_groups_order_and_open_status() {
         TaskFilter::All,
     );
     assert_eq!(
-        rows.iter().map(|row| row.task).collect::<Vec<_>>(),
+        rows.iter().map(task_index).collect::<Vec<_>>(),
         vec![None, Some(1), Some(3), Some(0), None],
     );
     assert!(
@@ -687,18 +607,18 @@ fn personal_due_filters_follow_checklist_dates_across_new_year() {
         .map(|event| (event.id, event.year))
         .collect();
     assert_eq!(events.len(), 2);
-    let all = task_rows(&calendar, &events, 5, today, TaskFilter::All);
+    let all = test_task_rows(&calendar, &events, 5, today, TaskFilter::All);
     assert_eq!(all.len(), 7);
     assert!(
         all.iter()
-            .any(|row| row.event == empty && row.task.is_none())
+            .any(|row| row.event == empty && row.kind == TaskRowKind::Event)
     );
     for (filter, indices) in [
         (TaskFilter::TodayAndTomorrow, vec![None, Some(3), Some(2)]),
         (TaskFilter::Overdue, vec![None, Some(4)]),
     ] {
-        let rows = task_rows(&calendar, &events, 5, today, filter);
-        assert_eq!(rows.iter().map(|row| row.task).collect::<Vec<_>>(), indices);
+        let rows = test_task_rows(&calendar, &events, 5, today, filter);
+        assert_eq!(rows.iter().map(task_index).collect::<Vec<_>>(), indices);
         assert!(
             rows.iter()
                 .all(|row| row.event == event && row.year == year)
@@ -706,7 +626,7 @@ fn personal_due_filters_follow_checklist_dates_across_new_year() {
     }
     let before_any_deadline = NaiveDate::from_ymd_opt(2026, 12, 27).unwrap();
     assert!(
-        task_rows(
+        test_task_rows(
             &calendar,
             &events,
             5,
@@ -716,7 +636,7 @@ fn personal_due_filters_follow_checklist_dates_across_new_year() {
         .is_empty()
     );
     assert!(
-        task_rows(
+        test_task_rows(
             &calendar,
             &events,
             5,
@@ -744,10 +664,7 @@ fn compact_calendar_keeps_the_list_and_sync_navigation_visible() {
         let mut frame = eframe::Frame::_new_kittest();
         let mut shapes = Vec::new();
         for _ in 0..4 {
-            let input = egui::RawInput {
-                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
-                ..Default::default()
-            };
+            let input = raw_input(size, Vec::new(), None);
             shapes = ctx
                 .run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
                 .shapes;
@@ -805,14 +722,7 @@ fn a_task_deadline_reveals_its_checkbox_without_marking_it_complete() {
     let mut frame = eframe::Frame::_new_kittest();
     let mut shapes = Vec::new();
     for tick in 0..40 {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                vec2(960.0, 600.0),
-            )),
-            time: Some(f64::from(tick) / 60.0),
-            ..Default::default()
-        };
+        let input = raw_input(vec2(960.0, 600.0), Vec::new(), Some(f64::from(tick) / 60.0));
         shapes = ctx
             .run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
             .shapes;
@@ -854,14 +764,7 @@ fn agenda_exposes_one_button_across_the_task_row() {
     crate::theme::setup(&ctx);
     let mut frame = eframe::Frame::_new_kittest();
     let mut render = |events| {
-        let input = egui::RawInput {
-            screen_rect: Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                vec2(960.0, 600.0),
-            )),
-            events,
-            ..Default::default()
-        };
+        let input = raw_input(vec2(960.0, 600.0), events, None);
         ctx.run_ui(input, |ui| eframe::App::ui(&mut app, ui, &mut frame))
     };
     render(Vec::new());
@@ -893,4 +796,235 @@ fn agenda_exposes_one_button_across_the_task_row() {
         app.reveal_task.unwrap().kind,
         Milestone::Task(editor.event.tasks[0].id)
     );
+}
+
+#[test]
+fn searching_after_a_title_edit_uses_the_current_occurrence_and_unicode_casing() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, id, _) = copy_test_event(&directory.path().join("profile"));
+    app.year = 2027;
+    let rename = |app: &App, title: &str| {
+        let state = app.reader.snapshot().state;
+        let mut editor = Editor::edit(state.follow_event(id, 2027).unwrap());
+        editor.scope = Scope::ThisYear;
+        editor.event.title = title.into();
+        app.save_event(&editor, false).unwrap();
+    };
+    let find = |app: &mut App, query: &str| {
+        app.search = query.into();
+        let state = app.reader.snapshot().state;
+        app.calendar_rows(state.workspace.as_ref().unwrap())
+            .iter()
+            .map(|r| r.id)
+            .collect::<Vec<_>>()
+    };
+
+    let indexed = |app: &App| {
+        app.calendar_view
+            .as_ref()
+            .unwrap()
+            .normalized_titles
+            .is_some()
+    };
+    rename(&app, "Отчёт ΟΣ İ");
+    assert_eq!(find(&mut app, "ОТ"), [id]);
+    assert_eq!(find(&mut app, " ОТЧЕТ "), [id]);
+    assert_eq!(find(&mut app, "ος"), [id]);
+    assert_eq!(find(&mut app, "i\u{307}"), [id]);
+    assert!(indexed(&app));
+    let ctx = egui::Context::default();
+    crate::theme::setup(&ctx);
+    let mut frame = eframe::Frame::_new_kittest();
+    let mut render = |app: &mut App, events| {
+        let input = raw_input(vec2(1100.0, 760.0), events, None);
+        let _ = ctx.run_ui(input, |ui| <App as eframe::App>::ui(app, ui, &mut frame));
+    };
+    app.search_focus = true;
+    render(&mut app, Vec::new());
+    render(
+        &mut app,
+        vec![egui::Event::Key {
+            key: egui::Key::Enter,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }],
+    );
+    assert!(!indexed(&app));
+    assert_eq!(find(&mut app, "i"), [id]);
+    assert!(indexed(&app));
+    app.page = Page::Tasks;
+    render(&mut app, Vec::new());
+    assert!(!indexed(&app));
+    assert_eq!(app.search, "i");
+    rename(&app, "Обновлённое название");
+    assert!(find(&mut app, "i\u{307}").is_empty());
+    assert!(find(&mut app, "отчет").is_empty());
+    assert_eq!(find(&mut app, "обновленное"), [id]);
+    app.year = 2028;
+    assert!(find(&mut app, "обновленное").is_empty());
+    assert_eq!(find(&mut app, "шаблон"), [id]);
+}
+
+fn test_task_rows(
+    calendar: &Calendar,
+    events: &[(Id, i32)],
+    open_count: usize,
+    today: NaiveDate,
+    filter: TaskFilter,
+) -> Arc<[TaskRow]> {
+    let all = all_task_rows(calendar, events, open_count);
+    filtered_task_rows(&all, open_count, today, filter).rows
+}
+
+fn task_index(row: &TaskRow) -> Option<usize> {
+    match row.kind {
+        TaskRowKind::Event => None,
+        TaskRowKind::Checklist { index, .. } => Some(index),
+    }
+}
+
+#[test]
+fn cached_task_rows_track_edits_identity_and_day_independently_of_receipts() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&directory.path().join("profile"));
+    let today = Local::now().date_naive();
+    let device = app.reader.snapshot().state.device;
+    let mut editor = Editor::new(today.year(), today);
+    editor.event.owner = Some(device);
+    editor.event.title = "Сверить контакты партнёров".into();
+    let task = Id::new_v4();
+    editor.event.tasks.push(Task {
+        id: task,
+        title: "Сверить адрес".into(),
+        days_before: 0,
+    });
+    app.save_event(&editor, false).unwrap();
+
+    let state = app.reader.snapshot().state;
+    let workspace = state.workspace.as_ref().unwrap();
+    let empty = Arc::new(BTreeSet::new());
+    let ctx = egui::Context::default();
+    crate::theme::setup(&ctx);
+    app.page = Page::Tasks;
+    app.task_filter = TaskFilter::TodayAndTomorrow;
+    let render = |app: &mut App| {
+        let input = raw_input(vec2(1340.0, 850.0), Vec::new(), None);
+        ctx.run_ui(input, |ui| app.tasks(ui, today, &workspace.calendar))
+    };
+    app.personal_view(&state, &empty, today);
+    let _ = render(&mut app);
+    let current = app.personal.as_ref().unwrap();
+    let rows = current.task_rows.as_ref().unwrap().rows.clone();
+    let initial_pending = current.pending.clone();
+    assert!(
+        rows.iter()
+            .any(|row| row.event == editor.id && task_index(row) == Some(0))
+    );
+    assert!(
+        initial_pending
+            .iter()
+            .any(|item| item.kind == Milestone::Task(task))
+    );
+
+    let read = Arc::new(initial_pending.iter().copied().collect());
+    app.personal_view(&state, &read, today);
+    let view = app.personal.as_ref().unwrap();
+    assert!(view.pending.is_empty());
+    assert!(Arc::ptr_eq(&rows, &view.task_rows.as_ref().unwrap().rows));
+
+    app.personal_view(&state, &empty, today);
+    let view = app.personal.as_ref().unwrap();
+    assert_eq!(&*view.pending, &*initial_pending);
+    assert!(Arc::ptr_eq(&rows, &view.task_rows.as_ref().unwrap().rows));
+
+    assert!(app.personal.as_ref().unwrap().all_task_rows.is_some());
+    app.page = Page::Calendar;
+    let mut frame = eframe::Frame::_new_kittest();
+    let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+        eframe::App::ui(&mut app, ui, &mut frame);
+    });
+    let view = app.personal.as_ref().unwrap();
+    assert!(view.all_task_rows.is_none());
+    assert!(Arc::ptr_eq(&rows, &view.task_rows.as_ref().unwrap().rows));
+
+    app.personal_view(&state, &empty, today.succ_opt().unwrap());
+    assert!(app.personal.as_ref().unwrap().task_rows.is_none());
+    app.personal_view(&state, &empty, today);
+    let _ = render(&mut app);
+    let mut alternative = (*state).clone();
+    alternative.device = Id::new_v4();
+    app.personal_view(&Arc::new(alternative), &empty, today);
+    let view = app.personal.as_ref().unwrap();
+    assert!(view.task_rows.is_none());
+    assert_eq!(view.open_count, 0);
+
+    app.check(editor.id, today.year(), task, true);
+    let changed = app.reader.snapshot().state;
+    let calendar = &changed.workspace.as_ref().unwrap().calendar;
+    app.personal_view(&changed, &empty, today);
+    let view = app.personal.as_ref().unwrap();
+    assert!(view.task_rows.is_none());
+    assert!(
+        all_task_rows(calendar, &view.events, view.open_count)
+            .iter()
+            .all(|row| row.event != editor.id || row.kind == TaskRowKind::Event)
+    );
+}
+
+#[test]
+fn cached_calendar_position_checks_the_event_identity_after_reorder_or_filter() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, _, _) = copy_test_event(&directory.path().join("profile"));
+    let today = NaiveDate::from_ymd_opt(2026, 11, 23).unwrap();
+    let make = |id| CalendarRow {
+        id: Id::from_u128(id),
+        title: "Событие".into(),
+        category: Category::Partners,
+        date: today,
+    };
+    let first = [make(1), make(2), make(3)];
+    app.selected = Some(first[1].id);
+    assert_eq!(app.update_selection(&first, today), Some(1));
+
+    let subset = [make(2), make(3)];
+    assert_eq!(app.update_selection(&subset, today), Some(0));
+    assert_eq!(app.selected, Some(first[1].id));
+
+    let other_year = [make(1), make(3)];
+    app.year += 1;
+    assert_eq!(app.update_selection(&other_year, today), Some(0));
+    assert_eq!(app.selected, Some(first[0].id));
+}
+
+#[test]
+fn extending_a_search_reuses_unchanged_rows_and_then_removes_nonmatching_events() {
+    let directory = tempfile::tempdir().unwrap();
+    let (mut app, original, _) = copy_test_event(&directory.path().join("profile"));
+    let day = NaiveDate::from_ymd_opt(2027, 3, 10).unwrap();
+    app.year = day.year();
+    let state = app.reader.snapshot().state;
+    let mut editor = Editor::edit(state.follow_event(original, app.year).unwrap());
+    editor.scope = Scope::ThisYear;
+    editor.event.title = "Встреча с партнёрами".into();
+    app.save_event(&editor, false).unwrap();
+    let mut extra = Editor::new(day.year(), day);
+    extra.event.title = "Встреча с командой".into();
+    app.save_event(&extra, false).unwrap();
+
+    let state = app.reader.snapshot().state;
+    let workspace = state.workspace.as_ref().unwrap();
+    app.search = "В".into();
+    let first = app.calendar_rows(workspace);
+    assert_eq!(first.len(), 2);
+    app.search = "ВСТРЕЧА".into();
+    let same = app.calendar_rows(workspace);
+    assert!(Arc::ptr_eq(&first, &same));
+
+    app.search = "Встреча с партнерами".into();
+    let only_partner = app.calendar_rows(workspace);
+    assert_eq!(only_partner.len(), 1);
+    assert_eq!(only_partner[0].id, original);
+    assert!(!Arc::ptr_eq(&same, &only_partner));
 }

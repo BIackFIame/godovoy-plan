@@ -16,6 +16,9 @@ ROOT = Path(__file__).resolve().parents[2]
 DOCS = ("SERVER.md", "ONLINE.md", "ONLINE-API.md", "API.md", "openapi.yaml", "DATA-PROTECTION.md", "MCP.md")
 LINUX_EXAMPLES = ("godovoy-calendar.service", "godovoy-office", "office.env.example",
                   "godovoy-backup.service", "godovoy-backup.timer")
+QUICK_INSTALL = ("install-office", "profile", "Caddyfile", "godovoy-quick-calendar.service",
+                 "godovoy-quick-tls.service", "godovoy-quick-backup.service",
+                 "godovoy-quick-backup.timer")
 PLATFORMS = {
     "linux-x64": ("Linux-x64", ["x86_64-unknown-linux-musl"]),
     "linux-arm64": ("Linux-ARM64", ["aarch64-unknown-linux-musl"]),
@@ -91,6 +94,10 @@ def main():
             for filename in LINUX_EXAMPLES:
                 path = Path("packaging/server") / filename
                 entries.append((path.as_posix(), ROOT/path, 0o755 if filename == "godovoy-office" else 0o644))
+            for filename in QUICK_INSTALL:
+                path = Path("packaging/server/quick") / filename
+                entries.append((path.as_posix(), ROOT / path,
+                                0o755 if filename in {"install-office", "profile"} else 0o644))
         # Publish only a complete archive, including when two builds share the output directory.
         with tempfile.TemporaryDirectory(dir=output.parent) as pending:
             staged = Path(pending) / output.name

@@ -73,6 +73,159 @@ fn personal_tasks_follow_year_specific_owners_and_their_linked_devices() {
 }
 
 #[test]
+fn planning_filters_use_current_employee_links_for_all_views() {
+    use godovoy_plan::planning::{self, Horizon, OwnerFilter};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    let id = Id::from_u128;
+    let revision = Revision {
+        sequence: 1,
+        operation: id(100),
+    };
+    let today = date(2026, 12, 1);
+    let owners = [
+        None,
+        Some(11),
+        Some(12),
+        Some(13),
+        Some(14),
+        Some(15),
+        Some(16),
+        Some(17),
+        Some(11),
+        Some(15),
+        Some(18),
+        Some(19),
+        Some(20),
+    ];
+    // 11 enters a two-device cycle. 14 is explicitly detached, and 15 links to 16.
+    let links: BTreeMap<_, _> = [
+        (11, 12),
+        (12, 13),
+        (13, 12),
+        (14, 14),
+        (15, 16),
+        (18, 19),
+        (19, 20),
+        (20, 11),
+    ]
+    .into_iter()
+    .map(|(from, to)| (id(from), Record::new(revision, id(to))))
+    .collect();
+    let mut calendar: Calendar = serde_json::from_value(serde_json::json!({
+        "members": {}, "plans": {}, "device_people": links
+    }))
+    .unwrap();
+    for member in 11..=20 {
+        calendar.members.insert(
+            id(member),
+            Record::new(revision, format!("Сотрудник {member}")),
+        );
+    }
+    for (n, owner) in owners.iter().enumerate() {
+        let mut event = template(id(11), date(2026, 12, 20));
+        event.yearly = false;
+        event.owner = owner.map(id);
+        calendar
+            .plans
+            .entry(id(n as u128 + 1000))
+            .or_default()
+            .templates
+            .insert(2026, Record::new(revision, Some(event.into())));
+    }
+    calendar.validate().unwrap();
+    let check = |calendar: &Calendar, filter, indices: &[u128]| {
+        let expected: BTreeSet<_> = indices.iter().map(|n| id(n + 1000)).collect();
+        let events = |rows: Vec<planning::Reminder>| {
+            rows.into_iter()
+                .map(|row| row.event)
+                .collect::<BTreeSet<_>>()
+        };
+        assert_eq!(
+            events(planning::agenda(calendar, today, Horizon::Days30, filter)),
+            expected
+        );
+        assert_eq!(events(planning::overdue(calendar, today, filter)), expected);
+        if let OwnerFilter::Member(member) = filter {
+            let personal = planning::personal_events(calendar, today, member);
+            assert_eq!(
+                personal
+                    .iter()
+                    .map(|event| event.id)
+                    .collect::<BTreeSet<_>>(),
+                expected
+            );
+            assert_eq!(events(planning::due_reminders(&personal, today)), expected);
+            for event in calendar.plans.keys() {
+                for year in 2024..=2029 {
+                    let found = planning::personal_event(calendar, today, member, *event, year);
+                    assert_eq!(
+                        found.is_some(),
+                        personal.iter().any(|r| r.id == *event && r.year == year)
+                    );
+                }
+            }
+        }
+    };
+    check(
+        &calendar,
+        OwnerFilter::Everyone,
+        &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    );
+    check(&calendar, OwnerFilter::Unassigned, &[0]);
+    for member in [11, 12, 13, 18, 19, 20] {
+        check(
+            &calendar,
+            OwnerFilter::Member(id(member)),
+            &[1, 2, 3, 8, 10, 11, 12],
+        );
+    }
+    check(&calendar, OwnerFilter::Member(id(14)), &[4]);
+    for member in [15, 16] {
+        check(&calendar, OwnerFilter::Member(id(member)), &[5, 6, 9]);
+    }
+    check(&calendar, OwnerFilter::Member(id(17)), &[7]);
+
+    let updated = Revision {
+        sequence: 2,
+        ..revision
+    };
+    calendar.merge(serde_json::from_value(serde_json::json!({
+        "members": {}, "plans": {}, "device_people": {(id(11).to_string()): Record::new(updated, id(14))}
+    })).unwrap());
+    check(
+        &calendar,
+        OwnerFilter::Member(id(11)),
+        &[1, 4, 8, 10, 11, 12],
+    );
+    check(&calendar, OwnerFilter::Member(id(12)), &[2, 3]);
+
+    // A small calendar can have many linked office devices. Its results must
+    // match the same assignments without scanning the complete roster.
+    let extra_links: BTreeMap<_, _> = (30..46)
+        .map(|n| (id(n), Record::new(revision, id(n))))
+        .collect();
+    for &device in extra_links.keys() {
+        calendar
+            .members
+            .insert(device, Record::new(revision, "Коллега".into()));
+    }
+    calendar.merge(
+        serde_json::from_value(serde_json::json!({
+            "members": {}, "plans": {}, "device_people": extra_links
+        }))
+        .unwrap(),
+    );
+    calendar.validate().unwrap();
+    check(
+        &calendar,
+        OwnerFilter::Member(id(18)),
+        &[1, 4, 8, 10, 11, 12],
+    );
+    check(&calendar, OwnerFilter::Member(id(12)), &[2, 3]);
+}
+
+#[test]
 fn preparation_and_deadlines_recur_with_new_checklist() {
     let mut calendar = Calendar::default();
     let id = Id::new_v4();
@@ -264,6 +417,56 @@ fn agenda_and_reminders_follow_owners_and_cross_year_deadlines() {
     assert_eq!(reminders.len(), 2);
     assert_eq!(reminders[1].kind, Milestone::Task(task_id));
     assert_eq!(reminders[1].date, date(2026, 12, 28));
+    for mask in 0..4 {
+        for expired in [0, 64] {
+            let mut receipts: std::collections::BTreeSet<_> = reminders
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| mask & (1 << i) != 0)
+                .map(|(_, reminder)| *reminder)
+                .collect();
+            for n in 0..expired {
+                receipts.insert(planning::Reminder {
+                    event: Id::from_u128(n),
+                    year: 2025,
+                    ..reminders[0]
+                });
+            }
+            let unread: Vec<_> = reminders
+                .iter()
+                .copied()
+                .filter(|r| !receipts.contains(r))
+                .collect();
+            assert_eq!(
+                planning::unread_reminders(&events, tomorrow, &receipts),
+                unread
+            );
+            assert_eq!(
+                planning::unread_reminder_count(&events, tomorrow, &receipts),
+                unread.len()
+            );
+            for (offset, limit) in [
+                (0, 0),
+                (0, 1),
+                (1, 1),
+                (0, 64),
+                (513, 64),
+                (usize::MAX, 1),
+                (1, usize::MAX),
+            ] {
+                let page = unread
+                    .iter()
+                    .copied()
+                    .skip(offset)
+                    .take(limit)
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    planning::unread_reminder_page(&events, tomorrow, &receipts, offset, limit),
+                    page
+                );
+            }
+        }
+    }
 }
 
 #[test]
@@ -700,4 +903,63 @@ fn checklist_validation_respects_size_and_unique_ids_in_any_order() {
     event.tasks.pop();
     event.tasks[0].id = event.tasks[MAX_TASKS - 1].id;
     assert!(event.validate().is_err());
+}
+
+#[test]
+fn reminder_pages_match_full_order_across_heap_and_deep_page_boundaries() {
+    use godovoy_plan::planning;
+    let owner = Id::from_u128(17);
+    let today = date(2026, 7, 1);
+    let mut calendar = Calendar::default();
+    for i in 0..500 {
+        let id = Id::from_u128(i + 1000);
+        let day = date(2026, 7, 1 + (19 * i % 20) as u32);
+        let revision = Revision {
+            sequence: 1,
+            operation: id,
+        };
+        calendar.plans.entry(id).or_default().templates.insert(
+            2026,
+            Record::new(revision, Some(template(owner, day).into())),
+        );
+    }
+    let events = planning::personal_events(&calendar, today, owner);
+    let all = planning::due_reminders(&events, today);
+    for receipts in [
+        std::collections::BTreeSet::new(),
+        all.iter().copied().step_by(4).collect(),
+    ] {
+        let expected: Vec<_> = all
+            .iter()
+            .copied()
+            .filter(|r| !receipts.contains(r))
+            .collect();
+        assert!(expected.len() > 1024);
+        for offset in [
+            0,
+            1,
+            64,
+            447,
+            448,
+            449,
+            511,
+            512,
+            513,
+            1024,
+            expected.len() - 1,
+            expected.len(),
+            usize::MAX,
+        ] {
+            for limit in [0, 1, 10, 64] {
+                let end = offset.saturating_add(limit).min(expected.len());
+                let start = offset.min(end);
+                assert_eq!(
+                    planning::unread_reminder_page(&events, today, &receipts, offset, limit),
+                    &expected[start..end],
+                    "offset={offset}, limit={limit}, receipts={}",
+                    receipts.len(),
+                );
+            }
+        }
+    }
 }

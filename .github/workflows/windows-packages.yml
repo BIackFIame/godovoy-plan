@@ -3,9 +3,13 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Тег опубликованного выпуска
+        description: Тег выпуска
         required: true
-        default: v0.6.6
+        default: v0.7.0
+      draft_id:
+        description: Идентификатор черновика для проверки перед публикацией
+        required: false
+        type: string
       architecture:
         description: Архитектура пакета
         type: choice
@@ -14,6 +18,8 @@ on:
 permissions: {}
 jobs:
   smoke:
+    permissions:
+      contents: write
     strategy:
       fail-fast: false
       matrix:
@@ -36,7 +42,20 @@ jobs:
         env:
           PACKAGE_ARCH: ${{ matrix.arch }}
         run: ./packaging/windows/test-renderer.ps1 -Arch $env:PACKAGE_ARCH
-      - name: Проверить опубликованный пакет на Windows
+      - name: Скачать архивы зафиксированного черновика
+        if: ${{ inputs.draft_id != '' }}
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          RELEASE_DRAFT_ID: ${{ inputs.draft_id }}
+          PACKAGE_ARCH: ${{ matrix.arch }}
+        run: |
+          $assetDir = Join-Path $env:RUNNER_TEMP windows-packages
+          python packaging/windows/smoke.py --fetch-draft $assetDir
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+          "RELEASE_ASSET_DIR=$assetDir" >> $env:GITHUB_ENV
+      - name: Проверить пакет на Windows
         shell: pwsh
         env:
           RELEASE_TAG: ${{ inputs.tag }}

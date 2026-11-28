@@ -44,10 +44,8 @@ pub(super) fn private_file(path: &Path) -> Fallible<File> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
-        if _metadata.nlink() != 1
-            || _metadata.mode() & 0o077 != 0
-            || _metadata.uid() != rustix::process::geteuid().as_raw()
-        {
+        // open_regular already checked the owner and link count on this handle.
+        if _metadata.mode() & 0o077 != 0 {
             return Err("Файл должен быть закрытым, принадлежать текущему пользователю и не иметь других ссылок.".into());
         }
     }
@@ -234,7 +232,7 @@ fn read_manifest(backup: &Path) -> Fallible<Manifest> {
     if file.metadata()?.len() > MANIFEST_LIMIT as u64 {
         return Err("Слишком большой манифест.".into());
     }
-    let manifest: Manifest = serde_json::from_reader(file.take(MANIFEST_LIMIT as u64 + 1))?;
+    let manifest: Manifest = super::read_bounded_json(file, MANIFEST_LIMIT)?;
     if manifest.version != 1
         || !manifest.files.contains_key(ACCESS)
         || !manifest.files.contains_key(DATA)
@@ -289,7 +287,7 @@ fn reconstruct(backup: &Path, out: &Path) -> Fallible<Manifest> {
     let vault = OnlineVault::open(out)?;
     let lock = vault.lock()?;
     lock.operator_record()?;
-    lock.data()?.calendar.validate()?;
+    lock.data()?;
     lock.standby_window()?;
     Ok(manifest)
 }

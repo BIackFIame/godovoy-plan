@@ -1,8 +1,11 @@
 //! Stateless MCP over Streamable HTTP. Authentication and the calendar transaction
 //! share the same vault lock; the client never selects the acting employee.
 use super::{
-    Host, Mode, actions, prepare_command, standby_unavailable, unavailable, with_mcp_auth,
+    CommandRejection, EntryPoint, Host, Mode, actions,
+    conditional::{Views, WriteInput},
+    prepare_command, standby_unavailable, unavailable, watch, with_mcp_auth,
 };
+use crate::http::is_json_content_type;
 use axum::{
     Json,
     body::Bytes,
@@ -12,8 +15,8 @@ use axum::{
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use godovoy_plan::{
-    model::Id,
-    storage::online::{Access, LockedVault},
+    model::{Id, Occurrence},
+    storage::online::{Access, Data, LockedVault},
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -41,6 +44,10 @@ struct Reply<'a> {
 
 const NO_ACCESS: &str = "Событие недоступно.";
 const INVALID_ARGUMENTS: &str = "Проверьте параметры инструмента.";
+const LIST_LIMIT_MIN: usize = 1;
+const LIST_LIMIT_MAX: usize = 100;
+const LIST_LIMIT_DEFAULT: usize = 25;
+const NOTE_MAX_CHARS: usize = 4000;
 
 fn success(reply: Reply<'_>, mut result: Value) -> Response {
     if reply.era == Era::Current {
@@ -91,15 +98,19 @@ fn tool(
 }
 
 fn tools(can_edit: bool, free_text: bool) -> Value {
-    let year = json!({"type":"integer","minimum":1900,"maximum":9999});
+    let year = json!({
+        "type":"integer",
+        "minimum":actions::MIN_CALENDAR_YEAR,
+        "maximum":actions::MAX_CALENDAR_YEAR
+    });
     let uuid = json!({"type":"string","format":"uuid"});
-    let note = json!({"type":"string","maxLength":4000});
+    let note = json!({"type":"string","maxLength":NOTE_MAX_CHARS});
     let mut list = vec![
         tool(
             "list_my_events",
             "Показать назначенные мне события за год по датам.",
             json!({"year":year,"offset":{"type":"integer","minimum":0,"default":0},
-                "limit":{"type":"integer","minimum":1,"maximum":100,"default":25}}),
+                "limit":{"type":"integer","minimum":LIST_LIMIT_MIN,"maximum":LIST_LIMIT_MAX,"default":LIST_LIMIT_DEFAULT}}),
             &["year"],
             true,
         ),
@@ -161,20 +172,22 @@ enum Call {
     },
 }
 fn default_limit() -> usize {
-    25
+    LIST_LIMIT_DEFAULT
 }
 
 impl Call {
     fn valid(&self) -> bool {
         let year = match self {
-            Self::ListMyEvents { year, limit, .. } if (1..=100).contains(limit) => year,
+            Self::ListMyEvents { year, limit, .. }
+                if (LIST_LIMIT_MIN..=LIST_LIMIT_MAX).contains(limit) => year,
             Self::GetMyEvent { year, .. } | Self::SetMyTaskDone { year, .. } => year,
             Self::SetMyNote {
                 year, base, text, ..
-            } if base.chars().count() <= 4000 && text.chars().count() <= 4000 => year,
+            } if base.chars().count() <= NOTE_MAX_CHARS
+                && text.chars().count() <= NOTE_MAX_CHARS => year,
             _ => return false,
         };
-        (1900..=9999).contains(year)
+        actions::valid_year(*year)
     }
 }
 
@@ -185,6 +198,9 @@ struct Context<'a, 'v> {
     employee: Id,
     can_edit: bool,
     mode: &'a Mode,
+    entry: EntryPoint,
+    watches: &'a std::sync::Mutex<watch::Watches>,
+    views: &'a Views,
 }
 impl Context<'_, '_> {
     fn audit(&self, action: &'static str, event: Option<Id>) -> bool {
@@ -192,6 +208,27 @@ impl Context<'_, '_> {
             .audit_security(action, Some(self.credential), Some(self.employee), event)
             .is_ok()
     }
+    fn read(&self, query: super::large_reads::Query, action: impl FnOnce(&Data) -> Response) -> Response {
+        self.lock
+            .open_data()
+            .and_then(|file| self.views.read_mcp(file, query, action))
+            .unwrap_or_else(|_| unavailable())
+    }
+
+    fn assigned_event<'a>(&self, data: &'a Data, event: Id, year: i32) -> Option<Occurrence<'a>> {
+        data.calendar
+            .event(event, year)
+            .filter(|occurrence| actions::assigned_to(data, *occurrence, self.employee))
+    }
+
+    fn denied_event(&self, id: Reply<'_>) -> Response {
+        if self.audit("employee_scope_denied", None) {
+            tool_error(id, NO_ACCESS)
+        } else {
+            unavailable()
+        }
+    }
+
     fn call(&self, id: Reply<'_>, call: Call) -> Response {
         let free_text = self.acl.protection().settings.free_text_allowed();
         if matches!(call, Call::SetMyNote { .. } | Call::SetMyTaskDone { .. }) && !self.can_edit {
@@ -208,79 +245,96 @@ impl Context<'_, '_> {
                 unavailable()
             };
         }
-        let Ok(mut data) = self.lock.data() else {
-            return unavailable();
-        };
-        let (event_id, year) = match &call {
+        let (event_id, year, command) = match call {
             Call::ListMyEvents {
                 year,
                 offset,
                 limit,
             } => {
-                if !self.audit("mcp_list_my_events_requested", None) {
-                    return unavailable();
-                }
-                let mut assigned: Vec<_> = data
-                    .calendar
-                    .occurrences(*year)
-                    .filter(|e| actions::assigned_to(&data, *e, self.employee))
-                    .collect();
-                assigned.sort_unstable_by_key(|e| (e.date, e.id));
-                let mut own = assigned.into_iter().skip(*offset);
-                let events: Vec<_> = own
-                    .by_ref()
-                    .take(*limit)
-                    .map(|e| {
-                        json!({
-                            "id":e.id, "title":e.event.title, "year":e.year,
-                            "date":e.date, "category":e.event.category,
-                            "preparationDate":e.preparation_date()
+                return self.read(super::large_reads::Query::List { employee:self.employee, year, offset, limit }, |data| {
+                    if !self.audit("mcp_list_my_events_requested", None) {
+                        return unavailable();
+                    }
+                    let assigned = super::large_reads::assigned(data, self.employee, year);
+                    let mut own = assigned.into_iter().skip(offset);
+                    let events: Vec<_> = own
+                        .by_ref()
+                        .take(limit)
+                        .map(|e| {
+                            json!({
+                                "id":e.id, "title":e.event.title, "year":e.year,
+                                "date":e.date, "category":e.event.category,
+                                "preparationDate":e.preparation_date()
+                            })
                         })
-                    })
-                    .collect();
-                let next_offset = own.next().map(|_| offset.saturating_add(events.len()));
-                return self.read_result(id, json!({"events":events,"nextOffset":next_offset}));
+                        .collect();
+                    let next_offset = own.next().map(|_| offset.saturating_add(events.len()));
+                    self.read_result(id, json!({"events":events,"nextOffset":next_offset}))
+                });
             }
-            Call::GetMyEvent { event_id, year }
-            | Call::SetMyNote { event_id, year, .. }
-            | Call::SetMyTaskDone { event_id, year, .. } => (*event_id, *year),
-        };
-        let Some(event) = data
-            .calendar
-            .event(event_id, year)
-            .filter(|e| actions::assigned_to(&data, *e, self.employee))
-        else {
-            return if self.audit("employee_scope_denied", None) {
-                tool_error(id, NO_ACCESS)
-            } else {
-                unavailable()
-            };
-        };
-        let command = match call {
-            Call::GetMyEvent { .. } => {
-                if !self.audit("mcp_get_my_event_requested", Some(event_id)) {
-                    return unavailable();
-                }
-                return match serde_json::to_value(actions::occurrence(&data, event, free_text)) {
-                    Ok(detail) => self.read_result(id, detail),
-                    Err(_) => unavailable(),
-                };
+            Call::GetMyEvent { event_id, year } => {
+                return self.read(super::large_reads::Query::Get { employee:self.employee, event:event_id, year }, |data| {
+                    let Some(event) = self.assigned_event(data, event_id, year) else {
+                        return self.denied_event(id);
+                    };
+                    if !self.audit("mcp_get_my_event_requested", Some(event_id)) {
+                        return unavailable();
+                    }
+                    match serde_json::to_value(actions::occurrence(data, event, free_text)) {
+                        Ok(detail) => self.read_result(id, detail),
+                        Err(_) => unavailable(),
+                    }
+                });
             }
-            Call::SetMyTaskDone { task_id, done, .. } => actions::Command::Check {
+            Call::SetMyTaskDone {
                 event_id,
                 year,
                 task_id,
                 done,
-            },
-            Call::SetMyNote { base, text, .. } => actions::Command::Note {
+            } => (
+                event_id,
+                year,
+                actions::Command::Check {
+                    event_id,
+                    year,
+                    task_id,
+                    done,
+                    only_if_assigned: true,
+                },
+            ),
+            Call::SetMyNote {
                 event_id,
                 year,
                 base,
                 text,
-            },
-            Call::ListMyEvents { .. } => unreachable!(),
+            } => (
+                event_id,
+                year,
+                actions::Command::Note {
+                    event_id,
+                    year,
+                    base,
+                    text,
+                },
+            ),
         };
-        let rejection = prepare_command(
+        let Ok(WriteInput {
+            calendar: mut data,
+            original,
+            ..
+        }) = self
+            .lock
+            .open_data()
+            .and_then(|file| self.views.data_for_write(file, false))
+        else {
+            return unavailable();
+        };
+        if self.assigned_event(&data, event_id, year).is_none() {
+            self.views.restore_after_failure(original);
+            return self.denied_event(id);
+        }
+        let change = watch::edit(&command, &data);
+        let Err(rejection) = prepare_command(
             self.lock,
             self.acl,
             self.credential,
@@ -288,20 +342,26 @@ impl Context<'_, '_> {
             self.mode,
             command,
             &mut data,
-        );
-        let response = match rejection {
-            None if self.lock.save_data(&data).is_ok() => StatusCode::NO_CONTENT.into_response(),
-            None => unavailable(),
-            Some(response) => response,
+        ) else {
+            let notify = |data: &Data| {
+                watch::committed(self.watches, data, self.acl, self.entry, change);
+            };
+            return match self.views.commit_without_receipt(self.lock, data, original, notify) {
+                Ok(()) => result(id, json!({"saved":true})),
+                Err(_) => unavailable(),
+            };
         };
-        match response.status() {
-            StatusCode::NO_CONTENT => result(id, json!({"saved":true})),
-            StatusCode::CONFLICT => {
+        self.views.restore_after_failure(original);
+        match rejection {
+            CommandRejection::Conflict(_) => {
                 tool_error(id, "Событие изменилось. Перечитайте его перед сохранением.")
             }
-            StatusCode::UNPROCESSABLE_ENTITY => tool_error(id, INVALID_ARGUMENTS),
-            StatusCode::FORBIDDEN => tool_error(id, NO_ACCESS),
-            _ => response,
+            CommandRejection::Invalid(_) => tool_error(id, INVALID_ARGUMENTS),
+            CommandRejection::FreeTextDisabled | CommandRejection::OutsideAssignment => {
+                tool_error(id, NO_ACCESS)
+            }
+            CommandRejection::Unavailable => unavailable(),
+            CommandRejection::StandbyUnavailable => standby_unavailable(),
         }
     }
     fn read_result(&self, id: Reply<'_>, value: Value) -> Response {
@@ -344,12 +404,7 @@ pub(super) async fn handle(
         return StatusCode::BAD_REQUEST.into_response();
     }
 
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(';').next())
-        .is_none_or(|s| !s.trim().eq_ignore_ascii_case("application/json"))
-    {
+    if !is_json_content_type(&headers) {
         return StatusCode::UNSUPPORTED_MEDIA_TYPE.into_response();
     }
     if !accepts(&headers, "application/json") || !accepts(&headers, "text/event-stream") {
@@ -362,6 +417,9 @@ pub(super) async fn handle(
             mirrors.append(name, value.clone());
         }
     }
+    let watches = host.watches.clone();
+    let entry = host.entry;
+    let views = host.views.clone();
     with_mcp_auth(
         host,
         headers,
@@ -374,6 +432,9 @@ pub(super) async fn handle(
                 employee,
                 can_edit,
                 mode,
+                watches: &watches,
+                entry,
+                views: &views,
             };
             dispatch(&ctx, &body, &mirrors)
         },
@@ -608,6 +669,7 @@ mod tests {
         for args in [
             json!({"year":"2027"}),
             json!({"year":1899}),
+            json!({"year":10000}),
             json!({"year":2027,"employeeId":Id::new_v4()}),
             json!({"year":2027,"limit":0}),
             json!({"year":2027,"limit":101}),
@@ -621,6 +683,48 @@ mod tests {
         )
         .unwrap();
         assert!(c.valid());
+    }
+
+    #[test]
+    fn schema_and_runtime_share_numeric_limits() {
+        let schema = tools(true, true);
+        let year = &schema["tools"][0]["inputSchema"]["properties"]["year"];
+        assert_eq!(year["minimum"], json!(actions::MIN_CALENDAR_YEAR));
+        assert_eq!(year["maximum"], json!(actions::MAX_CALENDAR_YEAR));
+        let list_limit = &schema["tools"][0]["inputSchema"]["properties"]["limit"];
+        assert_eq!(list_limit["minimum"], json!(LIST_LIMIT_MIN));
+        assert_eq!(list_limit["maximum"], json!(LIST_LIMIT_MAX));
+        assert_eq!(list_limit["default"], json!(LIST_LIMIT_DEFAULT));
+        let note = &schema["tools"][3]["inputSchema"]["properties"]["text"];
+        assert_eq!(note["maxLength"], json!(NOTE_MAX_CHARS));
+
+        for (year, limit, expected) in [
+            (1900, LIST_LIMIT_MIN, true),
+            (9999, LIST_LIMIT_MAX, true),
+            (1899, LIST_LIMIT_MIN, false),
+            (10000, LIST_LIMIT_MIN, false),
+            (2027, 0, false),
+            (2027, LIST_LIMIT_MAX + 1, false),
+        ] {
+            let call = serde_json::from_value::<Call>(json!({
+                "name":"list_my_events",
+                "arguments":{"year":year,"limit":limit}
+            }))
+            .unwrap();
+            assert_eq!(call.valid(), expected);
+        }
+
+        let text = "я".repeat(NOTE_MAX_CHARS);
+        let note_call = |base: String, text: String| {
+            serde_json::from_value::<Call>(json!({
+                "name":"set_my_note",
+                "arguments":{"eventId":Id::new_v4(),"year":2027,"base":base,"text":text}
+            }))
+            .unwrap()
+        };
+        assert!(note_call(text.clone(), text.clone()).valid());
+        assert!(!note_call(format!("{text}я"), String::new()).valid());
+        assert!(!note_call(String::new(), format!("{text}я")).valid());
     }
     #[test]
     fn accept_header_supports_separate_values_and_rejects_disabled_media_type() {

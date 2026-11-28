@@ -10,8 +10,6 @@ use godovoy_plan::{
     storage::{ApiSettings, SharedStore, random_bytes},
 };
 
-use super::App;
-
 #[derive(Clone, Copy)]
 pub(super) enum Action {
     StartSaved,
@@ -57,6 +55,14 @@ pub(super) struct ApiControls {
 }
 
 impl ApiControls {
+    pub(super) fn busy(&self) -> bool {
+        self.job.is_some()
+    }
+
+    pub(super) fn failed(&self) -> bool {
+        self.failed
+    }
+
     pub(super) fn new(store: &SharedStore, settings: Option<&ApiSettings>) -> Self {
         let mut controls = Self {
             server: None,
@@ -125,7 +131,7 @@ impl ApiControls {
         self.job = Some(Job { action, completed });
     }
 
-    fn poll(&mut self) {
+    pub(super) fn poll(&mut self) {
         let Some(job) = &self.job else { return };
         let action = job.action;
         let response = match job.completed.try_recv() {
@@ -222,34 +228,6 @@ fn rotate_tokens(store: &SharedStore) -> Fallible<()> {
         settings.import_token = Some(random_bytes()?);
         Ok(())
     })
-}
-
-impl App {
-    pub fn poll_api_controls(&mut self) {
-        self.api_controls.poll();
-    }
-
-    pub fn api_controls_busy(&self) -> bool {
-        self.api_controls.job.is_some()
-    }
-
-    pub fn api_controls_failed(&self) -> bool {
-        self.api_controls.failed
-    }
-
-    // True means exit must wait for this job or handle its start failure.
-    // The saved state stays enabled so the next launch restores the listener.
-    pub fn close_api_listener(&mut self, context: &egui::Context) -> bool {
-        if self.api_controls_busy() {
-            return true;
-        }
-        if self.api_controls.running_port().is_none() {
-            return false;
-        }
-        self.api_controls
-            .start(&self.store, Action::CloseListener, Some(context));
-        true
-    }
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
                 .hint_text("Например, новогодние поздравления")
                 .margin(theme::field_margin(ui))
                 .desired_width(f32::INFINITY)
-                .char_limit(160),
+                .char_limit(MAX_TITLE_CHARS),
         )
         .labelled_by(name.id);
     if std::mem::take(&mut editor.focus_title) {
@@ -103,7 +103,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
             ui.label("Начало подготовки")
                 .on_hover_text("С этого дня чек-лист появляется у ответственного");
             if let Some(date) = event_date {
-                let earliest = date - Days::new(366);
+                let earliest = date - Days::new(u64::from(MAX_PREPARATION_DAYS));
                 let task_offset = editor
                     .event
                     .tasks
@@ -131,7 +131,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
         ui.add(
             TextEdit::multiline(&mut editor.event.description)
                 .margin(Margin::same(8))
-                .char_limit(4000)
+                .char_limit(MAX_DESCRIPTION_CHARS)
                 .desired_rows(3)
                 .desired_width(f32::INFINITY),
         );
@@ -153,7 +153,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
                         .hint_text("Что нужно сделать")
                         .margin(theme::field_margin(ui))
                         .desired_width((ui.available_width() - 218.0).max(120.0))
-                        .char_limit(160),
+                        .char_limit(MAX_TITLE_CHARS),
                 );
                 if focus_last && index == last {
                     input.request_focus();
@@ -161,7 +161,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
                 }
                 if let Some(date) = event_date {
                     let due = date - Days::new(task.days_before.into());
-                    let earliest = date - Days::new(366);
+                    let earliest = date - Days::new(u64::from(MAX_PREPARATION_DAYS));
                     if let Some(chosen) = date_picker(
                         ui,
                         &format!("До {}", deadline_label(due, date)),
@@ -199,5 +199,7 @@ pub(super) fn editor_fields(ui: &mut Ui, editor: &mut Editor, workspace: &Worksp
 }
 
 pub(super) fn days_before(event: NaiveDate, selected: NaiveDate) -> u16 {
-    (event - selected).num_days().clamp(0, 366) as u16
+    (event - selected)
+        .num_days()
+        .clamp(0, i64::from(MAX_PREPARATION_DAYS)) as u16
 }

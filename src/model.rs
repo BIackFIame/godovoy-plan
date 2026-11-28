@@ -141,7 +141,7 @@ impl Plan {
             .map(|(&year, record)| (year, record))
     }
 
-    #[cfg(feature = "desktop")]
+    #[cfg(feature = "local-api")]
     pub(crate) fn import_template(&self) -> Option<(i32, &Event)> {
         if let Some((year, record)) = self.single_placement() {
             return record.value.as_deref().map(|event| (year, event));
@@ -323,7 +323,8 @@ impl Calendar {
     /// association when a device is explicitly detached.
     pub fn person_for(&self, id: Id) -> Id {
         let mut current = id;
-        for _ in 0..=self.device_people.len() {
+        let mut checkpoint = id;
+        for hop in 0..=self.device_people.len() {
             let Some(link) = self.device_people.get(&current) else {
                 return current;
             };
@@ -331,6 +332,14 @@ impl Calendar {
                 return current;
             }
             current = link.value;
+            // Reaching the same checkpoint twice proves we are inside a cycle.
+            // Increasing intervals find short cycles without walking the whole roster.
+            if current == checkpoint {
+                break;
+            }
+            if hop.is_power_of_two() {
+                checkpoint = current;
+            }
         }
         // Offline peers can concurrently link A to B and B to A. All replicas
         // pick the smallest ID in that cycle; incoming paths are not part of it.
@@ -383,8 +392,19 @@ impl Calendar {
     pub fn merge(&mut self, incoming: Self) {
         merge_map(&mut self.members, incoming.members);
         merge_map(&mut self.device_people, incoming.device_people);
-        for (id, plan) in incoming.plans {
-            self.plans.entry(id).or_default().merge(plan);
+        // A new replica can keep the validated plans and their history intact.
+        if self.plans.is_empty() {
+            self.plans = incoming.plans;
+        } else {
+            use std::collections::btree_map::Entry;
+            for (id, plan) in incoming.plans {
+                match self.plans.entry(id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(plan);
+                    }
+                    Entry::Occupied(mut slot) => slot.get_mut().merge(plan),
+                }
+            }
         }
     }
 
@@ -433,15 +453,52 @@ pub const MAX_PLANS: usize = 2000;
 pub const PLAN_LIMIT_ERROR: &str =
     "Достигнут лимит записей календаря. В него входит история удалений.";
 pub const MAX_TASKS: usize = 100;
+pub const MAX_TITLE_CHARS: usize = 160;
+pub const MAX_DESCRIPTION_CHARS: usize = 4000;
+pub const MAX_NOTE_CHARS: usize = 4000;
+pub const MAX_PREPARATION_DAYS: u16 = 366;
+
+// A UTF-8 scalar takes one to four bytes. Ordinary short fields need no scan.
+fn exceeds_char_limit(text: &str, limit: usize) -> bool {
+    text.len() > limit && (text.len() > limit.saturating_mul(4) || text.chars().count() > limit)
+}
+
+fn distinct_task_ids(tasks: &[Task]) -> bool {
+    // Most practical checklists have few collisions in the last UUID byte.
+    // Keep uncommon or deliberately clustered IDs on the bounded sort path.
+    const { assert!(MAX_TASKS <= u8::MAX as usize) };
+    let mut buckets = [0_u8; 256];
+    'next: for (i, task) in tasks.iter().enumerate() {
+        let start = task.id.as_bytes()[15];
+        for distance in 0..4 {
+            let slot = &mut buckets[usize::from(start.wrapping_add(distance))];
+            if *slot == 0 {
+                *slot = (i + 1) as u8;
+                continue 'next;
+            }
+            if tasks[usize::from(*slot) - 1].id == task.id {
+                return false;
+            }
+        }
+        let mut ids = [Id::nil(); MAX_TASKS];
+        let used = &mut ids[..tasks.len()];
+        for (id, item) in used.iter_mut().zip(tasks) {
+            *id = item.id;
+        }
+        used.sort_unstable();
+        return !used.windows(2).any(|pair| pair[0] == pair[1]);
+    }
+    true
+}
 
 impl Event {
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.title.trim().is_empty() || self.title.chars().count() > 160 {
+        if self.title.trim_start().is_empty() || exceeds_char_limit(&self.title, MAX_TITLE_CHARS) {
             return Err("Название события должно содержать от 1 до 160 символов.");
         }
         if !(1900..=9999).contains(&self.date.year())
-            || self.description.chars().count() > 4000
-            || self.preparation_days > 366
+            || exceeds_char_limit(&self.description, MAX_DESCRIPTION_CHARS)
+            || self.preparation_days > MAX_PREPARATION_DAYS
             || self.tasks.len() > MAX_TASKS
         {
             return Err(
@@ -452,19 +509,15 @@ impl Event {
             return Ok(());
         }
         const INVALID_TASK: &str = "Проверьте названия, сроки и идентификаторы пунктов чек-листа.";
-        let mut ids = [Id::nil(); MAX_TASKS];
-        let used = &mut ids[..self.tasks.len()];
-        for (id, task) in used.iter_mut().zip(&self.tasks) {
-            if task.title.trim().is_empty()
-                || task.title.chars().count() > 160
+        for task in &self.tasks {
+            if task.title.trim_start().is_empty()
+                || exceeds_char_limit(&task.title, MAX_TITLE_CHARS)
                 || task.days_before > self.preparation_days
             {
                 return Err(INVALID_TASK);
             }
-            *id = task.id;
         }
-        used.sort_unstable();
-        if used.windows(2).any(|pair| pair[0] == pair[1]) {
+        if !distinct_task_ids(&self.tasks) {
             return Err(INVALID_TASK);
         }
         Ok(())
@@ -480,7 +533,7 @@ impl Calendar {
             || self
                 .members
                 .values()
-                .any(|m| m.value.trim().is_empty() || m.value.chars().count() > 80)
+                .any(|m| m.value.trim_start().is_empty() || exceeds_char_limit(&m.value, 80))
         {
             return Err("Превышено ограничение числа участников или длины имени.");
         }
@@ -516,7 +569,7 @@ impl Calendar {
                     || year
                         .note
                         .as_ref()
-                        .is_some_and(|note| note.value.chars().count() > 4000)
+                        .is_some_and(|note| exceeds_char_limit(&note.value, MAX_NOTE_CHARS))
                 {
                     return Err("Превышены ограничения чек-листа или дневника.");
                 }
@@ -534,8 +587,79 @@ impl Calendar {
 }
 
 #[cfg(test)]
-mod employee_tests {
+mod tests {
     use super::*;
+
+    #[test]
+    fn checklist_id_validation_catches_duplicates_with_clustered_and_distinct_uuids() {
+        for len in [0, 1, 2, 4, 5, 8, 40, MAX_TASKS] {
+            for mask in [0_u128, 3, 15, 255] {
+                let tasks: Vec<_> = (0..len)
+                    .map(|i| Task {
+                        id: Id::from_u128(((i as u128) << 32) | ((i as u128 * 47) & mask)),
+                        title: "Согласовать".into(),
+                        days_before: 0,
+                    })
+                    .collect();
+                assert!(distinct_task_ids(&tasks));
+                let mut changed = tasks.clone();
+                for i in 1..len {
+                    for previous in &tasks[..i] {
+                        changed[i].id = previous.id;
+                        assert!(!distinct_task_ids(&changed));
+                    }
+                    changed[i].id = tasks[i].id;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn utf8_character_limits_preserve_scalar_count_boundaries() {
+        for limit in [0_usize, 1, 80, MAX_TITLE_CHARS, MAX_DESCRIPTION_CHARS] {
+            for unit in ["a", "Я", "年", "🙂", "е\u{301}", " a🙂"] {
+                for n in [limit.saturating_sub(1), limit, limit + 1] {
+                    let text = unit.repeat(n);
+                    assert_eq!(
+                        exceeds_char_limit(&text, limit),
+                        text.chars().count() > limit
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn employee_resolution_matches_all_five_device_link_graphs() {
+        let ids: Vec<_> = (1..=5).map(Id::from_u128).collect();
+        // Each device has six choices: no link, itself, or one of four others.
+        for mut choices in 0..6_usize.pow(5) {
+            let mut calendar = Calendar::default();
+            for &id in &ids {
+                let target = choices % 6;
+                choices /= 6;
+                if target > 0 {
+                    let revision = Revision { sequence: 1, operation: id };
+                    calendar.device_people.insert(id, Record::new(revision, ids[target - 1]));
+                }
+            }
+            for &start in &ids {
+                let mut visited = Vec::new();
+                let mut current = start;
+                let expected = loop {
+                    if let Some(first) = visited.iter().position(|&id| id == current) {
+                        break *visited[first..].iter().min().unwrap();
+                    }
+                    visited.push(current);
+                    match calendar.device_people.get(&current) {
+                        Some(link) => current = link.value,
+                        None => break current,
+                    }
+                };
+                assert_eq!(calendar.person_for(start), expected);
+            }
+        }
+    }
 
     #[test]
     fn reciprocal_offline_links_converge_and_detach_wins_over_stale_or_legacy_snapshots() {

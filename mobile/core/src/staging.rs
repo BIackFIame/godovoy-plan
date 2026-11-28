@@ -4,6 +4,8 @@ use std::{
     path::{Path, PathBuf},
 };
 
+pub(crate) const MAX_EXCHANGE_BYTES: u64 = 9 * 1024 * 1024;
+
 pub(super) fn directory(initial: &Path) -> Fallible<PathBuf> {
     let p = initial.join("exchange");
     let meta = fs::symlink_metadata(&p)?;
@@ -61,7 +63,7 @@ pub(super) fn input_path(initial: &Path, path: &Path) -> Fallible<PathBuf> {
     }
     let path = dir.join(path.file_name().ok_or("Выберите файл .yrplan.")?);
     let m = fs::symlink_metadata(&path)?;
-    if !m.is_file() || m.len() > 9 * 1024 * 1024 {
+    if !m.is_file() || m.len() > MAX_EXCHANGE_BYTES {
         return Err("Нужен обычный файл .yrplan размером до 9 МиБ.".into());
     }
     #[cfg(unix)]
@@ -72,4 +74,26 @@ pub(super) fn input_path(initial: &Path, path: &Path) -> Fallible<PathBuf> {
         }
     }
     Ok(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs::{self, File};
+
+    #[test]
+    fn accepts_exact_exchange_limit_and_rejects_one_more_byte() {
+        let temp = tempfile::tempdir().unwrap();
+        let initial = temp.path().join("phone");
+        fs::create_dir(&initial).unwrap();
+        prepare(&initial).unwrap();
+        let file = initial
+            .join("exchange")
+            .join(format!("{}.yrplan", Id::new_v4()));
+        let handle = File::create(&file).unwrap();
+        handle.set_len(MAX_EXCHANGE_BYTES).unwrap();
+        assert!(input_path(&initial, &file).is_ok());
+        handle.set_len(MAX_EXCHANGE_BYTES + 1).unwrap();
+        assert!(input_path(&initial, &file).is_err());
+    }
 }

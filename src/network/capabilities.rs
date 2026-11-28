@@ -6,6 +6,8 @@ pub(super) struct Capabilities(u16);
 impl Capabilities {
     pub(super) const NONE: Self = Self(0);
     pub(super) const DELTA: Self = Self(1 << 0);
+    pub(super) const MUTUAL_DELTA: Self = Self(1 << 2);
+    pub(super) const REVISION_HINT: Self = Self(1 << 3);
     pub(super) const EDIT_WAKE: Self = Self(1 << 1);
 
     pub(super) const fn union(self, other: Self) -> Self {
@@ -24,7 +26,10 @@ impl Capabilities {
     pub(super) fn negotiate(self, payload: &[u8]) -> Self {
         match payload {
             [b'G', b'P', b'-', b'C', b'A', b'P', 1, hi, lo] => {
-                let known = Self::DELTA.union(Self::EDIT_WAKE);
+                let known = Self::DELTA
+                    .union(Self::EDIT_WAKE)
+                    .union(Self::MUTUAL_DELTA)
+                    .union(Self::REVISION_HINT);
                 Self(self.0 & known.0 & u16::from_be_bytes([*hi, *lo]))
             }
             _ => Self::NONE,
@@ -40,12 +45,17 @@ mod tests {
     fn optional_features_are_intersected_independently() {
         let both = Caps::EDIT_WAKE.union(Caps::DELTA);
         assert_eq!(both.offer(), *b"GP-CAP\x01\x00\x03");
-        for local in [Caps::NONE, Caps::DELTA, Caps::EDIT_WAKE, both] {
-            for remote in [Caps::NONE, Caps::DELTA, Caps::EDIT_WAKE, both] {
+        for local in (0..16).map(Caps) {
+            for remote in (0..16).map(Caps) {
                 let agreed = local.negotiate(&remote.offer());
                 assert_eq!(agreed, remote.negotiate(&local.offer()));
                 assert_eq!(agreed, local.negotiate(&agreed.offer()));
-                for flag in [Caps::DELTA, Caps::EDIT_WAKE] {
+                for flag in [
+                    Caps::DELTA,
+                    Caps::EDIT_WAKE,
+                    Caps::MUTUAL_DELTA,
+                    Caps::REVISION_HINT,
+                ] {
                     assert_eq!(
                         agreed.contains(flag),
                         local.contains(flag) && remote.contains(flag)

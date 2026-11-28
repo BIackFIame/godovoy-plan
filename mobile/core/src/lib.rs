@@ -12,7 +12,6 @@ use godovoy_plan::{
     storage::{SharedStore, Store},
 };
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 use std::{
     collections::BTreeSet,
     io,
@@ -52,6 +51,24 @@ enum Command {
         accept_sync_stamp: bool,
         #[serde(default)]
         accept_check_patch: bool,
+        #[serde(default)]
+        accept_index_check_patch: bool,
+        #[serde(default)]
+        accept_checklist_tuples: bool,
+        #[serde(default)]
+        accept_agenda_index: bool,
+    },
+    AgendaCard {
+        base_token: Id,
+        year: i32,
+        event_year: i32,
+        event_id: Id,
+    },
+    ReminderPage {
+        base_token: Id,
+        year: i32,
+        offset: usize,
+        limit: usize,
     },
     CreateWorkspace {
         name: String,
@@ -68,7 +85,10 @@ enum Command {
         #[serde(default)]
         description: String,
     },
+    EditEvent(editor::Edit),
+    DeleteEvent(editor::Delete),
     Check {
+        view_year: Option<i32>,
         base_token: Option<Id>,
         event_id: Id,
         year: i32,
@@ -76,6 +96,8 @@ enum Command {
         done: bool,
     },
     Note {
+        view_year: Option<i32>,
+        base_token: Option<Id>,
         event_id: Id,
         year: i32,
         text: String,
@@ -260,17 +282,20 @@ impl Mobile {
             .ok_or_else(|| "Профиль недоступен.".into())
     }
 
-    fn request(&mut self, input: Value) -> Fallible<String> {
-        self.refresh()?.verify_access()?;
-        let session = self.session.as_mut().ok_or("Профиль недоступен.")?;
-        if matches!(
-            input.get("op").and_then(Value::as_str),
-            Some("editEvent" | "deleteEvent")
+    #[cfg(test)]
+    fn request(&mut self, input: serde_json::Value) -> Fallible<String> {
+        self.execute(serde_json::from_value(input).map_err(|_| "Неверные параметры запроса.")?)
+    }
+
+    fn execute(&mut self, cmd: Command) -> Fallible<String> {
+        let session = self.refresh()?;
+        if !matches!(
+            &cmd,
+            Command::State { .. } | Command::AgendaCard { .. } | Command::ReminderPage { .. }
         ) {
-            return success(editor::edit_event(&session.store, input)?);
+            session.verify_access()?;
         }
-        let cmd =
-            serde_json::from_value::<Command>(input).map_err(|_| "Неверные параметры запроса.")?;
+        let session = self.session.as_mut().ok_or("Профиль недоступен.")?;
         if matches!(
             &cmd,
             Command::PairingRequest
@@ -296,14 +321,44 @@ impl Mobile {
                 if_token,
                 accept_sync_stamp,
                 accept_check_patch,
+                accept_index_check_patch,
+                accept_checklist_tuples,
+                accept_agenda_index,
             } => {
                 return calendar::state(
                     session,
                     year,
                     if_token,
                     accept_sync_stamp,
-                    accept_check_patch,
+                    calendar::CheckPatch {
+                        full: accept_check_patch,
+                        indexed: accept_index_check_patch,
+                    },
+                    accept_checklist_tuples,
+                    accept_agenda_index,
                 );
+            }
+            Command::AgendaCard {
+                base_token,
+                year,
+                event_year,
+                event_id,
+            } => {
+                return calendar::agenda_card(session, base_token, year, event_year, event_id);
+            }
+            Command::ReminderPage {
+                base_token,
+                year,
+                offset,
+                limit,
+            } => {
+                return calendar::reminder_page(session, base_token, year, offset, limit);
+            }
+            Command::EditEvent(edit) => {
+                editor::edit_event(&session.store, session.last_state.as_ref(), edit)?
+            }
+            Command::DeleteEvent(delete) => {
+                editor::delete_event(&session.store, session.last_state.as_ref(), delete)?
             }
             Command::CreateWorkspace { name, employee } => {
                 session.store.lock().unwrap().transaction(|s| {
@@ -344,6 +399,7 @@ impl Mobile {
                 )?;
             }
             Command::Check {
+                view_year,
                 base_token,
                 event_id,
                 year,
@@ -351,17 +407,39 @@ impl Mobile {
                 done,
             } => {
                 if let Some(token) = base_token {
-                    calendar::check_from_view(session, token, event_id, year, task_id, done)?;
+                    calendar::check_from_view(
+                        session,
+                        token,
+                        view_year.unwrap_or(year),
+                        event_id,
+                        year,
+                        task_id,
+                        done,
+                    )?;
+                } else if view_year.is_some() {
+                    return Err(
+                        "Для отметки в открытом календаре требуется актуальный снимок.".into(),
+                    );
                 } else {
                     calendar::check(&session.store, event_id, year, task_id, done)?;
                 }
             }
             Command::Note {
+                view_year,
+                base_token,
                 event_id,
                 year,
                 text,
                 base,
-            } => calendar::note(&session.store, event_id, year, &text, base.as_deref())?,
+            } => calendar::note(
+                session,
+                view_year,
+                base_token,
+                event_id,
+                year,
+                &text,
+                base.as_deref(),
+            )?,
             Command::PairingRequest => return success(session.net()?.pairing_request()),
             Command::Invite { request } => {
                 return success(session.net()?.make_invite(request.trim())?);

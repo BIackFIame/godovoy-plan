@@ -35,9 +35,12 @@ pub(super) fn credential_hint(token: &str, purpose: GrantPurpose) -> Option<(Id,
 
 pub(super) enum Admission {
     Known,
-    New,
+    New(DiscoveryCheck),
     Limited,
 }
+
+// Only a request that spent a credit can return it. Dropping a check consumes the credit.
+pub(super) struct DiscoveryCheck(Fingerprint);
 
 pub(super) struct Discovery {
     known: BTreeSet<Fingerprint>,
@@ -67,10 +70,19 @@ impl Discovery {
             return Admission::Limited;
         }
         self.credits -= 1;
-        Admission::New
+        Admission::New(DiscoveryCheck(*key))
     }
 
-    pub(super) fn remember(&mut self, key: Fingerprint) {
+    pub(super) fn cancel_unstarted(&mut self, _check: DiscoveryCheck) {
+        self.credits = (self.credits + 1).min(BURST);
+    }
+
+    pub(super) fn authenticated(&mut self, DiscoveryCheck(key): DiscoveryCheck) {
+        self.credits = (self.credits + 1).min(BURST);
+        self.remember(key);
+    }
+
+    fn remember(&mut self, key: Fingerprint) {
         if !self.known.contains(&key) && self.known.len() >= MAX_REMEMBERED {
             self.known.pop_first();
         }
@@ -119,20 +131,44 @@ mod tests {
         let mut discovery = Discovery::new(start);
         let key = [17; 32];
         for _ in 0..BURST {
-            assert!(matches!(discovery.admit(&key, start), Admission::New));
+            assert!(matches!(discovery.admit(&key, start), Admission::New(_)));
         }
         assert!(matches!(
             discovery.admit(&key, start + Duration::from_millis(999)),
             Admission::Limited
         ));
         let later = start + Duration::from_secs(1);
-        assert!(matches!(discovery.admit(&key, later), Admission::New));
+        assert!(matches!(discovery.admit(&key, later), Admission::New(_)));
         assert!(matches!(discovery.admit(&key, later), Admission::Limited));
         let later = start + Duration::from_secs(120);
         for _ in 0..BURST {
-            assert!(matches!(discovery.admit(&key, later), Admission::New));
+            assert!(matches!(discovery.admit(&key, later), Admission::New(_)));
         }
         assert!(matches!(discovery.admit(&key, later), Admission::Limited));
+    }
+
+    #[test]
+    fn authenticated_checks_only_return_their_own_credit() {
+        let now = Instant::now();
+        let mut gate = Discovery::new(now);
+        for _ in 1..BURST {
+            assert!(matches!(gate.admit(&[0; 32], now), Admission::New(_)));
+        }
+        for person in 1..=240 {
+            let Admission::New(check) = gate.admit(&[person; 32], now) else {
+                panic!("a valid new login must have one credit available");
+            };
+            gate.authenticated(check);
+            assert!(matches!(gate.admit(&[person; 32], now), Admission::Known));
+        }
+        let Admission::New(check) = gate.admit(&[0; 32], now) else {
+            panic!("one unused credit");
+        };
+        gate.cancel_unstarted(check);
+        assert!(matches!(gate.admit(&[0; 32], now), Admission::New(_)));
+        assert!(matches!(gate.admit(&[0; 32], now), Admission::Limited));
+        assert!(matches!(gate.admit(&[1; 32], now), Admission::Known));
+        assert!(matches!(gate.admit(&[0; 32], now), Admission::Limited));
     }
 
     #[test]

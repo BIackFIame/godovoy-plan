@@ -687,6 +687,23 @@ fn mcp_credentials_bind_to_one_employee_key_and_cannot_be_used_as_ordinary_keys(
             .parent,
         Some(remote_reader)
     );
+    let mut acl = lock.access().unwrap();
+    let (independent_id, _, rights) = acl
+        .authorize_with_permissions(&independent, GrantPurpose::Mcp)
+        .unwrap();
+    assert!(rights.allow_remote);
+    acl.grants.get_mut(&remote_reader).unwrap().allow_remote = false;
+    let (_, _, rights) = acl
+        .authorize_with_permissions(&independent, GrantPurpose::Mcp)
+        .unwrap();
+    assert!(!rights.allow_remote);
+    acl.grants.get_mut(&remote_reader).unwrap().allow_remote = true;
+    acl.grants.get_mut(&independent_id).unwrap().allow_remote = false;
+    let (_, _, rights) = acl
+        .authorize_with_permissions(&independent, GrantPurpose::Mcp)
+        .unwrap();
+    assert!(!rights.allow_remote);
+
     lock.revoke(office_key).unwrap();
     lock.grant("Анна", Some(employee_id), false).unwrap();
     let acl = lock.access().unwrap();
@@ -772,6 +789,38 @@ fn valid_backup_checks_the_parent_without_migrating_sibling_files() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn backup_manifest_must_be_private_and_have_one_link() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
+    let vault = tmp.path().join("central");
+    let backup = tmp.path().join("backup");
+    assert!(cli("init", &vault, &["Team"]).status.success());
+    assert!(
+        cli("backup", &vault, &[backup.to_str().unwrap()])
+            .status
+            .success()
+    );
+
+    let manifest = backup.join("backup-manifest-v1.json");
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(!cli("backup-verify", &backup, &[]).status.success());
+    assert_eq!(
+        fs::metadata(&manifest).unwrap().permissions().mode() & 0o777,
+        0o644
+    );
+    fs::set_permissions(&manifest, fs::Permissions::from_mode(0o600)).unwrap();
+
+    let extra_link = tmp.path().join("linked-manifest.json");
+    fs::hard_link(&manifest, &extra_link).unwrap();
+    assert!(!cli("backup-verify", &backup, &[]).status.success());
+    fs::remove_file(extra_link).unwrap();
+    assert!(cli("backup-verify", &backup, &[]).status.success());
+}
+
 #[test]
 fn session_rechecks_same_length_acl_witness_and_repeated_journal_recovery() {
     use godovoy_plan::storage::online::{ProtectionSettings, SessionAcl};
@@ -807,8 +856,15 @@ fn session_rechecks_same_length_acl_witness_and_repeated_journal_recovery() {
         applied
     );
 
+    // A same-length change past the first comparison chunk must invalidate the cached ACL.
     let mut invalid = valid.clone();
-    *invalid.first_mut().unwrap() = b'!';
+    invalid.resize(48 * 1024, b' ');
+    fs::write(&acl, &invalid).unwrap();
+    assert_eq!(
+        lock.session_access(&mut cache).unwrap().protection(),
+        applied
+    );
+    *invalid.last_mut().unwrap() = b'!';
     fs::write(&acl, invalid).unwrap();
     assert!(lock.session_access(&mut cache).is_err());
     let mut pending: Value = serde_json::from_slice(&valid).unwrap();
@@ -833,4 +889,30 @@ fn session_rechecks_same_length_acl_witness_and_repeated_journal_recovery() {
         );
         assert_eq!(fs::read(&acl).unwrap(), valid);
     }
+}
+
+#[test]
+fn authoritative_reads_validate_calendar_content_and_recover_after_repair() {
+    use serde_json::{Value, json};
+    let tmp = TempDir::new().unwrap();
+    let dir = tmp.path().join("calendar");
+    let vault = OnlineVault::init(
+        &dir,
+        "Офис".into(),
+        Default::default(),
+        Default::default(),
+    )
+    .unwrap();
+    let lock = vault.lock().unwrap();
+    let path = dir.join("online-calendar-v1.json");
+    let before = fs::read(&path).unwrap();
+    let mut data: Value = serde_json::from_slice(&before).unwrap();
+    let member = Id::new_v4().to_string();
+    data["calendar"]["members"][&member] = json!({
+        "value":"  ", "revision":{"sequence":1,"device":member}
+    });
+    fs::write(&path, serde_json::to_vec(&data).unwrap()).unwrap();
+    assert!(lock.data().is_err(), "blank employee name was served");
+    fs::write(&path, &before).unwrap();
+    assert!(lock.data().is_ok());
 }

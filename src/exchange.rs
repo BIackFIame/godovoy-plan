@@ -74,12 +74,7 @@ pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
         LimitedWriter::new(&mut *bytes, PAYLOAD_LIMIT),
         Compression::fast(),
     );
-    {
-        let output = BufWriter::new(&mut encoder);
-        let mut limited = LimitedWriter::new(output, CALENDAR_MESSAGE_LIMIT);
-        serde_json::to_writer(&mut limited, &packet)?;
-        limited.flush()?;
-    }
+    write_packet_json(&mut encoder, &packet, CALENDAR_MESSAGE_LIMIT)?;
     encoder.finish()?;
     let nonce = random_bytes::<NONCE_SIZE>()?;
     let tag = cipher(&workspace)
@@ -109,6 +104,14 @@ pub fn export_file(store: &SharedStore, path: &Path) -> Fallible<usize> {
     verify_exchange_key(&current, &workspace)?;
     finish_export(output.persist_noclobber(path), path, write_packet)?;
     Ok(MAGIC.len() + NONCE_SIZE + bytes.len() + TAG_SIZE)
+}
+
+fn write_packet_json(output: impl Write, packet: &impl Serialize, limit: usize) -> Fallible<()> {
+    let mut writer = BufWriter::new(LimitedWriter::new(output, limit));
+    serde_json::to_writer(&mut writer, packet)?;
+    // Drain the last bytes and let the compressor finish its stream once.
+    writer.into_inner().map_err(|error| error.into_error())?;
+    Ok(())
 }
 
 fn finish_export(
@@ -176,6 +179,8 @@ pub fn import_file(store: &SharedStore, path: &Path) -> Fallible<bool> {
         }
     }
     let packet = decode(compressed)?;
+    // Clear the decrypted packet before waiting for the store or writing the profile.
+    drop(bytes);
     if packet.workspace != workspace.id {
         return Err("Файл принадлежит другому календарю.".into());
     }
@@ -277,6 +282,19 @@ fn cipher(workspace: &Workspace) -> XChaCha20Poly1305 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn export_charges_the_final_buffer_to_the_plaintext_limit() {
+        for text in ["abc".to_owned(), "a\n".repeat(10_000)] {
+            let expected = serde_json::to_vec(&text).unwrap();
+            let mut bytes = Vec::new();
+            write_packet_json(&mut bytes, &text, expected.len()).unwrap();
+            assert_eq!(bytes, expected);
+            bytes.clear();
+            assert!(write_packet_json(&mut bytes, &text, expected.len() - 1).is_err());
+            assert!(bytes.len() < expected.len());
+        }
+    }
 
     #[test]
     fn file_exchange_requires_the_active_key_generation() {

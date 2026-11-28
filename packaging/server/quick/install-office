@@ -1,0 +1,91 @@
+#!/bin/sh
+set -eu
+
+usage() {
+    printf '%s\n' 'Запуск: sudo ./packaging/server/quick/install-office plan.office.example'
+}
+if [ "${1-}" = --help ]; then usage; exit 0; fi
+if [ "$#" -ne 1 ]; then usage >&2; exit 2; fi
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+host=$1
+if [ "${#host}" -gt 253 ] || ! printf '%s\n' "$host" |
+    awk 'END {exit !(!bad && NR == 1 && $0 ~ /^[a-z0-9.-]+$/ && NF >= 2 && $NF ~ /[a-z]/)}
+         {for (i = 1; i <= NF; i++) if (length($i) > 63 || $i !~ /^[a-z0-9]([a-z0-9-]*[a-z0-9])?$/) {bad=1; exit}}' FS=.; then
+    printf '%s\n' 'Укажите полное DNS-имя из строчных ASCII-букв, цифр и дефисов.' >&2
+    exit 2
+fi
+if [ "$(uname -s)" != Linux ] || [ "$(id -u)" -ne 0 ] || [ ! -d /run/systemd/system ]; then
+    printf '%s\n' 'Для установки нужен Linux с systemd. Запустите команду через sudo.' >&2
+    exit 1
+fi
+for command in systemctl useradd getent curl flock; do
+    command -v "$command" >/dev/null
+done
+if [ ! -x /usr/bin/caddy ]; then
+    printf '%s\n' 'Нужен пакет Caddy с исполняемым файлом /usr/bin/caddy.' >&2
+    exit 1
+fi
+here=$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)
+binary="$here/../../../godovoy-online"
+"$binary" --version
+umask 077
+exec 9>/run/godovoy-quick-install.lock
+flock -n 9
+config=/etc/godovoy-quick
+if [ -f "$config/office.env" ] && ! grep -qxF "GODOVOY_OFFICE_HOST=$host" "$config/office.env"; then
+    printf '%s\n' 'Этот узел уже настроен на другое имя. Установку остановили.' >&2
+    exit 1
+fi
+for account in godovoy-office godovoy-tls; do
+    if entry=$(getent passwd "$account"); then
+        if [ ! -f "$config/$account.account" ] ||
+            [ "$(cat "$config/$account.account")" != "$entry" ] ||
+            [ "$(getent -s files passwd "$account")" != "$entry" ]; then
+            printf 'Учётная запись %s уже существует вне этой установки.\n' "$account" >&2
+            exit 1
+        fi
+    elif getent group "$account" >/dev/null || [ -e "$config/$account.account" ]; then
+        printf 'Учётная запись или группа %s изменена. Установку остановили.\n' "$account" >&2
+        exit 1
+    fi
+done
+install -d -m 0755 "$config"
+printf 'GODOVOY_OFFICE_HOST=%s\n' "$host" > "$config/office.env.new"
+chmod 0644 "$config/office.env.new"
+mv -f "$config/office.env.new" "$config/office.env"
+for account in godovoy-office godovoy-tls; do
+    if [ ! -f "$config/$account.account" ]; then
+        useradd --system --user-group --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$account"
+        getent -s files passwd "$account" > "$config/$account.account"
+    fi
+done
+install -m 0755 "$binary" "$config/godovoy-online.new"
+mv -f "$config/godovoy-online.new" "$config/godovoy-online"
+install -m 0755 "$here/profile" "$config/profile"
+install -m 0644 "$here/Caddyfile" "$config/Caddyfile"
+for unit in godovoy-quick-calendar.service godovoy-quick-tls.service godovoy-quick-backup.service godovoy-quick-backup.timer; do
+    install -m 0644 "$here/$unit" "/etc/systemd/system/$unit"
+done
+systemctl daemon-reload
+systemctl enable godovoy-quick-calendar.service godovoy-quick-tls.service
+systemctl restart godovoy-quick-calendar.service godovoy-quick-tls.service
+ca=/var/lib/godovoy-tls/caddy/pki/authorities/local/root.crt
+for attempt in $(seq 1 20); do
+    if [ -r "$ca" ] && curl --fail --silent --max-time 2 --noproxy '*' --cacert "$ca" \
+        --resolve "$host:443:127.0.0.1" "https://$host/" >/dev/null; then
+        break
+    fi
+    if [ "$attempt" -eq 20 ]; then
+        printf '%s\n' 'HTTPS не ответил. Проверьте journalctl -u godovoy-quick-tls -u godovoy-quick-calendar и наличие свободного порта 443.' >&2
+        exit 1
+    fi
+    sleep 1
+done
+systemctl enable --now godovoy-quick-backup.timer
+# The backup unit preserves snapshots. An interrupted install can be rerun.
+systemctl start godovoy-quick-backup.service
+printf 'Календарь: https://%s/\n' "$host"
+printf 'Корневой сертификат для доверия на рабочих местах: %s\n' "$ca"
+printf '%s\n' 'Первый ключ сотрудника:' \
+    '  sudo -u godovoy-office /etc/godovoy-quick/godovoy-online grant /var/lib/godovoy-office/calendar "Анна"' \
+    'Проверенные копии: /var/lib/godovoy-office/snapshots'

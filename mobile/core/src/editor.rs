@@ -5,18 +5,19 @@ use godovoy_plan::{
     storage::SharedStore,
 };
 use serde::Deserialize;
-use serde_json::Value;
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Selection {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Selection {
+    view_year: Option<i32>,
+    base_token: Option<Id>,
     event_id: Id,
     year: i32,
     revision: String,
     scope: Scope,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Copy, Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum Scope {
     Year,
@@ -24,8 +25,14 @@ enum Scope {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct Fields {
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct Edit {
+    view_year: Option<i32>,
+    base_token: Option<Id>,
+    event_id: Id,
+    year: i32,
+    revision: String,
+    scope: Scope,
     title: String,
     description: String,
     date: NaiveDate,
@@ -36,15 +43,35 @@ struct Fields {
     checklist: Vec<TaskInput>,
 }
 
+// Older callers also send the complete edit form on deletion. Accept that precise
+// shape, while rejecting misspelled selector fields in either representation.
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(untagged)]
+pub(super) enum Delete {
+    Selection(Selection),
+    Form(Edit),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TaskInput {
     id: Option<Id>,
     title: String,
     days_before: u16,
 }
 
-impl Fields {
+impl Edit {
+    fn take_selection(&mut self) -> Selection {
+        Selection {
+            view_year: self.view_year,
+            base_token: self.base_token,
+            event_id: self.event_id,
+            year: self.year,
+            revision: std::mem::take(&mut self.revision),
+            scope: self.scope,
+        }
+    }
+
     fn into_event(self, old: Occurrence<'_>) -> Fallible<Event> {
         if self.date.year() != old.year {
             return Err("Измените дату в пределах выбранного года.".into());
@@ -82,69 +109,94 @@ impl Fields {
     }
 }
 
-pub(super) fn edit_event(store: &SharedStore, json: Value) -> Fallible<Value> {
-    let fields = match json.get("op").and_then(Value::as_str) {
-        Some("editEvent") => Some(Fields::deserialize(&json)?),
-        Some("deleteEvent") => None,
-        _ => return Err("Неизвестная операция редактора.".into()),
+pub(super) fn edit_event(
+    store: &SharedStore,
+    prior: Option<&super::calendar::LastState>,
+    mut edit: Edit,
+) -> Fallible<()> {
+    change_event(store, prior, edit.take_selection(), Some(edit))
+}
+
+pub(super) fn delete_event(
+    store: &SharedStore,
+    prior: Option<&super::calendar::LastState>,
+    delete: Delete,
+) -> Fallible<()> {
+    let selection = match delete {
+        Delete::Selection(selection) => selection,
+        Delete::Form(mut form) => form.take_selection(),
     };
-    let target: Selection = serde_json::from_value(json)?;
-    store
-        .lock()
-        .map_err(|_| "Профиль недоступен.")?
-        .transaction(|state| {
-            let revision = state.revision()?;
-            let workspace = state.workspace_mut()?;
-            let old = workspace
-                .calendar
-                .event(target.event_id, target.year)
-                .ok_or("Событие перенесено или удалено.")?;
-            if format!("{}:{}", old.revision.sequence, old.revision.operation) != target.revision {
-                return Err("Событие изменилось на другом устройстве. Откройте его заново.".into());
+    change_event(store, prior, selection, None)
+}
+
+fn change_event(
+    store: &SharedStore,
+    prior: Option<&super::calendar::LastState>,
+    target: Selection,
+    edit: Option<Edit>,
+) -> Fallible<()> {
+    let mut store = store.lock().map_err(|_| "Профиль недоступен.")?;
+    super::calendar::require_event_view(
+        &store,
+        prior,
+        target.base_token,
+        target.view_year,
+        target.event_id,
+        target.year,
+    )?;
+    store.transaction(|state| {
+        let revision = state.revision()?;
+        let workspace = state.workspace_mut()?;
+        let old = workspace
+            .calendar
+            .event(target.event_id, target.year)
+            .ok_or("Событие перенесено или удалено.")?;
+        if format!("{}:{}", old.revision.sequence, old.revision.operation) != target.revision {
+            return Err("Событие изменилось на другом устройстве. Откройте его заново.".into());
+        }
+        let event = if let Some(edit) = edit {
+            workspace.check_assignment(old.event.owner, edit.owner_id)?;
+            Some(edit.into_event(old)?)
+        } else {
+            None
+        };
+        let plan = workspace
+            .calendar
+            .plans
+            .get_mut(&target.event_id)
+            .ok_or("Событие удалено.")?;
+        if event.as_ref().is_some_and(|e| e.yearly) && plan.imported_single_has_other_dates() {
+            return Err("Для ежегодного повтора создайте отдельное событие.".into());
+        }
+        match target.scope {
+            Scope::Year => {
+                let change = event.map_or(YearChange::Cancel, |e| YearChange::Edit(e.into()));
+                plan.years.entry(target.year).or_default().change =
+                    Some(Record::new(revision, change));
             }
-            let event = if let Some(fields) = fields {
-                workspace.check_assignment(old.event.owner, fields.owner_id)?;
-                Some(fields.into_event(old)?)
-            } else {
-                None
-            };
-            let plan = workspace
-                .calendar
-                .plans
-                .get_mut(&target.event_id)
-                .ok_or("Событие удалено.")?;
-            if event.as_ref().is_some_and(|e| e.yearly) && plan.imported_single_has_other_dates() {
-                return Err("Для ежегодного повтора создайте отдельное событие.".into());
-            }
-            match target.scope {
-                Scope::Year => {
-                    let change = event.map_or(YearChange::Cancel, |e| YearChange::Edit(e.into()));
-                    plan.years.entry(target.year).or_default().change =
-                        Some(Record::new(revision, change));
+            Scope::Future => {
+                plan.templates
+                    .insert(target.year, Record::new(revision, event.map(Into::into)));
+                if let Some(year) = plan.years.get_mut(&target.year) {
+                    year.change = Some(Record::new(revision, YearChange::UseTemplate));
                 }
-                Scope::Future => {
-                    plan.templates
-                        .insert(target.year, Record::new(revision, event.map(Into::into)));
-                    if let Some(year) = plan.years.get_mut(&target.year) {
-                        year.change = Some(Record::new(revision, YearChange::UseTemplate));
-                    }
-                }
             }
-            Ok(Value::Null)
-        })
+        }
+        Ok(())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::calendar;
-    use godovoy_plan::storage::Store;
     use serde_json::json;
 
     #[test]
     fn annual_edit_keeps_leap_anchor_and_task_identity_and_rejects_stale_revision() {
         let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(&dir.path().join("phone")).unwrap();
+        let mut phone = crate::Mobile::open(dir.path().join("phone")).unwrap();
+        let store = phone.session.as_ref().unwrap().store.clone();
         store
             .lock()
             .unwrap()
@@ -177,12 +229,32 @@ mod tests {
             "scope":"future","title":"Отправить письма","description":"","date":"2029-02-28",
             "yearly":true,"category":"Team","preparationDays":14,"ownerId":null,
             "checklist":[{"id":task,"title":"Адресаты","daysBefore":7}]});
+        let selector =
+            json!({"op":"deleteEvent","eventId":id,"year":2029,"scope":"year","revision":revision});
+        let mut legacy_delete = edit.clone();
+        legacy_delete["op"] = json!("deleteEvent");
+        for mut command in [edit.clone(), selector, legacy_delete] {
+            command["baseToke"] = json!(Id::new_v4());
+            assert_eq!(
+                phone.request(command).unwrap_err().to_string(),
+                "Неверные параметры запроса."
+            );
+        }
+        // Parsing directly into Command also catches duplicated JSON keys.
+        let duplicated_year = edit.to_string().replacen("{", r#"{"year":2029,"#, 1);
+        assert!(serde_json::from_str::<crate::Command>(&duplicated_year).is_err());
+        let mut bad_task = edit.clone();
+        bad_task["checklist"][0]["dayBefore"] = json!(7);
+        assert_eq!(
+            phone.request(bad_task).unwrap_err().to_string(),
+            "Неверные параметры запроса."
+        );
         calendar::check(&store, id, 2029, task, true).unwrap();
         let mut foreign = edit.clone();
         foreign["checklist"][0]["id"] = json!(Id::new_v4());
-        assert!(edit_event(&store, foreign).is_err());
-        edit_event(&store, edit.clone()).unwrap();
-        assert!(edit_event(&store, edit.clone()).is_err());
+        assert!(phone.request(foreign).is_err());
+        phone.request(edit.clone()).unwrap();
+        assert!(phone.request(edit.clone()).is_err());
         let snapshot = store.lock().unwrap().snapshot();
         let calendar = &snapshot.workspace.as_ref().unwrap().calendar;
         assert_eq!(calendar.event(id, 2028).unwrap().event.title, "Исходное");
@@ -199,7 +271,7 @@ mod tests {
             edited.revision.sequence, edited.revision.operation
         ));
         edit["scope"] = json!("year");
-        edit_event(&store, edit).unwrap();
+        phone.request(edit).unwrap();
         let snapshot = store.lock().unwrap().snapshot();
         let calendar = &snapshot.workspace.as_ref().unwrap().calendar;
         assert!(calendar.event(id, 2029).is_none());

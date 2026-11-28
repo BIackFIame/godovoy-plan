@@ -7,7 +7,9 @@ import UIKit
     @Published var year = GPDate.year
     @Published var busy = false
     @Published var failure: String?
+    @Published private(set) var contentRevision: UInt = 0
     private var refreshVersion: UInt = 0
+    private var supportsAgendaIndexCommand = true
     let core = CalendarClient.shared
 
     private enum Update { case full, stamp, unchanged }
@@ -17,14 +19,23 @@ import UIKit
         catch { await refresh(silent: true); throw error }
     }
 
+    func fullSnapshot(year: Int) async throws -> GPState {
+        let request: GPCommand = ["op": .string("state"), "year": .integer(year), "acceptChecklistTuples": .flag(true)]
+        guard case .state(let current) = try await core.value(request, as: GPSnapshot.self), current.year == year,
+              !current.agendaIndex else { throw GPError("Не удалось открыть полное событие.") }
+        return current
+    }
+
     private func read(year: Int) async throws -> (GPState, Update) {
-        let full: GPCommand = ["op": .string("state"), "year": .integer(year)]
+        let full: GPCommand = ["op": .string("state"), "year": .integer(year), "acceptChecklistTuples": .flag(true)]
+        var indexedFull = full
+        if supportsAgendaIndexCommand { indexedFull["acceptAgendaIndex"] = .flag(true) }
         if let prior = state, prior.year == year, let token = prior.stateToken {
-            var request = full
+            var request = indexedFull
             request["ifToken"] = .string(token)
             if prior.supportsSyncStamp == true { request["acceptSyncStamp"] = .flag(true) }
             do {
-                let reply = try await core.value(request, as: GPSnapshot.self)
+                let reply = try await readSnapshot(request)
                 switch reply {
                 case .state(let current) where current.year == year: return (current, .full)
                 case .unchanged where state?.year == year && state?.stateToken == token:
@@ -37,9 +48,26 @@ import UIKit
                 // Recover from an incompatible conditional response with one full read.
             }
         }
-        guard case .state(let current) = try await core.value(full, as: GPSnapshot.self),
+        guard case .state(let current) = try await readSnapshot(indexedFull),
               current.year == year else { throw GPError("Не удалось обновить календарь.") }
         return (current, .full)
+    }
+
+    private func readSnapshot(_ request: GPCommand) async throws -> GPSnapshot {
+        do { return try await core.value(request, as: GPSnapshot.self) }
+        catch let issue as GPError {
+            guard request["acceptAgendaIndex"] == .flag(true), issue.message == "Неверные параметры запроса." else { throw issue }
+            supportsAgendaIndexCommand = false
+            var legacy = request
+            legacy.removeValue(forKey: "acceptAgendaIndex")
+            return try await core.value(legacy, as: GPSnapshot.self)
+        } catch let issue as DecodingError {
+            guard request["acceptAgendaIndex"] == .flag(true) else { throw issue }
+            supportsAgendaIndexCommand = false
+            var legacy = request
+            legacy.removeValue(forKey: "acceptAgendaIndex")
+            return try await core.value(legacy, as: GPSnapshot.self)
+        }
     }
 
     func refresh(silent: Bool = false) async {
@@ -51,6 +79,7 @@ import UIKit
             guard !Task.isCancelled && requestedYear == year && version == refreshVersion else { return }
             switch update {
             case .full:
+                if state != current { contentRevision &+= 1 }
                 state = current
                 GPReminderSchedule.refresh(dates: current.notificationDates)
             case .stamp:
@@ -75,18 +104,95 @@ import UIKit
             if needsPeerPolling && !busy { await refresh(silent: true) }
         }
     }
-    func check(event: GPEvent, task: GPTask) async -> Bool {
+
+    func agendaCard(id: String, viewYear: Int, eventYear: Int) async throws -> GPAgendaCard {
+        for attempt in 0..<2 {
+            guard let prior = state, prior.agendaIndex, prior.year == viewYear,
+                  let token = prior.stateToken,
+                  UUID(uuidString: token)?.uuidString.lowercased() == token else {
+                throw GPError("Календарь изменился. Откройте актуальный список.")
+            }
+            let revision = contentRevision
+            let reply = try await core.agendaCard(id: id, viewYear: viewYear, eventYear: eventYear, token: token)
+            guard reply.event(id: id, eventYear: eventYear, in: prior) != nil else {
+                throw GPError("Карточка изменилась. Откройте актуальный список.")
+            }
+            guard state?.year == viewYear, state?.stateToken == token else {
+                if attempt == 0, contentRevision == revision, state?.year == viewYear { continue }
+                throw GPError("Календарь изменился. Откройте актуальный список.")
+            }
+            return reply
+        }
+        throw GPError("Календарь изменился. Откройте актуальный список.")
+    }
+
+    func reminderPage(offset: Int, limit: Int = 64) async throws -> [GPReminder] {
+        for attempt in 0..<2 {
+            guard let prior = state, prior.agendaIndex, let token = prior.stateToken else {
+                throw GPError("Календарь изменился. Откройте актуальный список.")
+            }
+            let revision = contentRevision
+            let reply = try await core.reminderPage(year: prior.year, token: token, offset: offset, limit: limit)
+            guard let rows = reply.rows(in: prior, expectedOffset: offset, limit: limit) else {
+                throw GPError("Список напоминаний изменился. Обновите календарь.")
+            }
+            guard state?.year == prior.year, state?.stateToken == token else {
+                if attempt == 0, contentRevision == revision, state?.year == prior.year { continue }
+                throw GPError("Календарь изменился. Откройте актуальный список.")
+            }
+            return rows
+        }
+        throw GPError("Календарь изменился. Откройте актуальный список.")
+    }
+
+    func check(event: GPEvent, task: GPTask, viewYear: Int, cardToken: String?) async -> Bool {
         guard !busy else { return false }
         guard let prior = state else {
             await refresh(silent: true)
             return false
         }
+        if prior.agendaIndex {
+            if let cardToken,
+               let context = GPIndexedCheckContext(prior: prior, card: event, cardToken: cardToken, viewYear: viewYear, task: task) {
+                busy = true
+                defer { busy = false }
+                refreshVersion &+= 1
+                let version = refreshVersion
+                do {
+                    let next = try await core.check(prior, context: context)
+                    guard !Task.isCancelled else { return false }
+                    guard refreshVersion == version, year == context.viewYear,
+                          state?.stateToken == context.token else {
+                        await refresh(silent: true)
+                        return true
+                    }
+                    state = next
+                    contentRevision &+= 1
+                    GPReminderSchedule.refresh(dates: next.notificationDates)
+                    return true
+                } catch {
+                    failure = error.localizedDescription
+                    await refresh(silent: true)
+                    return false
+                }
+            }
+            guard let cardToken else {
+                failure = "Карточка изменилась. Проверьте актуальный чек-лист."
+                await refresh(silent: true)
+                return false
+            }
+            return await run("check", ["eventId": .string(event.id), "year": .integer(event.year),
+                                        "taskId": .string(task.id), "done": .flag(!task.done),
+                                        "viewYear": .integer(viewYear), "baseToken": .string(cardToken)])
+        }
         guard year == event.year, prior.year == year,
               prior.canUseCheckPatch else {
-            return await run("check", ["eventId": .string(event.id), "year": .integer(event.year),
-                                       "taskId": .string(task.id), "done": .flag(!task.done)])
+            var fields: GPCommand = ["eventId": .string(event.id), "year": .integer(event.year),
+                                     "taskId": .string(task.id), "done": .flag(!task.done)]
+            if let cardToken { fields["viewYear"] = .integer(viewYear); fields["baseToken"] = .string(cardToken) }
+            return await run("check", fields)
         }
-        guard let context = GPCheckContext(prior: prior, displayed: event, task: task) else {
+        guard let context = GPCheckContext(prior: prior, displayed: event, task: task, cardToken: cardToken) else {
             failure = "Карточка изменилась. Проверьте актуальный чек-лист."
             await refresh(silent: true)
             return false
@@ -103,6 +209,7 @@ import UIKit
                 return true
             }
             state = next
+            contentRevision &+= 1
             GPReminderSchedule.refresh(dates: next.notificationDates)
             return true
         } catch {
@@ -112,29 +219,42 @@ import UIKit
         }
     }
 
-    func run(_ op: String, _ fields: GPCommand = [:]) async -> Bool {
+    private func perform<Value>(
+        _ op: String,
+        _ fields: GPCommand,
+        successRefreshSilent: Bool,
+        action: (GPCommand) async throws -> Value,
+        onSuccess: (Value) -> Void
+    ) async -> Bool {
         guard !busy else { return false }
         busy = true
         defer { busy = false }
         var command = fields; command["op"] = .string(op)
-        do { try await core.run(command); await refresh(); return true }
+        do {
+            let result = try await action(command)
+            onSuccess(result)
+            await refresh(silent: successRefreshSilent)
+            return true
+        }
         catch { failure = error.localizedDescription; await refresh(silent: true); return false }
     }
+    func run(_ op: String, _ fields: GPCommand = [:]) async -> Bool {
+        await perform(op, fields, successRefreshSilent: false, action: { command in
+            try await core.run(command)
+        }, onSuccess: { _ in })
+    }
     func copy(_ op: String, fields: GPCommand = [:]) async -> Bool {
-        guard !busy else { return false }
-        busy = true; defer { busy = false }
-        var command = fields; command["op"] = .string(op)
-        do {
-            let text = try await core.value(command, as: String.self)
+        await perform(op, fields, successRefreshSilent: true, action: { command in
+            try await core.value(command, as: String.self)
+        }, onSuccess: { text in
             UIPasteboard.general.setItems([["public.utf8-plain-text": text]], options: [.localOnly: true, .expirationDate: Date().addingTimeInterval(15 * 60)])
-            await refresh(silent: true)
-            return true
-        } catch { failure = error.localizedDescription; await refresh(silent: true); return false }
+        })
     }
 }
 
 @main struct GodovoyPlanApp: App {
     @StateObject private var model = CalendarModel()
+    @State private var selectedTab = 0
     @Environment(\.scenePhase) private var phase
     @State private var observedZone: String?
     @State private var zoneCheck: UUID?
@@ -146,10 +266,10 @@ import UIKit
                     if let state = model.state {
                         if state.workspaceName == nil { NavigationStack { WelcomeView() } }
                         else {
-                            TabView {
-                                NavigationStack { CalendarView() }.tabItem { Label("Календарь", systemImage: "calendar") }
-                                NavigationStack { TasksView() }.tabItem { Label("Мои задачи", systemImage: "checklist") }
-                                NavigationStack { SyncView() }.tabItem { Label("Обмен", systemImage: "arrow.triangle.2.circlepath") }
+                            TabView(selection: $selectedTab) {
+                                NavigationStack { CalendarView() }.tabItem { Label("Календарь", systemImage: "calendar") }.tag(0)
+                                NavigationStack { TasksView(isActive: selectedTab == 1) }.tabItem { Label("Мои задачи", systemImage: "checklist") }.tag(1)
+                                NavigationStack { SyncView() }.tabItem { Label("Обмен", systemImage: "arrow.triangle.2.circlepath") }.tag(2)
                             }
                         }
                     } else {

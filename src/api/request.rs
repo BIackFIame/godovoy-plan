@@ -3,6 +3,7 @@ use std::time::Duration;
 use axum::{
     body::{Body, to_bytes},
     http::{Request, Uri},
+    response::IntoResponse,
 };
 use serde::{Deserialize, Serialize};
 use snow::TransportState;
@@ -167,13 +168,113 @@ pub(super) async fn serve(
         .extension(credential)
         .body(body)?;
     let reply = routes.oneshot(request).await?;
+    // A read or durable write can finish after the integration key has changed.
+    let access = credential.require_current(&api.reader.snapshot().state);
+    let denied = access.is_err();
+    let reply = match access {
+        Ok(()) => reply,
+        Err(reason) => reason.into_response(),
+    };
     let status = reply.status().as_u16().to_be_bytes();
     let bytes = to_bytes(reply.into_body(), REPLY_LIMIT).await?;
     bridge::send_payload(&mut stream, &mut channel, &status).await?;
-    bridge::send_payload(
-        &mut stream,
-        &mut channel,
-        if bytes.is_empty() { b"null" } else { &bytes },
-    )
+    let body = if bytes.is_empty() {
+        b"null".as_slice()
+    } else {
+        &bytes
+    };
+    if denied {
+        return bridge::send_payload(&mut stream, &mut channel, body).await;
+    }
+    // A slow reader may hold a socket between chunks. Do not queue more bytes
+    // once the stored key has changed. Bytes already written cannot be recalled.
+    bridge::send_payload_checked(&mut stream, &mut channel, body, || {
+        credential
+            .require_current(&api.reader.snapshot().state)
+            .map_err(|_| "Доступ к ответу локального API прекращён.".into())
+    })
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::storage::{ApiSettings, Store};
+    use axum::{Router, middleware, routing::get};
+
+    #[tokio::test]
+    async fn response_checks_access_after_the_handler_has_finished() {
+        for disable in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            let store = Store::open(&temp.path().join("profile")).unwrap();
+            let key = [23; 32];
+            store
+                .lock()
+                .unwrap()
+                .transaction(|state| {
+                    state.create_workspace("Команда".into(), "Анна".into())?;
+                    state.api = Some(ApiSettings {
+                        token: key,
+                        import_token: None,
+                        port: 0,
+                        enabled: true,
+                    });
+                    Ok(())
+                })
+                .unwrap();
+            let api = ApiState::new(store.clone());
+            let route = Router::new()
+                .route(
+                    "/v1/test",
+                    get(move || async move {
+                        store
+                            .lock()
+                            .unwrap()
+                            .transaction(|state| {
+                                let settings = state.api.as_mut().unwrap();
+                                if disable {
+                                    settings.enabled = false
+                                } else {
+                                    settings.token = [42; 32]
+                                }
+                                Ok(())
+                            })
+                            .unwrap();
+                        "Частная запись из календаря"
+                    }),
+                )
+                .layer(middleware::from_fn_with_state(
+                    api.reader.clone(),
+                    super::super::authenticate,
+                ));
+            let input = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let port = input.local_addr().unwrap().port();
+            let (server, reply) = tokio::join!(
+                async {
+                    let (stream, _) = input.accept().await.unwrap();
+                    bridge::serve(stream, api, route).await
+                },
+                request_secure(
+                    port,
+                    &key,
+                    ApiKeyKind::Main,
+                    ApiMethod::Get,
+                    "/v1/test",
+                    &[]
+                )
+            );
+            server.unwrap();
+            let reply = reply.unwrap();
+            assert_eq!(reply.status, if disable { 503 } else { 401 });
+            let body: serde_json::Value = serde_json::from_slice(&reply.body).unwrap();
+            assert!(body["error"].is_string());
+            assert!(
+                !String::from_utf8(reply.body)
+                    .unwrap()
+                    .contains("Частная запись")
+            );
+        }
+    }
 }

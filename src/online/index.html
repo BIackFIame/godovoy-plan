@@ -6,8 +6,7 @@
   <meta name="referrer" content="no-referrer">
   <meta name="color-scheme" content="light dark">
   <title>Годовой план</title>
-  <link rel="stylesheet" href="/calendar.css">
-  <script defer src="/calendar.js"></script>
+  <style><!-- CALENDAR_STYLE --></style>
 </head>
 <body>
   <header class="topbar">
@@ -23,9 +22,11 @@
       <noscript>Для подключения включите JavaScript в браузере.</noscript>
       <form id="login" autocomplete="off">
         <label for="token">Ключ доступа</label>
-        <input id="token" type="password" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" maxlength="180" required>
+        <input id="token" type="password" autocomplete="off" autocorrect="off" autocapitalize="none" spellcheck="false" maxlength="180" required disabled>
         <button id="connect" class="primary" type="submit" disabled>Открыть календарь</button>
       </form>
+      <a id="reload-calendar" hidden href="/?bundle=1">Открыть форму входа заново</a>
+      <script>/* LOGIN_GATE */</script>
     </section>
     <section id="workspace" hidden aria-label="Рабочий календарь">
       <div class="heading">
@@ -48,7 +49,7 @@
         </div>
         <button type="button" id="refresh">Обновить</button>
       </div>
-      <p id="feedback" role="status" class="feedback"></p>
+      <p id="feedback" role="status" class="feedback" tabindex="-1"></p>
       <div id="list"></div>
     </section>
   </main>
@@ -57,5 +58,6 @@
     <div id="sheet-body"></div>
     <p id="sheet-error" class="error" role="alert"></p>
   </dialog>
+  <script>/* CALENDAR_SCRIPT */</script>
 </body>
 </html>

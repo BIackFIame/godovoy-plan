@@ -2,28 +2,34 @@
 mod admission;
 #[path = "conditional.rs"]
 mod conditional;
+#[path = "large_reads.rs"]
+mod large_reads;
 #[path = "mcp.rs"]
 mod mcp;
 #[path = "standby.rs"]
 mod standby;
+#[path = "watch.rs"]
+mod watch;
 use admission::{Admission, Discovery, credential_hint};
 use standby::Mode;
 
 use super::actions::{self, Command};
+use crate::http::{
+    add_common_security_headers, is_json_content_type, is_strong_state_tag, problem,
+};
 use axum::{
-    Json, Router,
+    Router,
     body::Bytes,
     extract::{DefaultBodyLimit, Query, Request, State},
     http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     middleware::{self, Next},
-    response::{Html, IntoResponse, Response},
+    response::{IntoResponse, Response},
     routing::{get, post},
 };
-use blake2::Digest;
 use godovoy_plan::{
     Fallible,
     model::Id,
-    storage::online::{Access, Data, GrantPurpose, LockedVault, OnlineVault, SessionAcl, record},
+    storage::online::{Access, Data, Grant, GrantPurpose, LockedVault, OnlineVault, SessionAcl, record},
 };
 use hyper::server::conn::http1;
 use hyper_util::{
@@ -31,7 +37,6 @@ use hyper_util::{
     service::TowerToHyperService,
 };
 use serde::Deserialize;
-use serde_json::json;
 use std::{
     net::Ipv4Addr,
     sync::{Arc, Mutex},
@@ -54,9 +59,11 @@ pub struct Host {
     entry: EntryPoint,
     mode: Mode,
     operations: Arc<Semaphore>,
+    vault_workers: Arc<Semaphore>,
     discovery: Arc<Mutex<Discovery>>,
     new_checks: Arc<Semaphore>,
     views: Arc<conditional::Views>,
+    watches: Arc<Mutex<watch::Watches>>,
 }
 impl Host {
     pub fn new(vault: OnlineVault, origin: &str, entry: Option<EntryPoint>) -> Fallible<Self> {
@@ -94,9 +101,11 @@ impl Host {
             entry,
             mode: Mode::Primary,
             operations: Arc::new(Semaphore::new(16)),
+            vault_workers: Arc::new(Semaphore::new(2)),
             discovery: Arc::new(Mutex::new(Discovery::new(Instant::now()))),
             new_checks: Arc::new(Semaphore::new(4)),
             views: Default::default(),
+            watches: Default::default(),
         })
     }
     fn enable_standby(&mut self) -> Fallible<()> {
@@ -116,9 +125,6 @@ fn standby_unavailable() -> Response {
         .headers_mut()
         .insert("x-godovoy-standby", HeaderValue::from_static("unavailable"));
     response
-}
-fn problem(status: StatusCode, message: &str) -> Response {
-    (status, Json(json!({"error":message}))).into_response()
 }
 fn discovery_limited() -> Response {
     let mut response = problem(
@@ -156,6 +162,12 @@ async fn headers(State(host): State<Host>, req: Request, next: Next) -> Response
         .uri()
         .authority()
         .is_some_and(|a| !a.as_str().eq_ignore_ascii_case(&host.authority));
+    let calendar_document = req.uri().path() == "/";
+    let bundled = req.uri().query() == Some("bundle=1");
+    let static_script = req.uri().path() == crate::assets::SCRIPT_PATH
+        && req.uri().query().is_none()
+        && !h.contains_key(header::AUTHORIZATION)
+        && !h.contains_key(header::COOKIE);
     let mut response = if !authority.is_some_and(|a| a.eq_ignore_ascii_case(&host.authority))
         || absolute_authority
         || !valid_origin
@@ -168,23 +180,25 @@ async fn headers(State(host): State<Host>, req: Request, next: Next) -> Response
     } else {
         next.run(req).await
     };
+    let successful_document = calendar_document && response.status() == StatusCode::OK;
+    let cache_script = static_script && response.status() == StatusCode::OK;
     let h = response.headers_mut();
-    h.insert(
-        header::CACHE_CONTROL,
-        HeaderValue::from_static("no-store, private, max-age=0"),
-    );
-    h.insert("pragma", HeaderValue::from_static("no-cache"));
-    h.insert("content-security-policy",HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'"));
-    h.insert(
-        "x-content-type-options",
-        HeaderValue::from_static("nosniff"),
-    );
-    h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
-    h.insert("x-frame-options", HeaderValue::from_static("DENY"));
-    h.insert(
-        "cross-origin-resource-policy",
-        HeaderValue::from_static("same-origin"),
-    );
+    if cache_script {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("private, max-age=86400, immutable"));
+    } else {
+        h.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store, private, max-age=0"));
+        h.insert("pragma", HeaderValue::from_static("no-cache"));
+    }
+    if successful_document && !bundled {
+        h.insert(header::LINK, crate::assets::PRELOAD);
+    }
+    let policy = if successful_document {
+        crate::assets::calendar_policy()
+    } else {
+        HeaderValue::from_static("default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; frame-ancestors 'none'; form-action 'none'; base-uri 'none'")
+    };
+    h.insert("content-security-policy", policy);
+    add_common_security_headers(h);
     response
 }
 #[derive(Clone, Copy)]
@@ -195,19 +209,10 @@ enum AuthOperation {
     Mcp { write: bool },
 }
 
-enum RequestAcl<'a> {
-    Current(&'a mut Access),
-    Session(&'a Access),
+fn personal_scope(acl: &Access, grant: &Grant) -> bool {
+    grant.purpose == GrantPurpose::Mcp || acl.assigned_only.contains(&grant.employee)
 }
-impl std::ops::Deref for RequestAcl<'_> {
-    type Target = Access;
-    fn deref(&self) -> &Access {
-        match self {
-            Self::Current(acl) => acl,
-            Self::Session(acl) => acl,
-        }
-    }
-}
+
 async fn with_auth<F>(
     host: Host,
     headers: HeaderMap,
@@ -221,6 +226,13 @@ where
         AuthOperation::Session | AuthOperation::View => (GrantPurpose::Employee, false),
         AuthOperation::Command => (GrantPurpose::Employee, true),
         AuthOperation::Mcp { write } => (GrantPurpose::Mcp, write),
+    };
+    let watch_year = if matches!(operation, AuthOperation::Session | AuthOperation::Command) {
+        headers.get("x-godovoy-watch-year")
+            .and_then(|value| value.to_str().ok()?.parse::<i32>().ok())
+            .filter(|year| actions::valid_year(*year))
+    } else {
+        None
     };
     let Some((token, presented_id, hint)) = headers
         .get(header::AUTHORIZATION)
@@ -237,48 +249,61 @@ where
             "Для доступа нужен действующий ключ.",
         );
     };
-    let admission = match host.discovery.lock() {
-        Ok(mut gate) => gate.admit(&hint, Instant::now()),
-        Err(_) => return unavailable(),
+    let new_check = {
+        let Ok(mut gate) = host.discovery.lock() else {
+            return unavailable();
+        };
+        match gate.admit(&hint, Instant::now()) {
+            Admission::Known => None,
+            Admission::New(check) => match host.new_checks.clone().try_acquire_owned() {
+                Ok(permit) => Some((permit, check)),
+                Err(_) => {
+                    gate.cancel_unstarted(check);
+                    return discovery_limited();
+                }
+            },
+            Admission::Limited => return discovery_limited(),
+        }
     };
-    let new_check = match admission {
-        Admission::Known => None,
-        Admission::New => match host.new_checks.clone().try_acquire_owned() {
-            Ok(permit) => Some(permit),
-            Err(_) => return discovery_limited(),
-        },
-        Admission::Limited => return discovery_limited(),
+    // The listener already bounds accepted connections. Let a previously verified
+    // reader wait briefly behind other views without occupying a vault worker.
+    let slot = match host.operations.clone().try_acquire_owned() {
+        Ok(slot) => Some(slot),
+        Err(_) if new_check.is_none() && matches!(operation, AuthOperation::View | AuthOperation::Session) => {
+            tokio::time::timeout(Duration::from_millis(300), host.operations.clone().acquire_owned())
+                .await.ok().and_then(Result::ok)
+        }
+        Err(_) => None,
     };
-    let Ok(slot) = host.operations.clone().try_acquire_owned() else {
+    let Some(slot) = slot else {
+        if let Some((_permit, check)) = new_check {
+            let Ok(mut gate) = host.discovery.lock() else {
+                return unavailable();
+            };
+            gate.cancel_unstarted(check);
+        }
         return problem(
             StatusCode::SERVICE_UNAVAILABLE,
             "Узел занят, повторите запрос.",
         );
     };
+    // Keep a second worker ready to take the cross-process file lock.
+    let Ok(worker) = host.vault_workers.clone().acquire_owned().await else {
+        return unavailable();
+    };
     tokio::task::spawn_blocking(move || {
+        let _worker = worker;
         let _slot = slot;
         let Ok(lock) = host.vault.lock() else {
             return unavailable();
         };
-        let mut fresh;
-        let mut cached;
-        let mut acl = if matches!(operation, AuthOperation::Session) {
-            let Ok(guard) = host.session_acl.lock() else {
-                return unavailable();
-            };
-            cached = guard;
-            let Ok(acl) = lock.session_access(&mut cached) else {
-                return unavailable();
-            };
-            RequestAcl::Session(acl)
-        } else {
-            let Ok(acl) = lock.access() else {
-                return unavailable();
-            };
-            fresh = acl;
-            RequestAcl::Current(&mut fresh)
+        let Ok(mut cached) = host.session_acl.lock() else {
+            return unavailable();
         };
-        let Some((id, grant)) = acl.authorize_for(&token, purpose) else {
+        let Ok(acl) = lock.session_access(&mut cached) else {
+            return unavailable();
+        };
+        let Some((id, grant, rights)) = acl.authorize_with_permissions(&token, purpose) else {
             let record_denial = match host.discovery.lock() {
                 Ok(mut gate) => gate.reject(&hint, Instant::now()),
                 Err(_) => return unavailable(),
@@ -303,22 +328,7 @@ where
             );
         };
         let employee = grant.employee;
-        let (read_only, allow_remote) = match purpose {
-            GrantPurpose::Employee => (grant.read_only, grant.allow_remote),
-            GrantPurpose::Mcp => {
-                let Some(rights) = acl.mcp_permissions(grant) else {
-                    return problem(StatusCode::UNAUTHORIZED, "Доступ по ключу MCP отозван.");
-                };
-                (rights.read_only, rights.allow_remote)
-            }
-        };
-        if purpose == GrantPurpose::Mcp {
-            // Only the authorization view of this request is narrowed. Persistent employee rights stay separate.
-            let RequestAcl::Current(ref mut private) = acl else {
-                return unavailable();
-            };
-            private.assigned_only.insert(employee);
-        }
+        let (read_only, allow_remote) = (rights.read_only, rights.allow_remote);
         let Ok(deadline) = host.mode.check(&lock) else {
             if lock
                 .audit_security("standby_access_denied", Some(id), Some(employee), None)
@@ -363,16 +373,23 @@ where
             }
             return problem(StatusCode::FORBIDDEN, "Разрешено только чтение.");
         };
-        match host.discovery.lock() {
-            Ok(mut gate) => gate.remember(hint),
-            Err(_) => return unavailable(),
+        if let Some((_permit, check)) = new_check {
+            let Ok(mut gate) = host.discovery.lock() else {
+                return unavailable();
+            };
+            gate.authenticated(check);
         }
-        drop(new_check);
-        let mut response = action(&lock, &acl, id, employee, !read_only, &host.mode);
+        let mut response = action(&lock, acl, id, employee, !read_only, &host.mode);
         let verified =
             response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED;
         if verified {
-            let scope = if acl.assigned_only.contains(&employee) {
+            if let Some(year) = watch_year
+                && let Ok(mut watches) = host.watches.lock()
+                && let Some(stamp) = watches.current(acl, id, employee, year, false)
+            {
+                response.headers_mut().insert("x-godovoy-watch", stamp);
+            }
+            let scope = if personal_scope(acl, grant) {
                 "true"
             } else {
                 "false"
@@ -405,15 +422,87 @@ where
 struct Year {
     year: i32,
 }
+fn exact_header(headers: &HeaderMap, name: &'static str, token: &str) -> bool {
+    let mut values = headers.get_all(name).iter();
+    values.next().is_some_and(|value| value == token) && values.next().is_none()
+}
+
+#[derive(Clone, Copy)]
+struct OverviewOffer {
+    format: actions::OverviewFormat,
+    assigned: bool,
+    packed_cards: bool,
+}
+
+impl OverviewOffer {
+    fn authorize(self, context: actions::ViewContext<'_>) -> actions::ViewContext<'_> {
+        context
+            .offer_overview(self.format)
+            .offer_assigned_overview(self.assigned)
+            .offer_packed_cards(self.packed_cards)
+    }
+}
+
+fn overview_requested(headers: &HeaderMap, detail: bool, entry: EntryPoint) -> OverviewOffer {
+    let format = if !detail && !exact_header(headers, "x-godovoy-view", "overview-v1") {
+        actions::OverviewFormat::Full
+    } else if exact_header(headers, "x-godovoy-rows", "tuple-v2") {
+        match entry {
+            EntryPoint::Remote => actions::OverviewFormat::RemoteTupleRows,
+            EntryPoint::Office => actions::OverviewFormat::TupleRows,
+        }
+    } else {
+        actions::OverviewFormat::NamedRows
+    };
+    let assigned = format.uses_tuples()
+        && exact_header(headers, "x-godovoy-assigned-view", "overview-v1");
+    let packed_cards = exact_header(headers, "x-godovoy-cards", "tuple-v1");
+    OverviewOffer { format, assigned, packed_cards }
+}
+
+fn page_offer(headers: &HeaderMap, name: &'static str) -> actions::YearRows {
+    use actions::YearRows;
+    let mut values = headers.get_all(name).iter();
+    match (values.next().map(HeaderValue::as_bytes), values.next()) {
+        (Some(b"first-v1"), None) => YearRows::First,
+        (Some(b"prefix-160-v1"), None) => YearRows::FirstTwo,
+        (Some(b"prefix-320-v1"), None) => YearRows::FirstFour,
+        (Some(b"prefix-640-v1"), None) => YearRows::FirstEight,
+        (Some(b"prefix-1280-v1"), None) => YearRows::FirstSixteen,
+        _ => YearRows::All,
+    }
+}
+
 async fn state(
     State(host): State<Host>,
     headers: HeaderMap,
     Query(query): Query<Year>,
 ) -> Response {
-    if !(1900..=9999).contains(&query.year) {
+    if !actions::valid_year(query.year) {
         return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
     }
+    let remote = host.entry == EntryPoint::Remote;
+    let watch = headers.get("x-godovoy-watch-year")
+        .and_then(|value| value.to_str().ok()?.parse::<i32>().ok()) == Some(query.year);
+    let watches = host.watches.clone();
     let views = host.views.clone();
+    let offer_overview = overview_requested(&headers, false, host.entry);
+    let year_rows = page_offer(&headers, "x-godovoy-page");
+    let prior = page_offer(&headers, "x-godovoy-continue");
+    let mut bases = headers.get_all("x-godovoy-base").iter();
+    let continuation = match (prior, bases.next(), bases.next()) {
+        (actions::YearRows::All, _, _) => None,
+        (_, Some(tag), None) => tag
+            .to_str()
+            .ok()
+            .filter(|tag| is_strong_state_tag(tag))
+            .map(|tag| (prior, tag.to_owned())),
+        _ => None,
+    };
+    let accept_page_delta = exact_header(&headers, "x-godovoy-delta", "page-event-v1");
+    let accept_delta = headers
+        .get("x-godovoy-delta")
+        .is_some_and(|v| v == "event-v1");
     let condition: Vec<_> = headers
         .get_all(header::IF_NONE_MATCH)
         .iter()
@@ -424,13 +513,17 @@ async fn state(
         headers,
         AuthOperation::View,
         move |lock, acl, id, employee, edit, mode| {
-            let context = actions::ViewContext::new(acl, query.year, employee, edit);
+            let mut context = offer_overview
+                .authorize(actions::ViewContext::new(acl, query.year, employee, edit))
+                .offer_page(year_rows)
+                .offer_continuation(continuation);
+            context.accepts_page_delta = accept_page_delta;
             let Ok(data) = lock.open_data() else {
                 return unavailable();
             };
             let today = chrono::Local::now().date_naive();
             let parallel_audit = data.byte_len() >= 128 * 1024 && condition.is_empty();
-            let prepare = || views.response(id, context, today, data, &condition);
+            let prepare = || views.response(id, context, today, data, &condition, accept_delta);
             let audit = || lock.audit_security("state_requested", Some(id), Some(employee), None);
             let result = if parallel_audit {
                 std::thread::scope(|scope| {
@@ -449,50 +542,161 @@ async fn state(
             } else {
                 prepare().ok().filter(|_| audit().is_ok())
             };
-            let Some(response) = result else {
+            let Some(mut response) = result else {
                 return unavailable();
             };
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
+            }
+            if (response.headers().contains_key("x-godovoy-delta-base")
+                || response.headers().contains_key("x-godovoy-continued"))
+                && chrono::Local::now().date_naive() != today
+            {
+                return unavailable();
+            }
+            if edit && response.status() == StatusCode::OK {
+                response.headers_mut().insert("x-godovoy-personal-check", HeaderValue::from_static("assigned-v1"));
+            }
+            if remote && year_rows == actions::YearRows::First && response.status() == StatusCode::OK
+                && response.headers().get("x-godovoy-state-tag").zip(response.headers().get(header::ETAG))
+                    .is_some_and(|(snapshot, page)| snapshot != page)
+            {
+                response.headers_mut().insert("x-godovoy-continuations", HeaderValue::from_static("v1"));
+            }
+            if watch && (response.status().is_success() || response.status() == StatusCode::NOT_MODIFIED)
+                && let Ok(mut watches) = watches.lock()
+                && let Some(stamp) = watches.current(acl, id, employee, query.year, true)
+            {
+                response.headers_mut().insert("x-godovoy-watch", stamp);
             }
             response
         },
     )
     .await
 }
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct EventDetail {
+    year: i32,
+    event_year: i32,
+    id: Id,
+}
+
+async fn event_detail(
+    State(host): State<Host>,
+    headers: HeaderMap,
+    Query(query): Query<EventDetail>,
+) -> Response {
+    if !actions::valid_year(query.year) || !actions::valid_year(query.event_year) {
+        return problem(StatusCode::BAD_REQUEST, "Год должен быть от 1900 до 9999.");
+    }
+    let base = {
+        let mut values = headers.get_all(header::IF_MATCH).iter();
+        values
+            .next()
+            .filter(|value| {
+                value.to_str().ok().is_some_and(is_strong_state_tag) && values.next().is_none()
+            })
+            .cloned()
+    };
+    let format = overview_requested(&headers, true, host.entry);
+    let views = host.views.clone();
+    with_auth(
+        host,
+        headers,
+        AuthOperation::View,
+        move |lock, acl, credential, employee, edit, mode| {
+            let Some(base) = base else {
+                return problem(
+                    StatusCode::PRECONDITION_REQUIRED,
+                    "Обновите год перед открытием карточки.",
+                );
+            };
+            let context = format.authorize(actions::ViewContext::new(acl, query.year, employee, edit));
+            let Ok(data) = lock.open_data() else {
+                return unavailable();
+            };
+            let today = chrono::Local::now().date_naive();
+            let Ok(response) = views.detail(
+                credential,
+                context,
+                today,
+                data,
+                base,
+                (query.id, query.event_year),
+            ) else {
+                return unavailable();
+            };
+            if lock
+                .audit_security("state_requested", Some(credential), Some(employee), None)
+                .is_err()
+            {
+                return unavailable();
+            }
+            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
+                return standby_unavailable();
+            }
+            if chrono::Local::now().date_naive() != today {
+                return StatusCode::PRECONDITION_FAILED.into_response();
+            }
+            response
+        },
+    )
+    .await
+}
+
 async fn session(State(host): State<Host>, headers: HeaderMap) -> Response {
-    with_auth(host, headers, AuthOperation::Session, |_, _, _, _, _, _| {
-        StatusCode::NO_CONTENT.into_response()
-    })
+    with_auth(
+        host,
+        headers,
+        AuthOperation::Session,
+        |_, _, _, _, edit, _| {
+            (
+                StatusCode::NO_CONTENT,
+                [("x-godovoy-can-edit", if edit { "true" } else { "false" })],
+            )
+                .into_response()
+        },
+    )
     .await
 }
 async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> Response {
-    if headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|s| s.split(';').next())
-        .is_none_or(|s| !s.trim().eq_ignore_ascii_case("application/json"))
-    {
+    command_with_receipt_audit(host, headers, body, |lock, credential, employee| {
+        lock.audit_security("state_requested", Some(credential), Some(employee), None)
+    })
+    .await
+}
+
+async fn command_with_receipt_audit(
+    host: Host,
+    headers: HeaderMap,
+    body: Bytes,
+    audit_receipt: impl FnOnce(&LockedVault<'_>, Id, Id) -> Fallible<()> + Send + 'static,
+) -> Response {
+    if !is_json_content_type(&headers) {
         return problem(
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             "Требуется application/json.",
         );
     }
+    let entry = host.entry;
+    let watches = host.watches.clone();
     let views = host.views.clone();
+    let offer_overview = overview_requested(&headers, false, host.entry);
+    let year_rows = page_offer(&headers, "x-godovoy-page");
+    let rows_only = exact_header(&headers, "x-godovoy-receipt", "rows-only-v1");
     let receipt = headers
         .get("x-godovoy-base")
         .zip(headers.get("x-godovoy-year"))
         .and_then(|(tag, year)| {
             let tag = tag.to_str().ok()?;
             let tag = tag.strip_prefix("W/").unwrap_or(tag);
-            let hex = tag.strip_prefix('"')?.strip_suffix('"')?;
-            if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            if !is_strong_state_tag(tag) {
                 return None;
             }
             let year = year.to_str().ok()?.parse::<i32>().ok()?;
-            (1900..=9999)
-                .contains(&year)
-                .then(|| (tag.to_owned(), year))
+            actions::valid_year(year).then(|| (tag.to_owned(), year))
         });
     with_auth(
         host,
@@ -504,67 +708,111 @@ async fn command(State(host): State<Host>, headers: HeaderMap, body: Bytes) -> R
             };
             let today = chrono::Local::now().date_naive();
             let receipt = receipt.and_then(|(base, year)| match &cmd {
-                Command::Check { event_id, .. } | Command::Note { event_id, .. } => {
-                    Some((base, year, *event_id))
+                Command::Check {
+                    event_id,
+                    year: detail_year,
+                    ..
                 }
+                | Command::Note {
+                    event_id,
+                    year: detail_year,
+                    ..
+                } => Some((base, year, *event_id, *detail_year)),
                 _ => None,
             });
-            let Ok(raw) = lock.data_bytes() else {
+            let Ok(file) = lock.open_data() else {
                 return unavailable();
             };
-            let Ok(mut data) = serde_json::from_slice(&raw) else {
+            let Ok(conditional::WriteInput { calendar: mut data, original, before }) =
+                views.data_for_write(file, receipt.is_some())
+            else {
                 return unavailable();
             };
-            let receipt = receipt.and_then(|(base, year, event)| {
-                let context = actions::ViewContext::new(acl, year, employee, can_edit);
+            let receipt = receipt.and_then(|(base, year, event, detail_year)| {
+                let context =
+                    offer_overview.authorize(actions::ViewContext::new(acl, year, employee, can_edit));
                 let source = conditional::Views::input_hasher(credential, &context, today).ok()?;
-                let original = source.clone().chain_update(&raw).finalize().into();
+                let before = before?;
+                let original = conditional::Views::source_key(&source, before);
                 let tag = views.lookup(&original).ok().flatten().or_else(|| {
                     views
-                        .view_tag(credential, &context.render(&data, today))
+                        .view_tag(credential, &context.render(&data, today), today)
                         .ok()
                 })?;
-                (tag.as_bytes() == base.as_bytes()).then_some((year, source, event))
+                (tag.as_bytes() == base.as_bytes()).then_some((
+                    year,
+                    source,
+                    event,
+                    detail_year,
+                    before,
+                ))
             });
-            drop(raw);
-            if let Some(response) =
+            let change = watch::edit(&cmd, &data);
+            let notify = |data: &Data| watch::committed(&watches, data, acl, entry, change);
+            if let Err(rejection) =
                 prepare_command(lock, acl, credential, employee, mode, cmd, &mut data)
             {
-                return response;
+                views.restore_after_failure(original);
+                return rejection.web_response();
             }
-            let Some((year, source, event)) = receipt else {
-                return match lock.save_data(&data) {
+            let Some((year, source, event, detail_year, before)) = receipt else {
+                return match views.commit_without_receipt(lock, data, original, notify) {
                     Ok(()) => StatusCode::NO_CONTENT.into_response(),
                     Err(_) => unavailable(),
                 };
             };
-            let Ok(key) = lock.save_data_hashed(&data, source) else {
+            let Ok(conditional::ReceiptCommit {
+                raw_digest: after,
+                bytes: committed,
+                mut annual,
+            }) = conditional::Views::commit_for_receipt(lock, &data, original)
+            else {
                 return unavailable();
             };
+            notify(&data);
+            let key = conditional::Views::source_key(&source, after);
+            views.transition(Some(conditional::EventTransition {
+                before,
+                after,
+                event,
+            }));
             if chrono::Local::now().date_naive() != today {
                 return StatusCode::NO_CONTENT.into_response();
             }
-            if lock
-                .audit_security("state_requested", Some(credential), Some(employee), None)
-                .is_err()
-            {
-                return unavailable();
+            // This audit gates the optional read, while the write is already durable.
+            if audit_receipt(lock, credential, employee).is_err() {
+                return StatusCode::NO_CONTENT.into_response();
             }
-            let context = actions::ViewContext::new(acl, year, employee, can_edit);
+            let context = offer_overview
+                .authorize(actions::ViewContext::new(acl, year, employee, can_edit))
+                .offer_page(year_rows);
             let view = context.render(&data, today);
-            let Ok(tag) = views.view_tag(credential, &view) else {
-                return unavailable();
+            let Ok(tag) =
+                views.view_tag_after_receipt_commit(credential, &view, today, event, &mut annual)
+            else {
+                return StatusCode::NO_CONTENT.into_response();
             };
             if views.remember(key, tag.clone()).is_err() {
-                return unavailable();
+                return StatusCode::NO_CONTENT.into_response();
             }
-            let mut reply = Json(view.changed_event(event)).into_response();
+            let Ok(receipt) = view.encode_change(event, (!rows_only).then_some(detail_year)) else {
+                return StatusCode::NO_CONTENT.into_response();
+            };
+            let mut reply = conditional::json_body(receipt);
             if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
                 return standby_unavailable();
             }
             if chrono::Local::now().date_naive() != today {
                 return StatusCode::NO_CONTENT.into_response();
             }
+            let rows = view.visible_year_rows();
+            if rows != actions::YearRows::All {
+                let Ok(page_tag) = conditional::response_tag(&tag, rows) else {
+                    return StatusCode::NO_CONTENT.into_response();
+                };
+                reply.headers_mut().insert("x-godovoy-page-tag", page_tag);
+            }
+            views.retain_committed(committed, after, data, annual);
             reply.headers_mut().insert("x-godovoy-state-tag", tag);
             reply
         },
@@ -578,6 +826,34 @@ where
     with_auth(host, headers, AuthOperation::Mcp { write }, action).await
 }
 
+pub(super) enum CommandRejection {
+    FreeTextDisabled,
+    OutsideAssignment,
+    Conflict(&'static str),
+    Invalid(&'static str),
+    Unavailable,
+    StandbyUnavailable,
+}
+
+impl CommandRejection {
+    fn web_response(self) -> Response {
+        match self {
+            Self::FreeTextDisabled => protection_denied(
+                "Описания и заметки отключены администратором.",
+                "free-text-disabled",
+            ),
+            Self::OutsideAssignment => protection_denied(
+                "Действие недоступно в персональном календаре.",
+                "assigned-only",
+            ),
+            Self::Conflict(message) => problem(StatusCode::CONFLICT, message),
+            Self::Invalid(message) => problem(StatusCode::UNPROCESSABLE_ENTITY, message),
+            Self::Unavailable => unavailable(),
+            Self::StandbyUnavailable => standby_unavailable(),
+        }
+    }
+}
+
 fn prepare_command(
     lock: &LockedVault<'_>,
     acl: &Access,
@@ -586,105 +862,79 @@ fn prepare_command(
     mode: &Mode,
     cmd: Command,
     data: &mut Data,
-) -> Option<Response> {
+) -> Result<(), CommandRejection> {
+    use CommandRejection::*;
+
     if !acl.protection().settings.free_text_allowed() && cmd.uses_free_text() {
-        if lock
-            .audit_security(
-                "protection_free_text_denied",
-                Some(credential),
-                Some(employee),
-                None,
-            )
-            .is_err()
-        {
-            return Some(unavailable());
-        }
-        return Some(protection_denied(
-            "Описания и заметки отключены администратором.",
-            "free-text-disabled",
-        ));
+        lock.audit_security("protection_free_text_denied", Some(credential), Some(employee), None)
+            .map_err(|_| Unavailable)?;
+        return Err(FreeTextDisabled);
     }
-    if acl.assigned_only.contains(&employee) && !cmd.allowed_for_assignee(data, employee) {
-        if lock
-            .audit_security(
-                "employee_scope_denied",
-                Some(credential),
-                Some(employee),
-                None,
-            )
-            .is_err()
-        {
-            return Some(unavailable());
-        }
-        return Some(protection_denied(
-            "Действие недоступно в персональном календаре.",
-            "assigned-only",
-        ));
+    let grant = acl
+        .grants
+        .get(&credential)
+        .filter(|grant| grant.employee == employee)
+        .ok_or(Unavailable)?;
+    let personal = personal_scope(acl, grant);
+    let only_if_assigned = matches!(&cmd, Command::Check { only_if_assigned: true, .. });
+    let assigned = !(personal || only_if_assigned) || cmd.allowed_for_assignee(data, employee);
+    if personal && !assigned {
+        lock.audit_security("employee_scope_denied", Some(credential), Some(employee), None)
+            .map_err(|_| Unavailable)?;
+        return Err(OutsideAssignment);
     }
-    match actions::apply(cmd, data, acl) {
-        Err(e) => Some(problem(
-            if e.conflict {
-                StatusCode::CONFLICT
-            } else {
-                StatusCode::UNPROCESSABLE_ENTITY
-            },
-            e.message,
-        )),
-        Ok((kind, event)) => {
-            if let Err(e) = data.calendar.validate() {
-                return Some(problem(StatusCode::UNPROCESSABLE_ENTITY, e));
-            }
-            let audit_kind = match kind {
-                "create" => "create_requested",
-                "edit" => "edit_requested",
-                "delete" => "delete_requested",
-                "check" => "check_requested",
-                "note" => "note_requested",
-                _ => return Some(unavailable()),
-            };
-            if lock
-                .audit_security(audit_kind, Some(credential), Some(employee), Some(event))
-                .is_err()
-            {
-                return Some(unavailable());
-            }
-            record(&mut data.audit, kind, credential, employee, Some(event));
-            if matches!(mode, Mode::Standby(_)) && mode.check(lock).is_err() {
-                return Some(standby_unavailable());
-            }
-            None
-        }
+    if only_if_assigned && !assigned {
+        return Err(Conflict("Задача больше не назначена вам."));
     }
+    let (mutation, event) = actions::apply(cmd, data, acl).map_err(|error| match error {
+        actions::Rejection::Conflict(message) => Conflict(message),
+        actions::Rejection::Invalid(message) => Invalid(message),
+    })?;
+    data.calendar.validate().map_err(Invalid)?;
+    let (kind, audit_kind) = mutation.audit_labels();
+    lock.audit_security(audit_kind, Some(credential), Some(employee), Some(event))
+        .map_err(|_| Unavailable)?;
+    record(&mut data.audit, kind, credential, employee, Some(event));
+    if matches!(mode, Mode::Standby(_)) {
+        mode.check(lock).map_err(|_| StandbyUnavailable)?;
+    }
+    Ok(())
 }
 pub fn router(host: Host) -> Router {
     Router::new()
-        .route("/", get(|| async { Html(include_str!("index.html")) }))
         .route(
-            "/calendar.js",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/javascript; charset=utf-8")],
-                    include_str!("calendar.js"),
-                )
+            "/",
+            get(|request: Request| async move {
+                if request.uri().query() == Some("bundle=1") {
+                    crate::assets::INDEX.serve(request.headers())
+                } else {
+                    crate::assets::WARM.serve(request.headers())
+                }
             }),
         )
         .route(
+            crate::assets::SCRIPT_PATH,
+            get(calendar_js),
+        )
+        .route("/calendar.js", get(calendar_js))
+        .route(
             "/calendar.css",
-            get(|| async {
-                (
-                    [(header::CONTENT_TYPE, "text/css; charset=utf-8")],
-                    include_str!("calendar.css"),
-                )
-            }),
+            get(|request: Request| async move { crate::assets::CALENDAR_CSS.serve(request.headers()) }),
         )
         .route("/mcp", post(mcp::handle))
         .route("/v1/session", get(session))
         .route("/v1/state", get(state))
+        .route("/v1/event", get(event_detail))
         .route("/v1/command", post(command))
         .layer(DefaultBodyLimit::max(128 * 1024))
         .layer(middleware::from_fn_with_state(host.clone(), headers))
         .with_state(host)
 }
+
+async fn calendar_js(request: Request) -> Response {
+    crate::assets::CALENDAR_JS.serve(request.headers())
+}
+
 pub async fn serve(
     vault: OnlineVault,
     port: u16,
@@ -707,13 +957,37 @@ pub async fn serve(
     eprintln!("Сервер слушает {addr}. Вход {scope}. Адрес клиента {origin}");
     serve_listener(listener, app).await
 }
+#[cfg(unix)]
+pub(super) async fn serve_office_socket(
+    vault: OnlineVault,
+    path: &std::path::Path,
+    origin: &str,
+) -> Fallible<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if !origin.starts_with("https://") {
+        return Err("Для офисного прокси укажите HTTPS origin.".into());
+    }
+    let host = Host::new(vault, origin, Some(EntryPoint::Office))?;
+    let listener = tokio::net::UnixListener::bind(path)?;
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660))?;
+    serve_connections(|| async { listener.accept().await.map(|(socket, _)| socket) }, router(host)).await
+}
+
 pub(super) async fn serve_listener(listener: TcpListener, app: Router) -> Fallible<()> {
+    serve_connections(|| async { listener.accept().await.map(|(socket, _)| socket) }, app).await
+}
+
+async fn serve_connections<S, F>(accept: impl Fn() -> F, app: Router) -> Fallible<()>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
+    F: Future<Output = std::io::Result<S>>,
+{
     let admissions = Arc::new(Semaphore::new(32));
     loop {
-        let (socket, _) = listener.accept().await?;
-        let Ok(slot) = admissions.clone().try_acquire_owned() else {
-            continue;
-        };
+        // Leave the pending handshakes in the OS listener backlog until a handler
+        // is free. The number of sockets and tasks in this process remains bounded.
+        let slot = admissions.clone().acquire_owned().await?;
+        let socket = accept().await?;
         let service = TowerToHyperService::new(app.clone());
         tokio::spawn(async move {
             let _slot = slot;
@@ -750,6 +1024,33 @@ mod tests {
         credential: Id,
         employee: Id,
     }
+    #[tokio::test]
+    async fn only_the_exact_public_script_can_enter_the_browser_cache() {
+        let f = Fixture::new();
+        let path = crate::assets::SCRIPT_PATH;
+        for (uri, extra, expected) in [
+            (path.to_string(), None, StatusCode::OK),
+            (format!("{path}?x=1"), None, StatusCode::OK),
+            (path.to_string(), Some(("authorization", "Bearer example")), StatusCode::OK),
+            (path.to_string(), Some(("cookie", "test=1")), StatusCode::OK),
+            (path.to_string(), Some(("sec-fetch-site", "cross-site")), StatusCode::FORBIDDEN),
+            (path.to_string(), Some(("accept-encoding", "*;q=0")), StatusCode::NOT_ACCEPTABLE),
+            ("/static/calendar-removed.js".into(), None, StatusCode::NOT_FOUND),
+            ("/calendar.js".into(), None, StatusCode::OK),
+            ("/?bundle=1".into(), None, StatusCode::OK),
+            ("/".into(), None, StatusCode::OK),
+        ] {
+            let mut req = Request::builder().uri(&uri).header(header::HOST, "calendar.test");
+            if let Some((name, value)) = extra { req = req.header(name, value); }
+            let response = f.app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            assert_eq!(response.status(), expected);
+            let public = uri == path && extra.is_none();
+            assert_eq!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("immutable"), public);
+            assert_eq!(response.headers()[header::CACHE_CONTROL].to_str().unwrap().contains("no-store"), !public);
+            assert_eq!(response.headers().contains_key(header::LINK), uri == "/");
+        }
+    }
+
     impl Fixture {
         fn new() -> Self {
             let tmp = TempDir::new().unwrap();
@@ -822,6 +1123,107 @@ mod tests {
             "date":"2028-02-29","yearly":true,"preparationDays":30,"checklist":[{"title":"Список","daysBefore":10}]})
         }
     }
+    #[tokio::test]
+    async fn finishing_a_personal_task_rechecks_the_current_assignee() {
+        let f = Fixture::new();
+        assert_eq!(f.cmd(f.create()).await, StatusCode::NO_CONTENT);
+        let other = f.vault.lock().unwrap().grant("Иван", None, false).unwrap();
+        let reader = f.vault.lock().unwrap().grant("Наблюдатель", None, true).unwrap();
+        let state = f.state().await;
+        let event = &state["events"][0];
+        let check = json!({"op":"check","eventId":event["id"],"year":2028,
+            "taskId":event["checklist"][0]["id"],"done":true,"onlyIfAssigned":true});
+        assert_eq!(f.request("/v1/command", &reader.2, Some(check.clone())).await.0, StatusCode::FORBIDDEN);
+        let mut edit = f.create();
+        edit["op"] = json!("editEvent");
+        edit["eventId"] = event["id"].clone();
+        edit["revision"] = event["revision"].clone();
+        edit["scope"] = json!("year");
+        edit["year"] = json!(2028);
+        edit["ownerId"] = json!(other.1);
+        edit["checklist"][0]["id"] = event["checklist"][0]["id"].clone();
+        assert_eq!(f.cmd(edit).await, StatusCode::NO_CONTENT);
+        assert_eq!(f.cmd(check.clone()).await, StatusCode::CONFLICT);
+        assert_eq!(f.state().await["events"][0]["checklist"][0]["done"], false);
+        assert_eq!(f.request("/v1/command", &other.2, Some(check)).await.0, StatusCode::NO_CONTENT);
+        assert_eq!(f.state().await["events"][0]["checklist"][0]["done"], true);
+    }
+
+    #[tokio::test]
+    async fn queued_reads_and_writes_recheck_access_after_revocation() {
+        let mut fixture = Fixture::new();
+        let host = Host::new(
+            fixture.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Office),
+        )
+        .unwrap();
+        let operations = host.operations.clone();
+        fixture.app = router(host);
+        let fixture = Arc::new(fixture);
+        let path = "/v1/state?year=2028";
+        assert_eq!(fixture.state().await["events"], json!([]));
+        let held = fixture.vault.lock().unwrap();
+        let mut pending = Vec::new();
+        let capacity = operations.available_permits();
+        for index in 0..capacity {
+            let f = fixture.clone();
+            pending.push(tokio::spawn(async move {
+                if index % 2 == 0 {
+                    f.request(path, &f.key, None).await.0
+                } else {
+                    f.cmd(f.create()).await
+                }
+            }));
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while operations.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            fixture.request(path, &fixture.key, None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        held.revoke(fixture.credential).unwrap();
+        drop(held);
+        for response in pending {
+            assert_eq!(response.await.unwrap(), StatusCode::UNAUTHORIZED);
+        }
+        assert_eq!(operations.available_permits(), capacity);
+        let (_, _, observer) = fixture.vault.lock().unwrap().grant("Борис", None, false).unwrap();
+        let (status, visible) = fixture.request(path, &observer, None).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(visible["events"], json!([]));
+    }
+
+    #[tokio::test]
+    async fn busy_calendar_does_not_deplete_the_new_login_budget() {
+        let mut f = Fixture::new();
+        let host = Host::new(
+            f.vault.clone(),
+            "https://calendar.test",
+            Some(EntryPoint::Office),
+        )
+        .unwrap();
+        let operations = host.operations.clone();
+        let busy = operations
+            .acquire_many(operations.available_permits() as u32)
+            .await
+            .unwrap();
+        f.app = router(host);
+        for _ in 0..12 {
+            assert_eq!(
+                f.request("/v1/session", &f.key, None).await.0,
+                StatusCode::SERVICE_UNAVAILABLE
+            );
+        }
+        drop(busy);
+        assert_eq!(f.request("/v1/session", &f.key, None).await.0, StatusCode::NO_CONTENT);
+    }
+
     #[tokio::test]
     async fn known_employee_can_work_and_be_revoked_while_new_checks_are_busy() {
         let mut f = Fixture::new();
@@ -1433,10 +1835,17 @@ mod tests {
             f.request("/v1/session", "invalid", None).await.0,
             StatusCode::UNAUTHORIZED
         );
-        assert_eq!(
-            f.request("/v1/session", &reader, None).await.0,
-            StatusCode::NO_CONTENT
-        );
+        for (key, can_edit) in [(&f.key, "true"), (&reader, "false")] {
+            let request = Request::builder()
+                .uri("/v1/session")
+                .header(header::HOST, "calendar.test")
+                .header(header::AUTHORIZATION, format!("Bearer {key}"))
+                .body(Body::empty())
+                .unwrap();
+            let session = f.app.clone().oneshot(request).await.unwrap();
+            assert_eq!(session.status(), StatusCode::NO_CONTENT);
+            assert_eq!(session.headers()["x-godovoy-can-edit"], can_edit);
+        }
         assert_eq!(
             f.request("/v1/command", &reader, Some(f.create())).await.0,
             StatusCode::FORBIDDEN
@@ -1464,6 +1873,37 @@ mod tests {
                 .contains(f.key.split_once('.').unwrap().1)
         );
     }
+    #[tokio::test]
+    async fn employee_calendar_and_commands_recheck_the_required_policy_after_a_warm_read() {
+        use godovoy_plan::storage::online::ProtectionSettings;
+
+        let f = Fixture::new();
+        f.vault
+            .lock()
+            .unwrap()
+            .set_protection(
+                0,
+                ProtectionSettings {
+                    belarus: true,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = f.state().await;
+        let witness = f
+            ._tmp
+            .path()
+            .join("host/online-protection-required-v1.json");
+        std::fs::write(&witness, b"0").unwrap();
+        assert_eq!(
+            f.request("/v1/state?year=2028", &f.key, None).await.0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(f.cmd(f.create()).await, StatusCode::SERVICE_UNAVAILABLE);
+        std::fs::write(&witness, b"1").unwrap();
+        assert_eq!(f.state().await, before);
+    }
+
     #[tokio::test]
     async fn serialized_updates_preserve_checklists_and_detect_stale_notes_and_edits() {
         let f = Fixture::new();

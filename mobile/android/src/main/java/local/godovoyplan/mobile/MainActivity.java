@@ -50,6 +50,15 @@ public final class MainActivity extends Activity {
     private CalendarApplication app;
     private LinearLayout root, body;
     JSONObject state = new JSONObject();
+    private JSONObject openedCard;
+    private long cardRequest, pageRequest;
+    private int eventYear, requestedEventYear;
+    private String requestedCard = "";
+    private JSONArray reminderPage;
+    private ReminderPager reminderPager;
+    private int reminderOffset;
+    private int requestedOffset = -1;
+    private static final int REMINDERS_PER_PAGE = 64;
     private final Map<String, String> memberNames = new HashMap<>();
     private boolean renderPending;
     private String section = "Год", selectedId = "", stateKey = "";
@@ -113,6 +122,10 @@ public final class MainActivity extends Activity {
         app = (CalendarApplication) getApplication();
         if (saved != null) {
             year = saved.getInt("year", year);
+            eventYear = saved.getInt("eventYear", year);
+            firstVisible = saved.getInt("firstVisible");
+            topOffset = saved.getInt("topOffset");
+            reminderOffset = saved.getInt("reminderOffset");
             month = saved.getInt("month");
             section = saved.getString("tab", "Год");
             selectedId = saved.getString("event", "");
@@ -129,6 +142,11 @@ public final class MainActivity extends Activity {
         super.onSaveInstanceState(s);
         s.putInt("year", year);
         s.putInt("month", month);
+        s.putInt("eventYear", eventYear);
+        rememberListPosition();
+        s.putInt("firstVisible", firstVisible);
+        s.putInt("topOffset", topOffset);
+        s.putInt("reminderOffset", reminderOffset);
         s.putString("tab", section);
         s.putString("event", selectedId);
         s.putString("pendingTask", pendingTaskId);
@@ -154,6 +172,11 @@ public final class MainActivity extends Activity {
     @Override
     public void onStop() {
         active = false;
+        if (!requestedCard.isEmpty() || requestedOffset >= 0) renderPending = true;
+        cardRequest++;
+        pageRequest++;
+        requestedCard = "";
+        requestedOffset = -1;
         unregisterReceiver(calendarClock);
         clock.removeCallbacks(checkZone);
         refreshVersion++;
@@ -266,6 +289,12 @@ public final class MainActivity extends Activity {
         return memberNames.getOrDefault(id, "");
     }
     private void replaceState(JSONObject next) {
+        openedCard = null;
+        requestedCard = "";
+        reminderPage = null;
+        requestedOffset = -1;
+        int remaining = next.optInt("reminderCount");
+        if (reminderOffset >= remaining) reminderOffset = Math.max(0, (remaining - 1) / REMINDERS_PER_PAGE * REMINDERS_PER_PAGE);
         if (state.optJSONArray("members") != next.optJSONArray("members")) {
             memberNames.clear();
             JSONArray members = next.optJSONArray("members");
@@ -323,7 +352,9 @@ public final class MainActivity extends Activity {
                 message("state", "year", expected, "ifToken", token);
         final ChecklistUpdate update = hasBase && pending != null && pending.matches(prior, expected, stateKey)
                 ? pending : null;
-        if (update != null) addField(request, "acceptCheckPatch", true);
+        addField(request, "acceptChecklistTuples", true);
+        addField(request, "acceptAgendaIndex", true);
+        if (update != null) addField(request, update.indexed ? "acceptIndexCheckPatch" : "acceptCheckPatch", true);
         loading = true;
         app.readState(request, update, (data, error) -> {
             if (!alive() || !active || version != refreshVersion)
@@ -353,12 +384,14 @@ public final class MainActivity extends Activity {
                             }
                             return;
                         }
-                        JSONObject updated = acceptsStamp ? applySyncStamp(prior, next, expected, token) : null;
+                        JSONObject updated = acceptsStamp ? SyncStamp.apply(prior, next, expected, token) : null;
                         if (updated != null) {
+                            boolean pageInterrupted = requestedOffset >= 0 && selectedId.isEmpty() && "Напоминания".equals(section);
+                            boolean cardInterrupted = !requestedCard.isEmpty() && !selectedId.isEmpty();
                             replaceState(updated);
                             stateKey = str(updated, "stateToken");
                             if (force) ReminderSchedule.refresh(this, updated.optJSONArray("notificationDates"));
-                            if ("Доступ".equals(section) && selectedId.isEmpty()) renderPending = true;
+                            if (cardInterrupted || pageInterrupted || ("Доступ".equals(section) && selectedId.isEmpty())) renderPending = true;
                             if (renderPending && dialog == null) render();
                             return;
                         }
@@ -370,10 +403,13 @@ public final class MainActivity extends Activity {
                     if (force || !key.equals(stateKey)) {
                         renderPending = true;
                         replaceState(next);
+                        if (update != null) openedCard = update.cardFor(next, selectedId, eventYear);
                         schedulePoll();
                         stateKey = key;
                         ReminderSchedule.refresh(this, state.optJSONArray("notificationDates"));
-                        if (dialog == null) render();
+                        if (dialog != null && !selectedId.isEmpty() && eventYear != year && selectedEvent() == null) {
+                            dialog.dismiss();
+                        } else if (dialog == null) render();
                     }
                     return;
                 }
@@ -383,34 +419,6 @@ public final class MainActivity extends Activity {
         });
     }
 
-    static JSONObject applySyncStamp(JSONObject prior, JSONObject update, int year, String token) {
-        Object nextToken = update.opt("stateToken");
-        Object stamp = update.opt("lastSync");
-        if (!Boolean.TRUE.equals(update.opt("syncStamp")) || update.has("unchanged") ||
-                !(update.opt("year") instanceof Integer) || update.optInt("year") != year ||
-                prior.optInt("year") != year || !token.equals(prior.opt("stateToken")) ||
-                !token.equals(update.opt("baseToken")) || !(nextToken instanceof String) ||
-                token.equals(nextToken) || !update.has("lastSync")) return null;
-        try {
-            if (!UUID.fromString((String)nextToken).toString().equals(nextToken)) return null;
-            if (stamp != JSONObject.NULL) {
-                if (!(stamp instanceof String)) return null;
-                java.time.OffsetDateTime.parse((String)stamp);
-            }
-            // Copy only top-level references; event and checklist arrays are shared.
-            JSONObject result = new JSONObject();
-            Iterator<String> keys = prior.keys();
-            while (keys.hasNext()) {
-                String name = keys.next();
-                result.put(name, prior.get(name));
-            }
-            result.put("lastSync", stamp);
-            result.put("stateToken", nextToken);
-            return result;
-        } catch (IllegalArgumentException | java.time.format.DateTimeParseException | org.json.JSONException invalid) {
-            return null;
-        }
-    }
     void action(JSONObject command, CalendarApplication.Reply result) {
         action(command, result, null);
     }
@@ -421,11 +429,15 @@ public final class MainActivity extends Activity {
             return;
         }
         if (update != null) addField(command, "baseToken", update.token);
+        else if (!command.has("baseToken") && state.optBoolean("agendaIndex") && "check".equals(command.opt("op"))) {
+            addField(command, "baseToken", stateKey);
+        }
         outstanding++;
         app.call(command, (data, error) -> {
             outstanding--;
             if (!alive())
                 return;
+            if (error != null && command.has("viewYear")) renderPending = true;
             if (result != null)
                 result.accept(data, error);
             else if (error != null)
@@ -449,6 +461,7 @@ public final class MainActivity extends Activity {
         month = 0;
         section = "Год";
         body = null;
+        reminderPager = null;
         status = null;
         schedulePoll();
         stateKey = "";
@@ -461,12 +474,16 @@ public final class MainActivity extends Activity {
         root.addView(reason);
         root.addView(button("Повторить", () -> refresh(true)));
     }
-    private void newPage(String title, boolean eventPage) {
-        if (list != null) {
+    private void rememberListPosition() {
+        if (list != null && list.getChildCount() != 0 && requestedOffset < 0) {
             firstVisible = list.getFirstVisiblePosition();
             View top = list.getChildAt(0);
             topOffset = top == null ? 0 : top.getTop();
         }
+    }
+    private void newPage(String title, boolean eventPage) {
+        reminderPager = null;
+        rememberListPosition();
         list = null;
         root.removeAllViews();
         LinearLayout head = horizontal();
@@ -519,6 +536,16 @@ public final class MainActivity extends Activity {
             return;
         }
         JSONObject selected = selectedEvent();
+        if (selected != null && state.optBoolean("agendaIndex")) {
+            if (openedCard == null || !selectedId.equals(openedCard.opt("id")) || eventYear != openedCard.optInt("year")) {
+                newPage("Событие", true);
+                hint(body, str(selected, "title"));
+                hint(body, "Открываем карточку…");
+                requestCard();
+                return;
+            }
+            selected = openedCard;
+        }
         if (!selectedId.isEmpty() && selected == null)
             selectedId = "";
         newPage(selected != null ? "Событие" : "Год".equals(section) ? str(state, "workspaceName") : section, selected != null);
@@ -559,16 +586,50 @@ public final class MainActivity extends Activity {
         body.addView(scroll, new LinearLayout.LayoutParams(-1, -1));
         return inner;
     }
+    private void requestCard() {
+        String id = selectedId;
+        if (requestedCard.equals(id) && requestedEventYear == eventYear) return;
+        int occurrence = eventYear;
+        requestedEventYear = occurrence;
+        requestedCard = id;
+        long request = ++cardRequest;
+        JSONObject base = state;
+        String token = stateKey;
+        int requestedYear = year;
+        app.call(message("agendaCard", "year", year, "eventYear", occurrence, "eventId", id, "baseToken", token), (data, error) -> {
+            if (request != cardRequest) return;
+            if (!alive() || !active || base != state || !token.equals(stateKey) ||
+                    requestedYear != year || occurrence != eventYear || !id.equals(selectedId)) {
+                if (base == state && id.equals(requestedCard)) requestedCard = "";
+                return;
+            }
+            requestedCard = "";
+            JSONObject reply = data instanceof JSONObject ? (JSONObject) data : null;
+            JSONArray events = reply == null ? null : reply.optJSONArray("events");
+            JSONObject card = events != null && events.length() == 1 ? events.optJSONObject(0) : null;
+            if (error != null || card == null || !token.equals(reply.opt("baseToken")) ||
+                    !Integer.valueOf(year).equals(reply.opt("year")) || !id.equals(card.opt("id")) ||
+                    !Integer.valueOf(occurrence).equals(card.opt("year")) || card.optJSONArray("checklist") == null) {
+                selectedId = "";
+                render();
+                refresh(true, false);
+                return;
+            }
+            openedCard = card;
+            render();
+        });
+    }
+
     private JSONObject selectedEvent() {
         if (selectedId.isEmpty())
             return null;
-        JSONObject event = findSelected(state.optJSONArray("events"));
+        JSONObject event = eventYear == year ? findSelected(state.optJSONArray("events")) : null;
         return event != null ? event : findSelected(state.optJSONArray("tasks"));
     }
     private JSONObject findSelected(JSONArray rows) {
         for (int i = 0; rows != null && i < rows.length(); i++) {
             JSONObject event = rows.optJSONObject(i);
-            if (event != null && selectedId.equals(str(event, "id")) && year == event.optInt("year"))
+            if (event != null && selectedId.equals(str(event, "id")) && eventYear == event.optInt("year"))
                 return event;
         }
         return null;
@@ -580,13 +641,12 @@ public final class MainActivity extends Activity {
         detailOffset = 0;
         pendingTaskId = taskId;
         selectedId = id;
-        if (yr != year) {
-            resetList();
-            renderPending = true;
-            year = yr;
-            refresh(true);
-        } else
-            render();
+        eventYear = yr;
+        render();
+    }
+    void eventSaved(JSONObject previous, int newYear) {
+        if (previous == null || previous.optInt("year") == year) year = newYear;
+        eventYear = newYear;
     }
     private void changeYear(int by) {
         int next = year + by;
@@ -658,23 +718,127 @@ public final class MainActivity extends Activity {
     }
     private void agenda() {
         List<Row> rows = new ArrayList<>();
-        if (section.equals("Задачи"))
-            for (JSONObject e : items(array(state, "tasks"))) rows.add(eventRow(e));
-        else
-            for (JSONObject r : items(array(state, "reminders")))
-                rows.add(new Row(
-                        str(r, "title"), pretty(str(r, "date")), str(r, "eventId"), r.optInt("year", year), null, str(r, "taskId")));
-        if (rows.isEmpty())
-            rows.add(new Row(section.equals("Задачи") ? "Сейчас нет личных задач" : "Сейчас нет напоминаний",
-                    null, null, 0));
+        boolean reminders = "Напоминания".equals(section);
+        boolean paged = reminders && state.optBoolean("agendaIndex");
+        int count = paged ? state.optInt("reminderCount") : 0;
+        JSONArray entries = paged ? reminderPage : array(state, reminders ? "reminders" : "tasks");
+        if (paged && count > 0 && reminderPage == null) requestReminderPage(count);
+        appendAgendaRows(rows, entries, reminders, paged && count > 0 && reminderPage == null);
         if (section.equals("Напоминания")) {
             Button toggle = button(ReminderSchedule.enabled(this) ? "Выключить уведомления" : "Включить уведомления",
                     this::toggleAlerts);
             toggle.setEnabled(!changingReminders);
             body.addView(toggle);
         }
+        if (paged && count > REMINDERS_PER_PAGE) reminderPager = new ReminderPager(count, rows);
         displayRows(rows, null);
     }
+
+    private void appendAgendaRows(List<Row> rows, JSONArray entries, boolean reminders, boolean loadingPage) {
+        String previousDate = null;
+        String formattedDate = null;
+        for (int i = 0; entries != null && i < entries.length(); i++) {
+            JSONObject item = entries.optJSONObject(i);
+            if (item == null) continue;
+            if (reminders) {
+                String date = str(item, "date");
+                if (!date.equals(previousDate)) {
+                    previousDate = date;
+                    formattedDate = pretty(date);
+                }
+                rows.add(new Row(str(item, "title"), formattedDate, str(item, "eventId"),
+                        item.optInt("year", year), null, str(item, "taskId")));
+            } else {
+                rows.add(eventRow(item));
+            }
+        }
+        if (loadingPage) rows.add(new Row("Загружаем напоминания…", null, null, 0));
+        if (rows.isEmpty())
+            rows.add(new Row(section.equals("Задачи") ? "Сейчас нет личных задач" : "Сейчас нет напоминаний",
+                    null, null, 0));
+    }
+
+    private final class ReminderPager {
+        final int count;
+        final List<Row> rows;
+        final Button previous, next;
+        final TextView range;
+
+        ReminderPager(int count, List<Row> rows) {
+            this.count = count;
+            this.rows = rows;
+            LinearLayout pages = horizontal();
+            previous = button("Назад", () -> turn(-REMINDERS_PER_PAGE));
+            previous.setContentDescription("Предыдущая страница напоминаний");
+            pages.addView(previous);
+            range = text("", 14, false);
+            fill(pages, range);
+            next = button("Далее", () -> turn(REMINDERS_PER_PAGE));
+            next.setContentDescription("Следующая страница напоминаний");
+            pages.addView(next);
+            body.addView(pages);
+            updateControls();
+        }
+
+        void updateControls() {
+            previous.setEnabled(reminderOffset > 0);
+            next.setEnabled(reminderOffset + REMINDERS_PER_PAGE < count);
+            range.setText((reminderOffset + 1) + "–" + Math.min(count, reminderOffset + REMINDERS_PER_PAGE) + " из " + count);
+        }
+
+        void turn(int delta) {
+            if (reminderPager != this) return;
+            int target = reminderOffset + delta;
+            if (target < 0 || target >= count) return;
+            firstVisible = 0;
+            topOffset = 0;
+            reminderOffset = target;
+            reminderPage = null;
+            updateControls();
+            range.setText("Открываем " + range.getText());
+            list.setEnabled(false);
+            list.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS);
+            requestReminderPage(count);
+        }
+
+        void updateRows() {
+            rows.clear();
+            appendAgendaRows(rows, reminderPage, true, false);
+            ((BaseAdapter) list.getAdapter()).notifyDataSetChanged();
+            list.setSelectionFromTop(firstVisible, topOffset);
+            list.setEnabled(true);
+            list.setImportantForAccessibility(View.IMPORTANT_FOR_ACCESSIBILITY_AUTO);
+            updateControls();
+        }
+    }
+
+    private void requestReminderPage(int count) {
+        int offset = reminderOffset;
+        if (requestedOffset == offset) return;
+        requestedOffset = offset;
+        long request = ++pageRequest;
+        JSONObject base = state;
+        String token = stateKey;
+        app.call(message("reminderPage", "year", year, "baseToken", token, "offset", offset, "limit", REMINDERS_PER_PAGE), (data, error) -> {
+            if (request != pageRequest || base != state || requestedOffset != offset) return;
+            requestedOffset = -1;
+            if (!alive() || !active || !token.equals(stateKey) || offset != reminderOffset ||
+                    !selectedId.isEmpty() || !"Напоминания".equals(section)) return;
+            JSONObject reply = data instanceof JSONObject ? (JSONObject) data : null;
+            JSONArray rows = reply == null ? null : reply.optJSONArray("reminders");
+            if (error != null || rows == null || !Integer.valueOf(offset).equals(reply.opt("offset")) ||
+                    !Integer.valueOf(year).equals(reply.opt("year")) || !token.equals(reply.opt("baseToken")) ||
+                    rows.length() != Math.min(REMINDERS_PER_PAGE, count - offset)) {
+                go("Задачи");
+                refresh(true, false);
+                return;
+            }
+            reminderPage = rows;
+            if (reminderPager == null) render();
+            else reminderPager.updateRows();
+        });
+    }
+
     private void toggleAlerts() {
         if (changingReminders) return;
         if (ReminderSchedule.enabled(this)) {
@@ -731,15 +895,20 @@ public final class MainActivity extends Activity {
         }
     }
     private static JSONObject nextOpenTask(JSONObject event) {
+        if (event.has("nextOpenTask")) return event.optJSONObject("nextOpenTask");
         JSONArray tasks = event.optJSONArray("checklist");
-        JSONObject earliest = null;
+        Object earliest = null;
+        String firstDate = null;
         for (int i = 0; tasks != null && i < tasks.length(); i++) {
-            JSONObject task = tasks.optJSONObject(i);
-            if (task == null || task.optBoolean("done")) continue;
-            if (earliest == null || str(task, "dueDate").compareTo(str(earliest, "dueDate")) < 0)
+            Object task = tasks.opt(i);
+            if (!Boolean.FALSE.equals(ChecklistRows.field(task, ChecklistRows.DONE))) continue;
+            Object due = ChecklistRows.field(task, ChecklistRows.DATE);
+            if (due instanceof String && (firstDate == null || ((String) due).compareTo(firstDate) < 0)) {
+                firstDate = (String) due;
                 earliest = task;
+            }
         }
-        return earliest;
+        return ChecklistRows.object(earliest);
     }
 
     private void displayRows(List<Row> rows, View header) {
@@ -801,6 +970,7 @@ public final class MainActivity extends Activity {
             }
         });
         list.setOnItemClickListener((parent, v, pos, id) -> {
+            if (!parent.isEnabled() || pos < 0 || pos >= parent.getCount()) return;
             Object value = parent.getItemAtPosition(pos);
             if (value instanceof Row) {
                 Row r = (Row) value;
@@ -852,6 +1022,26 @@ public final class MainActivity extends Activity {
         return check;
     }
 
+    static final class CardView {
+        final int year;
+        final String token;
+        CardView(int year, String token) {
+            this.year = year;
+            this.token = token;
+        }
+        JSONObject bind(JSONObject command) {
+            if (command.optInt("year", year) != year) {
+                addField(command, "viewYear", year);
+                addField(command, "baseToken", token);
+            }
+            return command;
+        }
+    }
+
+    CardView cardView() {
+        return new CardView(year, stateKey);
+    }
+
     private void detail(JSONObject e) {
         LinearLayout form = scroller();
         ScrollView scroll = (ScrollView) form.getParent();
@@ -870,7 +1060,7 @@ public final class MainActivity extends Activity {
             hint(form, str(e, "description"));
         final JSONArray displayedEvents = state.optJSONArray("events");
         final int displayedYear = year;
-        List<JSONObject> tasks = items(array(e, "checklist"));
+        List<JSONObject> tasks = ChecklistRows.forCard(array(e, "checklist"));
         if (!tasks.isEmpty()) {
             label(form, "Чек-лист", 19);
             LocalDate today = LocalDate.now();
@@ -892,6 +1082,7 @@ public final class MainActivity extends Activity {
                     check.setEnabled(false);
                     JSONObject command = message("check", "eventId", str(e, "id"), "year", e.optInt("year"), "taskId",
                                    str(task, "id"), "done", check.isChecked());
+                    cardView().bind(command);
                     ChecklistUpdate update = ChecklistUpdate.forCommand(state, command);
                     action(command, (data, error) -> {
                         if (error != null) {
@@ -929,33 +1120,42 @@ public final class MainActivity extends Activity {
             hint(form, note);
         form.addView(button(note.isEmpty() ? "Добавить заметку" : "Изменить заметку", () -> {
             LinearLayout panel = vertical();
+            CardView view = cardView();
             EditText editor = field(panel, "Заметка за " + e.optInt("year") + " год", note, true);
             submit("Дневник события", panel, "Сохранить",
-                    ()
-                            -> message("note", "eventId", str(e, "id"), "year", e.optInt("year"), "text",
-                                    editor.getText().toString(), "base", note),
+                    () -> {
+                        String text = editor.getText().toString();
+                        if (!MobileLimits.withinNoteLimit(text)) {
+                            editor.requestFocus();
+                            throw new IllegalArgumentException("Заметка не должна превышать " +
+                                    MobileLimits.MAX_NOTE_CHARS + " символов.");
+                        }
+                        return view.bind(message("note", "eventId", str(e, "id"), "year", e.optInt("year"), "text",
+                                text, "base", note));
+                    },
                     null);
         }));
         line(form);
         form.addView(button("Редактировать событие", () -> new EventForm(this, e).show()));
         form.addView(button("Удалить событие…", () -> {
+            CardView view = cardView();
             boolean yearly = e.optBoolean("yearly");
             if (yearly)
                 chooser("Как удалить событие?",
                         new String[] {"Только за " + e.optInt("year") + " год", "За этот и следующие годы"},
-                        -1, i -> delete(e, i == 0 ? "year" : "future"));
+                        -1, i -> delete(view, e, i == 0 ? "year" : "future"));
             else
-                delete(e, "future");
+                delete(view, e, "future");
         }));
     }
-    private void delete(JSONObject e, String scope) {
+    private void delete(CardView view, JSONObject e, String scope) {
         confirm("Удалить событие?",
                 str(e, "title")
                         + (scope.equals("future") && e.optBoolean("yearly") ? " · этот и следующие годы"
                                                                             : " · " + e.optInt("year")),
                 "Удалить", () -> {
-                    action(message("deleteEvent", "eventId", str(e, "id"), "year", e.optInt("year"),
-                                   "revision", str(e, "revision"), "scope", scope),
+                    action(view.bind(message("deleteEvent", "eventId", str(e, "id"), "year", e.optInt("year"),
+                                   "revision", str(e, "revision"), "scope", scope)),
                             (unused, error) -> {
                                 if (error != null)
                                     feedback(error);

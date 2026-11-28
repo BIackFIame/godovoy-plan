@@ -127,7 +127,7 @@ impl Inbound {
         if ports.udp.is_none()
             && let Some(port) = self.config.discovery_port
         {
-            match discovery_socket(*self.config.listen.ip(), port) {
+            match discovery::socket(*self.config.listen.ip(), port) {
                 Ok(socket) => {
                     let mut socket = mio::net::UdpSocket::from_std(socket);
                     ports.udp_ready = Self::register(&self.udp_signal, &mut socket);
@@ -162,6 +162,10 @@ impl Inbound {
     }
     pub(super) fn warning(&self) -> Option<String> {
         self.ports.lock().unwrap().warning.clone()
+    }
+    #[cfg(test)]
+    pub(super) fn discovery_bound(&self) -> bool {
+        self.ports.lock().unwrap().udp.is_some()
     }
     pub(super) fn retry_at(&self) -> Option<Instant> {
         self.ports.lock().unwrap().retry

@@ -1,9 +1,9 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    io::{self, BufRead, BufReader, BufWriter, Read, Write},
+    io::{self, Read, Write},
     net::{Ipv4Addr, SocketAddr, SocketAddrV4, TcpListener, TcpStream, UdpSocket},
     sync::{
-        Arc, Mutex, OnceLock, Weak,
+        Arc, Mutex, MutexGuard, OnceLock, Weak,
         atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering},
         mpsc::{self, Receiver},
     },
@@ -12,20 +12,19 @@ use std::{
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use blake2::{Blake2s256, Digest};
 use chrono::Utc;
-use flate2::{Compression, bufread::ZlibDecoder, write::ZlibEncoder};
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-use snow::{Builder, TransportState};
+use serde::{Deserialize, Serialize};
+use snow::TransportState;
 use socket2::{Domain, Protocol, Socket, Type};
 use subtle::ConstantTimeEq;
+use zeroize::Zeroizing;
 
 use crate::{
     Fallible,
     model::{Calendar, Id, MAX_PLANS, PLAN_LIMIT_ERROR, Record},
     storage::{
-        CALENDAR_MESSAGE_LIMIT, LimitedWriter, LocalState, PeerRoutes, SharedStore, Store,
-        StoreReader, Workspace, random_bytes,
+        LimitedWriter, LocalState, PeerRoutes, SharedStore, Store,
+        StoreReader, Workspace,
     },
 };
 
@@ -37,13 +36,16 @@ mod inbound;
 use inbound::{Inbound, Wait};
 mod pairing;
 use pairing::{ChannelKey, PairingKeys};
+mod scheduler;
+use scheduler::{PeerProtocol, sync_forever};
+mod wire;
+use wire::{
+    MAGIC, MESSAGE_LIMIT, Operation, SYNC_HELLO_LEN, calendar_digest, header, noise, read_calendar,
+    read_control, read_frame, read_secure, send_calendar, send_control, send_secure, write_frame,
+};
 
 pub const SYNC_PORT: u16 = 45736;
 pub const DISCOVERY_PORT: u16 = 45737;
-const MAGIC: [u8; 8] = *b"YRCAL001";
-const NOISE: &str = "Noise_NNpsk0_25519_ChaChaPoly_BLAKE2s";
-const FRAME: usize = 60_000;
-const MESSAGE_LIMIT: usize = CALENDAR_MESSAGE_LIMIT;
 const MAX_PEERS: usize = 64;
 const MAX_REVISION_LEAD: u64 = 1_000_000;
 const SESSION_LIMIT: Duration = Duration::from_secs(6);
@@ -51,34 +53,18 @@ const INVITE_PROBE_LIMIT: Duration = Duration::from_millis(1200);
 const IO_POLL: Duration = Duration::from_millis(400);
 const DISCOVERY_TTL: Duration = Duration::from_secs(20);
 const INVITE_TTL: Duration = Duration::from_secs(15 * 60);
+const INVITE_CODE_LIMIT: usize = 300;
+const INVITE_KEY_TEXT_LEN: usize = 43;
 const LEGACY_RECHECK: Duration = Duration::from_secs(60);
 // Advertised only inside authenticated digest-sync handshakes. Older peers
 // ignore the optional payload and retain their original polling cadence.
-const DIGEST_CAPABILITIES: Capabilities = Capabilities::EDIT_WAKE.union(Capabilities::DELTA);
-const QUIET_SYNC_INTERVAL: Duration = Duration::from_secs(9);
+const DIGEST_CAPABILITIES: Capabilities = Capabilities::EDIT_WAKE
+    .union(Capabilities::DELTA)
+    .union(Capabilities::MUTUAL_DELTA)
+    .union(Capabilities::REVISION_HINT);
 const QUIET_INBOUND: Duration = Duration::from_secs(11);
 const RECENT_INBOUND: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy, Eq, PartialEq)]
-#[repr(u8)]
-enum Operation {
-    LegacySync = 1,
-    Join = 2,
-    DigestSync = 3,
-}
-
-impl TryFrom<u8> for Operation {
-    type Error = &'static str;
-
-    fn try_from(value: u8) -> Result<Self, Self::Error> {
-        match value {
-            1 => Ok(Self::LegacySync),
-            2 => Ok(Self::Join),
-            3 => Ok(Self::DigestSync),
-            _ => Err("Неизвестный тип подключения."),
-        }
-    }
-}
+const OVERLAP_DEFER: Duration = Duration::from_millis(300);
 
 #[derive(Clone, Copy)]
 pub struct Config {
@@ -106,7 +92,8 @@ impl Default for Config {
 struct InviteState {
     device: Id,
     recipient: [u8; 32],
-    key: [u8; 32],
+    // The invitation map can move entries when inserting or removing a key.
+    key: Box<Zeroizing<[u8; 32]>>,
     expires: Instant,
     used_by: Option<(Id, [u8; 32])>,
 }
@@ -143,7 +130,8 @@ struct Core {
     discovered: Mutex<BTreeMap<SocketAddrV4, Seen>>,
     routes: Mutex<PeerRoutes>,
     connected: Mutex<BTreeMap<Id, Instant>>,
-    inbound_until: Mutex<BTreeMap<SocketAddrV4, Instant>>,
+    inbound_until: Mutex<BTreeMap<SocketAddrV4, InboundGrace>>,
+    receiving_deltas: Mutex<BTreeMap<SocketAddrV4, ReceivingDelta>>,
     status: Mutex<Status>,
     digest: Mutex<Option<CachedDigest>>,
     delta_baselines: delta::Baselines,
@@ -155,10 +143,63 @@ struct CachedDigest {
     digest: [u8; 32],
 }
 
+struct InboundGrace {
+    until: Instant,
+    confirmed: Option<ConfirmedInbound>,
+}
+
+struct ConfirmedInbound {
+    workspace: Weak<Workspace>,
+    generation: usize,
+}
+
+impl ConfirmedInbound {
+    fn matches(&self, state: &LocalState, generation: usize) -> bool {
+        self.generation == generation
+            && state
+                .workspace
+                .as_ref()
+                .is_some_and(|live| std::ptr::eq(Arc::as_ptr(live), self.workspace.as_ptr()))
+    }
+}
+
+struct InboundDelta<'a> {
+    core: &'a Core,
+    peer: SocketAddrV4,
+}
+
+struct ReceivingDelta {
+    count: usize,
+    defer_until: Instant,
+}
+
+impl Drop for InboundDelta<'_> {
+    fn drop(&mut self) {
+        let mut receiving = self.core.receiving_deltas.lock().unwrap();
+        let active = receiving
+            .get_mut(&self.peer)
+            .expect("registered inbound delta");
+        active.count -= 1;
+        if active.count == 0 {
+            let still_deferred = active.defer_until > Instant::now();
+            receiving.remove(&self.peer);
+            drop(receiving);
+            if still_deferred {
+                self.core.wake_sync();
+            }
+        }
+    }
+}
+
 pub struct Network {
     core: Arc<Core>,
     workers: Vec<thread::JoinHandle<()>>,
-    joining: Mutex<Option<thread::JoinHandle<()>>>,
+    joining: Mutex<Option<AccessJob>>,
+}
+
+struct AccessJob {
+    worker: thread::JoinHandle<()>,
+    completed: Arc<AtomicBool>,
 }
 
 impl Network {
@@ -184,7 +225,7 @@ impl Network {
         let mut workers = Vec::new();
         if let Some(port) = config.discovery_port {
             let core = Arc::clone(&core);
-            workers.push(thread::spawn(move || discover(core, udp, port)));
+            workers.push(thread::spawn(move || discovery::run(core, udp, port)));
         }
         let accept_core = Arc::clone(&core);
         workers.push(thread::spawn(move || listen_forever(accept_core, tcp)));
@@ -243,6 +284,20 @@ impl Network {
         connected.values().any(|&seen| now - seen < DISCOVERY_TTL)
     }
 
+    #[cfg(feature = "desktop")]
+    pub fn recent_peer_remaining(&self) -> Option<Duration> {
+        let latest = self
+            .core
+            .connected
+            .lock()
+            .unwrap()
+            .values()
+            .max()
+            .copied()?;
+        let remaining = DISCOVERY_TTL.saturating_sub(latest.elapsed());
+        (!remaining.is_zero()).then_some(remaining)
+    }
+
     pub fn paused(&self) -> bool {
         self.core.paused.load(Ordering::Relaxed)
     }
@@ -279,6 +334,8 @@ impl Network {
     }
 
     pub fn make_invite(&self, request: &str) -> Fallible<String> {
+        use std::fmt::Write as _;
+
         let (recipient_device, recipient) = PairingKeys::from_request(request)?;
         self.core.require_available()?;
         let state = self.core.snapshot();
@@ -292,7 +349,10 @@ impl Network {
             return Err("Слишком много активных приглашений. Попробуйте позже.".into());
         }
         let id = Id::new_v4();
-        let key = random_bytes()?;
+        let mut key = Box::new(Zeroizing::new([0; 32]));
+        getrandom::fill(&mut key[..]).map_err(|error| io::Error::other(error.to_string()))?;
+        let mut encoded = Zeroizing::new([0; INVITE_KEY_TEXT_LEN]);
+        let encoded_len = URL_SAFE_NO_PAD.encode_slice(&key[..], &mut encoded[..])?;
         invites.insert(
             id,
             InviteState {
@@ -306,11 +366,14 @@ impl Network {
         let address = self
             .address()
             .map_or_else(|| "-".into(), |addr| addr.to_string());
-        Ok(format!(
+        let mut code = String::with_capacity(INVITE_CODE_LIMIT);
+        write!(
+            code,
             "yr2.{device}.{id}.{}.{}.{address}",
-            URL_SAFE_NO_PAD.encode(key),
+            std::str::from_utf8(&encoded[..encoded_len])?,
             self.core.pairing.encoded_public()
-        ))
+        )?;
+        Ok(code)
     }
 
     pub fn join_async(
@@ -319,7 +382,8 @@ impl Network {
         employee: String,
         address: Option<SocketAddrV4>,
     ) -> Receiver<Fallible<()>> {
-        self.access_job(move |core| join(core, &code, employee, address, false))
+        let code = Zeroizing::new(code);
+        self.access_job(move |core| join(core, code, employee, address, false))
     }
 
     pub fn rejoin_async(
@@ -327,6 +391,7 @@ impl Network {
         code: String,
         address: Option<SocketAddrV4>,
     ) -> Receiver<Fallible<()>> {
+        let code = Zeroizing::new(code);
         let state = self.core.snapshot();
         let name = state
             .workspace
@@ -336,7 +401,7 @@ impl Network {
             .unwrap_or_default();
         self.access_job(move |core| {
             core.pause_for_renewal()?;
-            join(core, &code, name, address, true)
+            join(core, code, name, address, true)
         })
     }
 
@@ -368,17 +433,26 @@ impl Network {
         let core = Arc::clone(&self.core);
         let (send, receive) = mpsc::sync_channel(1);
         let mut joining = self.joining.lock().unwrap();
-        if joining.as_ref().is_some_and(|job| !job.is_finished()) {
+        if joining
+            .as_ref()
+            .is_some_and(|job| !job.completed.load(Ordering::Acquire) && !job.worker.is_finished())
+        {
             let _ = send.send(Err("Подключение уже выполняется.".into()));
             return receive;
         }
-        if let Some(previous) = joining.take() {
-            let _ = previous.join();
-        }
-        *joining = Some(thread::spawn(move || {
+        let previous = joining.take().map(|job| job.worker);
+        let completed = Arc::new(AtomicBool::new(false));
+        let worker_completed = Arc::clone(&completed);
+        let worker = thread::spawn(move || {
+            if let Some(previous) = previous {
+                let _ = previous.join();
+            }
             let result = work(&core);
+            // A reply permits another operation even while this thread is exiting.
+            worker_completed.store(true, Ordering::Release);
             let _ = send.send(result);
-        }));
+        });
+        *joining = Some(AccessJob { worker, completed });
         receive
     }
 
@@ -421,8 +495,8 @@ impl Drop for Network {
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
-        if let Some(worker) = self.joining.get_mut().unwrap().take() {
-            let _ = worker.join();
+        if let Some(job) = self.joining.get_mut().unwrap().take() {
+            let _ = job.worker.join();
         }
     }
 }
@@ -450,6 +524,7 @@ impl Core {
             routes: Mutex::new(routes),
             connected: Mutex::default(),
             inbound_until: Mutex::default(),
+            receiving_deltas: Mutex::default(),
             status: Mutex::default(),
             digest: Mutex::default(),
             delta_baselines: Default::default(),
@@ -563,22 +638,55 @@ impl Core {
         }
     }
 
+    fn receive_delta(&self, peer: SocketAddrV4) -> InboundDelta<'_> {
+        self.receiving_deltas
+            .lock()
+            .unwrap()
+            .entry(peer)
+            .or_insert_with(|| ReceivingDelta {
+                count: 0,
+                defer_until: Instant::now() + OVERLAP_DEFER,
+            })
+            .count += 1;
+        InboundDelta { core: self, peer }
+    }
+
     fn snapshot(&self) -> Arc<LocalState> {
         self.reader.snapshot().state
     }
 
     fn calendar_digest(&self, state: &LocalState) -> Fallible<[u8; 32]> {
+        self.calendar_digest_with(state, None)
+    }
+
+    fn calendar_digest_with(
+        &self,
+        state: &LocalState,
+        verified: Option<CachedDigest>,
+    ) -> Fallible<[u8; 32]> {
         let workspace = state.workspace.as_ref().ok_or("Пространство недоступно.")?;
         let mut cache = self.digest.lock().unwrap();
         let observed = Arc::downgrade(workspace);
         if let Some(record) = cache.as_ref().filter(|r| r.workspace.ptr_eq(&observed)) {
             return Ok(record.digest);
         }
-        let digest = calendar_digest(&workspace.calendar)?;
-        *cache = Some(CachedDigest {
-            workspace: observed,
-            digest,
-        });
+        let digest = match verified.filter(|r| r.workspace.ptr_eq(&observed)) {
+            Some(record) => record.digest,
+            None => calendar_digest(&workspace.calendar)?,
+        };
+        // An in-flight exchange may finish after a newer Workspace was published.
+        // Check the live Arc while holding the digest lock, before replacing its cache.
+        if self
+            .snapshot()
+            .workspace
+            .as_ref()
+            .is_some_and(|live| Arc::ptr_eq(live, workspace))
+        {
+            *cache = Some(CachedDigest {
+                workspace: observed,
+                digest,
+            });
+        }
         Ok(digest)
     }
 
@@ -586,11 +694,15 @@ impl Core {
         let mut connected = self.connected.lock().unwrap();
         let now = Instant::now();
         connected.retain(|_, seen| now - *seen < DISCOVERY_TTL);
+        let became_online = connected.is_empty();
         if connected.len() < MAX_PEERS || connected.contains_key(&device) {
             connected.insert(device, now);
         }
         drop(connected);
         self.status.lock().unwrap().last_sync = Some(Utc::now().timestamp());
+        if became_online {
+            self.reader.repaint_window();
+        }
     }
 
     fn exchanged(&self, device: Id, peer: SocketAddrV4) {
@@ -601,18 +713,48 @@ impl Core {
         self.synchronized(device);
     }
 
-    fn inbound_exchange(&self, own: Id, device: Id, peer: SocketAddrV4, grace: Duration) {
-        // The lower device ID prefers initiating once an incoming session has
-        // proved the path works. The other side can still dial when it goes quiet.
-        if device < own {
+    fn inbound_schedule(
+        &self,
+        now: Instant,
+    ) -> MutexGuard<'_, BTreeMap<SocketAddrV4, InboundGrace>> {
+        let mut incoming = self.inbound_until.lock().unwrap();
+        if incoming.is_empty() {
+            return incoming;
+        }
+        let state = self.snapshot();
+        let generation = self.generation.load(Ordering::Acquire);
+        incoming.retain(|_, entry| {
+            entry.until > now
+                && entry
+                    .confirmed
+                    .as_ref()
+                    .is_none_or(|confirmed| confirmed.matches(&state, generation))
+        });
+        incoming
+    }
+
+    fn inbound_exchange(
+        &self,
+        own: Id,
+        device: Id,
+        peer: SocketAddrV4,
+        grace: Duration,
+        confirmed: Option<ConfirmedInbound>,
+    ) {
+        // Ordinary exchanges use the existing device ordering. A peer that
+        // proved the current version needs no immediate reverse connection.
+        let defer = match &confirmed {
+            Some(exact) => exact.matches(&self.snapshot(), self.generation.load(Ordering::Acquire)),
+            None => device < own,
+        };
+        if defer {
             let now = Instant::now();
-            let mut inbound_until = self.inbound_until.lock().unwrap();
-            inbound_until.retain(|_, expiry| *expiry > now);
+            let mut inbound_until = self.inbound_schedule(now);
             if inbound_until.len() < MAX_PEERS || inbound_until.contains_key(&peer) {
-                let expiry = now + grace;
+                let until = now + grace;
                 if inbound_until
-                    .insert(peer, expiry)
-                    .is_some_and(|old| expiry < old)
+                    .insert(peer, InboundGrace { until, confirmed })
+                    .is_some_and(|old| until < old.until)
                 {
                     self.wake_sync();
                 }
@@ -633,19 +775,57 @@ impl Core {
     }
 
     fn merge(&self, packet: SyncPacket) -> Fallible<()> {
+        self.merge_in_scope(packet, None)
+    }
+
+    fn merge_in_scope(&self, packet: SyncPacket, scope: Option<delta::PeerScope>) -> Fallible<()> {
+        self.merge_received(packet, scope, None).map(|_| ())
+    }
+
+    // Returns the committed Workspace only for a patch applied to its original base.
+    // Callers still have to verify the touched records before reusing a peer digest.
+    fn merge_received(
+        &self,
+        mut packet: SyncPacket,
+        scope: Option<delta::PeerScope>,
+        patch_base: Option<&Calendar>,
+    ) -> Fallible<Option<Arc<Workspace>>> {
         self.require_available()?;
         let now = Utc::now().timestamp();
         validate_incoming_calendar(&packet.calendar, packet.device)?;
         let mut store = self.store.lock().unwrap();
         self.require_available()?;
-        merge_validated_calendar(
+        let current = store.snapshot();
+        if let Some(scope) = scope {
+            scope.check(&current)?;
+        }
+        let unchanged_base = match patch_base {
+            Some(base) => std::ptr::eq(base, &workspace(&current)?.calendar),
+            None => false,
+        };
+        if let Some(base) = patch_base.filter(|_| !unchanged_base) {
+            // Another writer changed the base. Recreate the verified peer image
+            // so the CRDT merge retains the same semantics as a full transfer.
+            packet.calendar = delta::restore_plans(base, packet.calendar, None);
+            validate_incoming_calendar(&packet.calendar, packet.device)?;
+        }
+        let changed = merge_validated_calendar(
             &mut store,
             packet.workspace,
             packet.device,
             packet.calendar,
             Some(now),
         )?;
-        Ok(())
+        let committed = if unchanged_base {
+            store.snapshot().workspace.clone()
+        } else {
+            None
+        };
+        drop(store);
+        if changed {
+            self.reader.repaint_window();
+        }
+        Ok(committed)
     }
 }
 
@@ -762,133 +942,6 @@ fn check_address(address: SocketAddrV4) -> Fallible<()> {
     }
 }
 
-fn discovery_socket(ip: Ipv4Addr, port: u16) -> io::Result<UdpSocket> {
-    let socket = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
-    socket.set_reuse_address(true)?;
-    #[cfg(unix)]
-    socket.set_reuse_port(true)?;
-    socket.set_broadcast(ip.is_unspecified())?;
-    socket.bind(&SocketAddrV4::new(ip, port).into())?;
-    socket.set_nonblocking(true)?;
-    Ok(socket.into())
-}
-
-fn discover(core: Arc<Core>, mut wait: Wait, port: u16) {
-    let inbound = core.inbound.get().unwrap();
-    let mut announce_at = Instant::now();
-    // One extra byte distinguishes oversized/truncated packets.
-    let mut packet = [0; discovery::LENGTH + 1];
-    while !core.stopped.load(Ordering::Relaxed) {
-        if !core.active() {
-            inbound.wait_for_resume(&core);
-            continue;
-        }
-        if Instant::now() >= announce_at {
-            announce_at = Instant::now() + Duration::from_secs(3);
-            let state = core.snapshot();
-            if let Some(team) = &state.workspace {
-                let mut keys = vec![discovery::Key::derive(&team.key, true, team.id)];
-                let invites = core.invites.lock().unwrap();
-                keys.extend(
-                    invites
-                        .iter()
-                        .filter(|(_, invite)| invite.expires > Instant::now())
-                        .map(|(id, invite)| discovery::Key::derive(&invite.key, false, *id)),
-                );
-                drop(invites);
-                for key in keys {
-                    if !core.active() {
-                        break;
-                    }
-                    if let Some(message) = key.seal(
-                        state.device,
-                        team.id,
-                        core.advertised_port(),
-                        Utc::now().timestamp(),
-                    ) {
-                        inbound.announce(&message, port);
-                    }
-                }
-            }
-        }
-        let (registered, result) = inbound.receive(&mut packet);
-        let source = match result {
-            Ok((discovery::LENGTH, SocketAddr::V4(source))) if core.active() => source,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                wait.until(
-                    registered,
-                    announce_at.saturating_duration_since(Instant::now()),
-                );
-                continue;
-            }
-            Err(_) => {
-                thread::park_timeout(Duration::from_millis(40));
-                continue;
-            }
-            _ => continue,
-        };
-        if !core.active() || !core.permits_ip(*source.ip()) {
-            continue;
-        }
-        let state = core.snapshot();
-        let now = Utc::now().timestamp();
-        let packet = &packet[..discovery::LENGTH];
-        let hint = state
-            .workspace
-            .as_ref()
-            .and_then(|team| {
-                discovery::Key::derive(&team.key, true, team.id)
-                    .open(packet, now)
-                    .filter(|(_, group, _)| *group == team.id)
-            })
-            .or_else(|| {
-                let pending = core.pending_discovery.lock().unwrap();
-                let (host, key) = pending.as_ref()?;
-                key.open(packet, now).filter(|(from, _, _)| from == host)
-            });
-        let Some((from, remote_workspace, listen_port)) = hint else {
-            continue;
-        };
-        if from == state.device {
-            continue;
-        }
-        let address = SocketAddrV4::new(*source.ip(), listen_port);
-        let mut seen = core.discovered.lock().unwrap();
-        let new_route = seen.get(&address).is_none_or(|old| {
-            old.workspace != remote_workspace || old.time.elapsed() >= DISCOVERY_TTL
-        });
-        remember_discovery(
-            &mut seen,
-            address,
-            Seen {
-                device: from,
-                workspace: remote_workspace,
-                time: Instant::now(),
-            },
-        );
-        if new_route && seen.contains_key(&address) {
-            core.wake_sync();
-        }
-    }
-}
-
-fn remember_discovery(
-    seen: &mut BTreeMap<SocketAddrV4, Seen>,
-    address: SocketAddrV4,
-    beacon: Seen,
-) {
-    seen.retain(|previous, record| {
-        let same_device = previous.ip() == address.ip()
-            && record.device == beacon.device
-            && record.workspace == beacon.workspace;
-        !same_device && beacon.time.saturating_duration_since(record.time) < DISCOVERY_TTL
-    });
-    let other_ports = seen.keys().filter(|key| key.ip() == address.ip()).count();
-    if seen.contains_key(&address) || (seen.len() < MAX_PEERS && other_ports < 3) {
-        seen.insert(address, beacon);
-    }
-}
-
 fn listen_forever(core: Arc<Core>, mut wait: Wait) {
     let inbound = core.inbound.get().unwrap();
     // Limit work per source and join handlers before releasing the profile.
@@ -935,177 +988,6 @@ fn listen_forever(core: Arc<Core>, mut wait: Wait) {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-enum PeerProtocol {
-    #[default]
-    Unknown,
-    LegacyUntil(Instant),
-    Digest,
-}
-
-struct Backoff {
-    next: Instant,
-    last_attempt: Instant,
-    protocol: PeerProtocol,
-    failures: u8,
-    quiet_matches: u8,
-}
-
-impl Backoff {
-    fn record_exchange(&mut self, result: Fallible<SyncPace>, now: Instant) {
-        self.quiet_matches = if matches!(result, Ok(SyncPace::QuietMatch)) {
-            self.quiet_matches.saturating_add(1)
-        } else {
-            0
-        };
-        self.failures = if result.is_ok() {
-            0
-        } else {
-            (self.failures + 1).min(3)
-        };
-        let interval = if self.quiet_matches >= 2 {
-            QUIET_SYNC_INTERVAL
-        } else {
-            Duration::from_secs(3 << self.failures.saturating_sub(1))
-        };
-        self.last_attempt = now;
-        self.next = self.last_attempt + interval;
-    }
-}
-
-fn next_peer(
-    peers: &BTreeSet<SocketAddrV4>,
-    preferred: &BTreeSet<SocketAddrV4>,
-    attempts: &BTreeMap<SocketAddrV4, Backoff>,
-    inbound_until: &BTreeMap<SocketAddrV4, Instant>,
-    now: Instant,
-) -> Option<SocketAddrV4> {
-    peers
-        .iter()
-        .copied()
-        .filter(|peer| inbound_until.get(peer).is_none_or(|expiry| *expiry <= now))
-        .filter(|peer| attempts.get(peer).is_none_or(|retry| retry.next <= now))
-        .min_by_key(|peer| {
-            (
-                attempts.get(peer).map(|retry| retry.next),
-                !preferred.contains(peer),
-            )
-        })
-}
-
-fn sync_forever(core: Arc<Core>) {
-    let _ = core
-        .inbound
-        .get()
-        .unwrap()
-        .sync_thread
-        .set(thread::current());
-    let inbound = core.inbound.get().unwrap();
-    let calendar_wake = core.store.lock().unwrap().subscribe_calendar();
-    let mut attempts = BTreeMap::<SocketAddrV4, Backoff>::new();
-    let mut generation = core.generation.load(Ordering::Acquire);
-    while !core.stopped.load(Ordering::Relaxed) {
-        inbound.retry(&core);
-        let current_generation = core.generation.load(Ordering::Acquire);
-        if generation != current_generation {
-            let now = Instant::now();
-            for attempt in attempts.values_mut() {
-                // Recheck reachability on resume without forgetting a known
-                // digest peer and allowing legacy fallback on its address.
-                attempt.last_attempt = now;
-                attempt.next = now;
-                attempt.failures = 0;
-                attempt.quiet_matches = 0;
-            }
-            core.inbound_until.lock().unwrap().clear();
-            generation = current_generation;
-        }
-        let mut delay = Duration::from_secs(3);
-        if core.active()
-            && let Ok((_, workspace, _)) = core.sync_context()
-        {
-            let mut preferred: BTreeSet<_> = core.routes.lock().unwrap().addresses().collect();
-            preferred.extend(core.discovered.lock().unwrap().iter().filter_map(
-                |(&address, seen)| {
-                    (seen.workspace == workspace && seen.time.elapsed() < DISCOVERY_TTL)
-                        .then_some(address)
-                },
-            ));
-            let peers: BTreeSet<_> = core
-                .snapshot()
-                .peers
-                .union(&preferred)
-                .filter(|peer| core.permits_ip(*peer.ip()))
-                .copied()
-                .collect();
-            attempts.retain(|address, _| peers.contains(address));
-            let now = Instant::now();
-            for address in &peers {
-                attempts.entry(*address).or_insert(Backoff {
-                    // A newly admitted peer must finish saving its workspace
-                    // before it can authenticate a separate sync connection.
-                    next: now + Duration::from_millis(300),
-                    last_attempt: now,
-                    failures: 0,
-                    quiet_matches: 0,
-                    protocol: PeerProtocol::Unknown,
-                });
-            }
-            if calendar_wake.take_change() {
-                // A real edit can use either direction. Preserve the failure backoff
-                // and coalesce rapid writes to a healthy peer into one exchange.
-                core.inbound_until.lock().unwrap().clear();
-                for attempt in attempts
-                    .values_mut()
-                    .filter(|attempt| attempt.failures == 0)
-                {
-                    attempt.quiet_matches = 0;
-                    attempt.next = attempt
-                        .next
-                        .min(attempt.last_attempt + Duration::from_millis(300));
-                }
-            }
-            let address = next_peer(
-                &peers,
-                &preferred,
-                &attempts,
-                &core.inbound_until.lock().unwrap(),
-                now,
-            );
-            if let Some(address) = address {
-                let retry = attempts.get_mut(&address).expect("known peer");
-                let result = sync_peer(&core, address, &mut retry.protocol);
-                retry.record_exchange(result, Instant::now());
-            }
-            // Respect the existing 300 ms pacing between distinct ready peers.
-            // With nothing due, sleep until the earliest possible connection.
-            let now = Instant::now();
-            let incoming = core.inbound_until.lock().unwrap();
-            if let Some(earliest) = peers
-                .iter()
-                .map(|peer| {
-                    let retry = attempts.get(peer).map_or(now, |entry| entry.next);
-                    retry.max(incoming.get(peer).copied().unwrap_or(now))
-                })
-                .min()
-            {
-                delay = earliest
-                    .saturating_duration_since(now)
-                    .max(Duration::from_millis(300));
-            }
-        }
-        let retry = inbound
-            .retry_at()
-            .map(|deadline| deadline.saturating_duration_since(Instant::now()));
-        match (core.active(), retry) {
-            (true, Some(retry)) => thread::park_timeout(delay.min(retry)),
-            (true, None) => thread::park_timeout(delay),
-            (false, Some(retry)) => thread::park_timeout(retry),
-            (false, None) => thread::park(),
-        }
-    }
-}
-
 #[derive(Serialize, Deserialize)]
 struct SyncPacket<C = Calendar> {
     device: Id,
@@ -1147,7 +1029,49 @@ struct JoinCredentials {
     host_public: [u8; 32],
     host: Id,
     id: Id,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
+}
+
+impl JoinCredentials {
+    fn parse(code: &str) -> Fallible<(Self, Option<SocketAddrV4>)> {
+        let code = code.trim();
+        // IPv4 содержит точки. Читаем первые пять полей и оставляем адрес целиком.
+        let mut fields = code.splitn(6, '.');
+        if code.len() > INVITE_CODE_LIMIT || fields.next() != Some("yr2") {
+            return Err(
+                "Нужен адресный код приглашения от коллеги с версией 0.5.41 или новее.".into(),
+            );
+        }
+        let host = Id::parse_str(fields.next().ok_or("В коде отсутствует устройство.")?)?;
+        let id = Id::parse_str(fields.next().ok_or("В коде отсутствует приглашение.")?)?;
+        let encoded = fields.next().ok_or("В коде отсутствует ключ.")?;
+        if encoded.len() != INVITE_KEY_TEXT_LEN {
+            return Err("Неверная длина ключа.".into());
+        }
+        let mut key = Zeroizing::new([0; 32]);
+        let decoded_len = URL_SAFE_NO_PAD
+            .decode_slice(encoded, &mut key[..])
+            .map_err(|_| "Некорректный ключ приглашения.")?;
+        if decoded_len != key.len() {
+            return Err("Неверная длина ключа.".into());
+        }
+        let host_public =
+            pairing::decode_public(fields.next().ok_or("Нет ключа приглашающего устройства.")?)?;
+        let embedded = match fields.next().ok_or("Код приглашения неполный.")?
+        {
+            "-" => None,
+            value => Some(value.parse::<SocketAddrV4>()?),
+        };
+        Ok((
+            Self {
+                host_public,
+                host,
+                id,
+                key,
+            },
+            embedded,
+        ))
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -1157,41 +1081,23 @@ struct InvitationFallback<'a> {
     attempted: &'a BTreeSet<SocketAddrV4>,
 }
 
+fn valid_employee_name(name: &str) -> bool {
+    !name.trim().is_empty() && name.chars().count() <= 80
+}
+
 fn join(
     core: &Core,
-    code: &str,
+    code: Zeroizing<String>,
     employee: String,
     manual_address: Option<SocketAddrV4>,
     renewal: bool,
 ) -> Fallible<()> {
     core.require_operation(renewal)?;
-    let code = code.trim();
-    // IPv4 содержит точки. Читаем первые пять полей и оставляем адрес целиком.
-    let mut fields = code.splitn(6, '.');
-    if code.len() > 300 || fields.next() != Some("yr2") {
-        return Err("Нужен адресный код приглашения от коллеги с версией 0.5.41 или новее.".into());
-    }
-    let host = Id::parse_str(fields.next().ok_or("В коде отсутствует устройство.")?)?;
-    let id = Id::parse_str(fields.next().ok_or("В коде отсутствует приглашение.")?)?;
-    let encoded = fields.next().ok_or("В коде отсутствует ключ.")?;
-    let key: [u8; 32] = URL_SAFE_NO_PAD
-        .decode(encoded)?
-        .try_into()
-        .map_err(|_| "Неверная длина ключа.")?;
-    let host_public =
-        pairing::decode_public(fields.next().ok_or("Нет ключа приглашающего устройства.")?)?;
-    let credentials = JoinCredentials {
-        host,
-        id,
-        key,
-        host_public,
-    };
-    let embedded = match fields.next().ok_or("Код приглашения неполный.")? {
-        "-" => None,
-        value => Some(value.parse::<SocketAddrV4>()?),
-    };
+    let (credentials, embedded) = JoinCredentials::parse(&code)?;
+    drop(code);
+    let host = credentials.host;
     let employee = employee.trim().to_owned();
-    if employee.is_empty() || employee.chars().count() > 80 {
+    if !valid_employee_name(&employee) {
         return Err("Введите имя длиной от 1 до 80 символов.".into());
     }
     let (device, proof) = {
@@ -1208,8 +1114,11 @@ fn join(
             self.0.pending_discovery.lock().unwrap().take();
         }
     }
-    *core.pending_discovery.lock().unwrap() = Some((host, discovery::Key::derive(&key, false, id)));
-    let _pending = Pending(core);
+    *core.pending_discovery.lock().unwrap() = Some((
+        host,
+        discovery::Key::derive(&credentials.key, false, credentials.id),
+    ));
+    let pending = Pending(core);
     let request = JoinRequest {
         enforces_managed_access: true,
         device,
@@ -1246,6 +1155,8 @@ fn join(
             });
             match redeem(core, address, &credentials, &request, deadline, fallback) {
                 Ok(Ok(response)) => {
+                    drop(pending);
+                    drop(credentials);
                     core.require_operation(renewal)?;
                     response.workspace.require_device_access(device)?;
                     response.workspace.require_device_access(response.device)?;
@@ -1363,6 +1274,7 @@ fn sync_peer(
                 *protocol = PeerProtocol::Digest;
                 let peer_wakes_on_edit = stream.capabilities.contains(Capabilities::EDIT_WAKE);
                 let same_calendar = if stream.capabilities.contains(Capabilities::DELTA) {
+                    let capabilities = stream.capabilities;
                     delta::exchange(
                         core,
                         &mut stream,
@@ -1370,6 +1282,7 @@ fn sync_peer(
                         &state,
                         *address.ip(),
                         delta::Role::Initiator,
+                        capabilities,
                     )?
                 } else {
                     sync_digest(core, &mut stream, &mut transport, &state, *address.ip())?
@@ -1406,15 +1319,7 @@ fn sync_peer(
         &legacy_packet(&state, core.advertised_port())?,
     )?;
     let packet: SyncPacket = read_secure(&mut stream, &mut transport)?;
-    if packet.device == state.device {
-        return Err("Это адрес текущего устройства.".into());
-    }
-    let device = packet.device;
-    let peer = peer_address(*address.ip(), packet.port)?;
-    if let Err(error) = core.merge(packet) {
-        core.record_merge_error(peer, &error.to_string());
-        return Err(error);
-    }
+    let (device, peer) = merge_legacy_packet(core, packet, state.device, *address.ip())?;
     core.exchanged(device, peer);
     Ok(SyncPace::Regular)
 }
@@ -1530,31 +1435,30 @@ fn respond(core: &Core, tcp: TcpStream, ip: Ipv4Addr) -> Fallible<()> {
     }
     let id = Id::from_slice(&header[9..])?;
     let operation = Operation::try_from(header[8])?;
-    let (secret, recipient) = match operation {
+    let mut session = match operation {
         Operation::LegacySync | Operation::DigestSync => {
             let (_, workspace, key) = core.sync_context()?;
             if id != workspace {
                 return Err("Запрошено другое пространство.".into());
             }
-            (key, None)
+            ChannelKey::Group(&key)
+                .builder(&core.pairing, &header)?
+                .build_responder()?
         }
-        Operation::Join => core
-            .invites
-            .lock()
-            .unwrap()
-            .get(&id)
-            .filter(|invite| invite.expires > Instant::now())
-            .map(|invite| (invite.key, Some(invite.recipient)))
-            .ok_or("Приглашение просрочено.")?,
+        Operation::Join => {
+            let invites = core.invites.lock().unwrap();
+            let invite = invites
+                .get(&id)
+                .filter(|invite| invite.expires > Instant::now())
+                .ok_or("Приглашение просрочено.")?;
+            ChannelKey::Invitation {
+                secret: &invite.key,
+                peer: &invite.recipient,
+            }
+            .builder(&core.pairing, &header)?
+            .build_responder()?
+        }
     };
-    let key = match &recipient {
-        Some(peer) => ChannelKey::Invitation {
-            secret: &secret,
-            peer,
-        },
-        None => ChannelKey::Group(&secret),
-    };
-    let mut session = key.builder(&core.pairing, &header)?.build_responder()?;
     let mut buffer = [0; 256];
     let frame = read_frame(&mut stream, buffer.len())?;
     let n = session.read_message(&frame, &mut buffer)?;
@@ -1581,26 +1485,19 @@ fn respond(core: &Core, tcp: TcpStream, ip: Ipv4Addr) -> Fallible<()> {
                 return Err("Для этого календаря нужен современный протокол синхронизации.".into());
             }
             let request: SyncPacket = read_secure(&mut stream, &mut transport)?;
-            if request.device == core.snapshot().device {
-                return Err("Это адрес текущего устройства.".into());
-            }
-            let device = request.device;
-            let peer = peer_address(ip, request.port)?;
-            if let Err(error) = core.merge(request) {
-                core.record_merge_error(peer, &error.to_string());
-                return Err(error);
-            }
+            let (device, peer) = merge_legacy_packet(core, request, core.snapshot().device, ip)?;
             let state = core.snapshot();
             send_secure(
                 &mut stream,
                 &mut transport,
                 &legacy_packet(&state, core.advertised_port())?,
             )?;
-            core.inbound_exchange(state.device, device, peer, RECENT_INBOUND);
+            core.inbound_exchange(state.device, device, peer, RECENT_INBOUND, None);
             Ok(())
         }
         Operation::DigestSync if stream.capabilities.contains(Capabilities::DELTA) => {
             let edit_wake = stream.capabilities.contains(Capabilities::EDIT_WAKE);
+            let capabilities = stream.capabilities;
             delta::exchange(
                 core,
                 &mut stream,
@@ -1608,11 +1505,28 @@ fn respond(core: &Core, tcp: TcpStream, ip: Ipv4Addr) -> Fallible<()> {
                 &core.snapshot(),
                 ip,
                 delta::Role::Responder { edit_wake },
+                capabilities,
             )
             .map(|_| ())
         }
         Operation::DigestSync => respond_digest(core, &mut stream, &mut transport, ip),
     }
+}
+
+fn merge_legacy_packet(
+    core: &Core,
+    packet: SyncPacket,
+    own_device: Id,
+    ip: Ipv4Addr,
+) -> Fallible<(Id, SocketAddrV4)> {
+    let device = packet.device;
+    if device == own_device {
+        return Err("Это адрес текущего устройства.".into());
+    }
+    let peer = peer_address(ip, packet.port)?;
+    core.merge(packet)
+        .inspect_err(|error| core.record_merge_error(peer, &error.to_string()))?;
+    Ok((device, peer))
 }
 
 fn legacy_packet(state: &LocalState, port: u16) -> Fallible<SyncPacket<&Calendar>> {
@@ -1633,7 +1547,7 @@ struct SyncHello {
 }
 
 impl SyncHello {
-    const LEN: usize = 50;
+    const LEN: usize = SYNC_HELLO_LEN;
 
     fn new(core: &Core, state: &Arc<LocalState>) -> Fallible<Self> {
         Ok(Self {
@@ -1686,28 +1600,6 @@ impl Receipt {
     fn send(self, stream: &mut impl Write, transport: &mut TransportState) -> Fallible<()> {
         send_control(stream, transport, &[self as u8])
     }
-}
-
-fn send_control(
-    stream: &mut impl Write,
-    transport: &mut TransportState,
-    data: &[u8],
-) -> Fallible<()> {
-    let mut wire = [0; SyncHello::LEN + 18];
-    send_encrypted(stream, transport, data, &mut wire)
-}
-
-fn read_control<const N: usize>(
-    stream: &mut impl Read,
-    transport: &mut TransportState,
-) -> Fallible<[u8; N]> {
-    let mut wire = [0; SyncHello::LEN + 16];
-    let wire = read_frame_into(stream, &mut wire[..N + 16])?;
-    let mut plain = [0; N];
-    if transport.read_message(wire, &mut plain)? != N {
-        return Err("Неверный размер управляющего сообщения.".into());
-    }
-    Ok(plain)
 }
 
 fn finish_remote_rejection<T>(core: &Core, peer: SocketAddrV4) -> Fallible<T> {
@@ -1795,7 +1687,7 @@ fn respond_digest(
         } else {
             RECENT_INBOUND
         };
-    core.inbound_exchange(local.device, remote.device, peer, grace);
+    core.inbound_exchange(local.device, remote.device, peer, grace, None);
     Ok(())
 }
 
@@ -1815,12 +1707,20 @@ fn accept_calendar(
             calendar,
         })
     });
-    if let Err(error) = result {
+    reject_failed_snapshot(core, stream, transport, peer, result)
+}
+
+fn reject_failed_snapshot<T>(
+    core: &Core,
+    stream: &mut impl Write,
+    transport: &mut TransportState,
+    peer: SocketAddrV4,
+    result: Fallible<T>,
+) -> Fallible<T> {
+    result.inspect_err(|error| {
         core.record_merge_error(peer, &error.to_string());
         let _ = Receipt::Rejected.send(stream, transport);
-        return Err(error);
-    }
-    Ok(())
+    })
 }
 
 fn register(
@@ -1842,12 +1742,12 @@ fn register(
     if invite.used_by.is_some_and(|user| user != claimant) {
         return Err("Приглашение уже использовано.".into());
     }
-    if request.employee.trim().is_empty() || request.employee.chars().count() > 80 {
+    if !valid_employee_name(&request.employee) {
         return Err("Указано неверное имя.".into());
     }
     let peer = SocketAddrV4::new(ip, request.port);
     check_address(peer)?;
-    let response = core.store.lock().unwrap().transaction(|state| {
+    let (response, new_member) = core.store.lock().unwrap().transaction(|state| {
         core.require_available()?;
         let device = state.device;
         if device == request.device {
@@ -1862,7 +1762,8 @@ fn register(
             );
         }
         let grant = Id::new_v5(&workspace.id, &request.proof);
-        if workspace.calendar.members.contains_key(&request.device) {
+        let known_member = workspace.calendar.members.contains_key(&request.device);
+        if known_member {
             // A lost response can be recovered with a fresh invitation from the same device.
             let known = state.enrollment_grants.get(&request.device);
             let same_claimant = invite.used_by == Some(claimant)
@@ -1893,24 +1794,16 @@ fn register(
             workspace: workspace.clone(),
         };
         update_sync_time(&mut state.last_sync, Utc::now().timestamp());
-        Ok(response)
+        Ok((response, !known_member))
     })?;
     invite.used_by = Some(claimant);
+    drop(invites);
+    if new_member {
+        core.reader.repaint_window();
+    }
     core.exchanged(request.device, peer);
     core.wake_sync();
     Ok(response)
-}
-
-fn header(kind: Operation, id: Id) -> [u8; 25] {
-    let mut result = [0; 25];
-    result[..8].copy_from_slice(&MAGIC);
-    result[8] = kind as u8;
-    result[9..].copy_from_slice(id.as_bytes());
-    result
-}
-
-fn noise<'a>(header: &'a [u8], key: &'a [u8; 32]) -> Fallible<Builder<'a>> {
-    Ok(Builder::new(NOISE.parse()?).prologue(header)?.psk(0, key)?)
 }
 
 struct Connection<'a> {
@@ -2037,266 +1930,6 @@ fn set_io_timeout(
         }
         error
     })
-}
-
-fn write_frame(stream: &mut impl Write, bytes: &[u8]) -> io::Result<()> {
-    let length = u16::try_from(bytes.len()).map_err(io::Error::other)?;
-    stream.write_all(&length.to_be_bytes())?;
-    stream.write_all(bytes)
-}
-
-fn read_frame(stream: &mut impl Read, max: usize) -> io::Result<Vec<u8>> {
-    let length = read_frame_length(stream, max)?;
-    let mut frame = vec![0; length];
-    stream.read_exact(&mut frame)?;
-    Ok(frame)
-}
-
-fn read_frame_into<'a>(stream: &mut impl Read, buffer: &'a mut [u8]) -> io::Result<&'a [u8]> {
-    let length = read_frame_length(stream, buffer.len())?;
-    stream.read_exact(&mut buffer[..length])?;
-    Ok(&buffer[..length])
-}
-
-fn read_frame_length(stream: &mut impl Read, max: usize) -> io::Result<usize> {
-    let mut length = [0; 2];
-    stream.read_exact(&mut length)?;
-    let length = usize::from(u16::from_be_bytes(length));
-    if length == 0 || length > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "Неверный размер сетевого сообщения",
-        ));
-    }
-    Ok(length)
-}
-
-fn send_secure<T: Serialize>(
-    stream: &mut impl Write,
-    transport: &mut TransportState,
-    value: &T,
-) -> Fallible<()> {
-    let mut json = Vec::new();
-    serde_json::to_writer(LimitedWriter::new(&mut json, MESSAGE_LIMIT), value)?;
-    send_bytes(stream, transport, &json)
-}
-
-fn send_encrypted(
-    stream: &mut impl Write,
-    transport: &mut TransportState,
-    data: &[u8],
-    wire: &mut [u8],
-) -> Fallible<()> {
-    let written = transport.write_message(data, &mut wire[2..])?;
-    wire[..2].copy_from_slice(&u16::try_from(written)?.to_be_bytes());
-    stream.write_all(&wire[..2 + written])?;
-    Ok(())
-}
-
-fn send_bytes(
-    stream: &mut impl Write,
-    transport: &mut TransportState,
-    bytes: &[u8],
-) -> Fallible<()> {
-    let length = u32::try_from(bytes.len())?.to_be_bytes();
-    send_control(stream, transport, &length)?;
-    let mut buffer = vec![0; bytes.len().min(FRAME) + 18];
-    for plaintext in bytes.chunks(FRAME) {
-        send_encrypted(stream, transport, plaintext, &mut buffer)?;
-    }
-    Ok(())
-}
-
-fn read_secure<T: DeserializeOwned>(
-    stream: &mut impl Read,
-    transport: &mut TransportState,
-) -> Fallible<T> {
-    Ok(serde_json::from_slice(&read_bytes(stream, transport)?)?)
-}
-
-fn message_length(stream: &mut impl Read, transport: &mut TransportState) -> Fallible<usize> {
-    let length = read_control::<4>(stream, transport)?;
-    let length = u32::from_be_bytes(length) as usize;
-    if length == 0 || length > MESSAGE_LIMIT {
-        return Err("Размер календаря превышает лимит синхронизации.".into());
-    }
-    Ok(length)
-}
-
-fn read_bytes(stream: &mut impl Read, transport: &mut TransportState) -> Fallible<Vec<u8>> {
-    let length = message_length(stream, transport)?;
-    let mut message = vec![0; length];
-    let mut buffer = vec![0; length.min(FRAME) + 16];
-    for destination in message.chunks_mut(FRAME) {
-        let chunk = read_frame_into(stream, &mut buffer[..destination.len() + 16])?;
-        if transport.read_message(chunk, destination)? != destination.len() {
-            return Err("Получено неполное сообщение.".into());
-        }
-    }
-    Ok(message)
-}
-
-struct DigestWriter(Blake2s256);
-
-impl Write for DigestWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        Digest::update(&mut self.0, bytes);
-        Ok(bytes.len())
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-fn calendar_digest(calendar: &Calendar) -> Fallible<[u8; 32]> {
-    let mut digest = DigestWriter(Blake2s256::new());
-    let mut writer = BufWriter::new(LimitedWriter::new(&mut digest, MESSAGE_LIMIT));
-    serde_json::to_writer(&mut writer, calendar)?;
-    writer.into_inner().map_err(|e| e.into_error())?;
-    Ok(digest.0.finalize().into())
-}
-
-fn encode_calendar(calendar: &Calendar) -> Fallible<Vec<u8>> {
-    let mut compressed = Vec::new();
-    let mut output = LimitedWriter::new(&mut compressed, MESSAGE_LIMIT);
-    let mut encoder = ZlibEncoder::new(&mut output, Compression::fast());
-    let mut writer = BufWriter::new(LimitedWriter::new(&mut encoder, MESSAGE_LIMIT));
-    serde_json::to_writer(&mut writer, calendar)?;
-    writer.into_inner().map_err(|e| e.into_error())?;
-    encoder.finish()?;
-    Ok(compressed)
-}
-
-fn send_calendar(
-    stream: &mut impl Write,
-    transport: &mut TransportState,
-    calendar: &Calendar,
-) -> Fallible<()> {
-    send_bytes(stream, transport, &encode_calendar(calendar)?)
-}
-
-struct CalendarFrames<'a, R> {
-    stream: &'a mut R,
-    transport: &'a mut TransportState,
-    encrypted: Vec<u8>,
-    decoded: Vec<u8>,
-    unread: std::ops::Range<usize>,
-    remaining: usize,
-}
-
-impl<'a, R> CalendarFrames<'a, R> {
-    fn new(stream: &'a mut R, transport: &'a mut TransportState, length: usize) -> Self {
-        let capacity = length.min(FRAME);
-        Self {
-            stream,
-            transport,
-            encrypted: vec![0; capacity + 16],
-            decoded: vec![0; capacity],
-            unread: 0..0,
-            remaining: length,
-        }
-    }
-}
-
-impl<R: Read> BufRead for CalendarFrames<'_, R> {
-    fn fill_buf(&mut self) -> io::Result<&[u8]> {
-        if self.unread.is_empty() && self.remaining > 0 {
-            let size = self.remaining.min(FRAME);
-            let encrypted = read_frame_into(self.stream, &mut self.encrypted[..size + 16])?;
-            let count = self
-                .transport
-                .read_message(encrypted, &mut self.decoded[..size])
-                .map_err(|_| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "Не удалось прочитать кадр календаря.",
-                    )
-                })?;
-            if count != size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    "Получено неполное сообщение.",
-                ));
-            }
-            self.remaining -= count;
-            self.unread = 0..count;
-        }
-        Ok(&self.decoded[self.unread.clone()])
-    }
-
-    fn consume(&mut self, amount: usize) {
-        self.unread.start += amount.min(self.unread.len());
-    }
-}
-
-impl<R: Read> Read for CalendarFrames<'_, R> {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        let count = self.fill_buf()?.read(output)?;
-        self.consume(count);
-        Ok(count)
-    }
-}
-
-struct DigestReader<R> {
-    source: R,
-    digest: Blake2s256,
-}
-
-impl<R: Read> Read for DigestReader<R> {
-    fn read(&mut self, bytes: &mut [u8]) -> io::Result<usize> {
-        let count = self.source.read(bytes)?;
-        Digest::update(&mut self.digest, &bytes[..count]);
-        Ok(count)
-    }
-}
-
-fn decode_calendar(
-    compressed: impl BufRead,
-    length: usize,
-    expected: [u8; 32],
-) -> Fallible<Calendar> {
-    decode_calendar_with_limit(compressed, length, expected, MESSAGE_LIMIT)
-}
-
-fn decode_calendar_with_limit(
-    compressed: impl BufRead,
-    length: usize,
-    expected: [u8; 32],
-    max: usize,
-) -> Fallible<Calendar> {
-    let decoder = ZlibDecoder::new(compressed);
-    let reader = DigestReader {
-        source: decoder.take(max as u64 + 1),
-        digest: Blake2s256::new(),
-    };
-    let mut buffered = BufReader::new(reader);
-    let calendar = serde_json::from_reader(&mut buffered)?;
-    let reader = buffered.into_inner();
-    if reader.source.limit() == 0 || reader.source.into_inner().total_in() != length as u64 {
-        return Err("Неверный размер сжатого календаря.".into());
-    }
-    let actual: [u8; 32] = reader.digest.finalize().into();
-    if actual != expected {
-        return Err("Календарь не совпадает с контрольной суммой обмена.".into());
-    }
-    Ok(calendar)
-}
-
-fn read_calendar(
-    stream: &mut impl Read,
-    transport: &mut TransportState,
-    expected: [u8; 32],
-) -> Fallible<Calendar> {
-    let length = message_length(stream, transport)?;
-    decode_calendar(
-        CalendarFrames::new(stream, transport, length),
-        length,
-        expected,
-    )
 }
 
 #[cfg(test)]

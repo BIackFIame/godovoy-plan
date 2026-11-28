@@ -1,6 +1,5 @@
 //! Protect local profile data with the logged-in user's filesystem permissions.
 //! The profile contains a shared team secret. An exchange file has a different format.
-#[cfg(unix)]
 use std::io;
 use std::{fs, path::Path};
 
@@ -30,10 +29,10 @@ pub(super) fn check_directory(path: &Path) -> Fallible<()> {
 
 /// Inspect the handle that will actually be used. Never follow the final
 /// component or wait for a special file while deciding whether it is regular.
-pub(super) fn open_regular(
+fn open_regular_handle(
     path: &Path,
     options: &mut fs::OpenOptions,
-) -> Fallible<(fs::File, fs::Metadata)> {
+) -> io::Result<(fs::File, fs::Metadata)> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -47,15 +46,37 @@ pub(super) fn open_regular(
     let file = options.open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Err("Ожидался обычный файл хранилища.".into());
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "Ожидался обычный файл хранилища."));
     }
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         if metadata.file_attributes() & 0x400 != 0 { // FILE_ATTRIBUTE_REPARSE_POINT
-            return Err("Файл содержит точку повторной обработки.".into());
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "Файл содержит точку повторной обработки."));
         }
     }
+    Ok((file, metadata))
+}
+
+/// Read an already private local profile. Recovery can retain a hard link to
+/// the old inode while publishing its replacement, so a read may see two links.
+pub(super) fn open_profile_reader(path: &Path) -> io::Result<(fs::File, fs::Metadata)> {
+    let (file, metadata) = open_regular_handle(path, fs::OpenOptions::new().read(true))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != rustix::process::geteuid().as_raw() {
+            return Err(io::Error::new(io::ErrorKind::PermissionDenied, "Файл профиля должен принадлежать текущему пользователю."));
+        }
+    }
+    Ok((file, metadata))
+}
+
+pub(super) fn open_regular(
+    path: &Path,
+    options: &mut fs::OpenOptions,
+) -> Fallible<(fs::File, fs::Metadata)> {
+    let (file, metadata) = open_regular_handle(path, options)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -122,7 +143,7 @@ fn managed(name: &std::ffi::OsStr) -> bool {
 
 #[cfg(unix)]
 fn inspect_file(path: &Path, repair: bool) -> Fallible<()> {
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let found = fs::symlink_metadata(path)?;
     if !found.is_file() || found.uid() != rustix::process::geteuid().as_raw() {
         return Err(format!(
@@ -139,13 +160,8 @@ fn inspect_file(path: &Path, repair: bool) -> Fallible<()> {
     }
     // Narrow permissions on old, user-owned single-link files only. An
     // external hard link might designate data outside the profile.
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
-        .open(path)?;
-    let meta = file.metadata()?;
-    if !meta.is_file()
-        || meta.uid() != rustix::process::geteuid().as_raw()
+    let (file, meta) = open_regular_handle(path, fs::OpenOptions::new().read(true))?;
+    if meta.uid() != rustix::process::geteuid().as_raw()
         || meta.nlink() != 1
         || meta.mode() & 0o022 != 0
     {
@@ -383,6 +399,29 @@ mod lock_files {
         drop(created);
         assert!(open_lock(&lock, &mut fs::OpenOptions::new()).is_ok());
         assert!(open_lock(tmp.path(), &mut fs::OpenOptions::new()).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_reads_support_retained_originals_and_reject_symbolic_links() {
+        use std::os::unix::fs::symlink;
+        use std::io::Read;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("calendar.json");
+        assert_eq!(open_profile_reader(&path).unwrap_err().kind(), io::ErrorKind::NotFound);
+        fs::write(&path, b"original").unwrap();
+        let retained = directory.path().join("calendar-before-restore-test.json");
+        fs::hard_link(&path, &retained).unwrap();
+        let (mut file, metadata) = open_profile_reader(&retained).unwrap();
+        assert_eq!(metadata.len(), 8);
+        let mut text = String::new();
+        file.read_to_string(&mut text).unwrap();
+        assert_eq!(text, "original");
+        let alias = directory.path().join("drafts-v1.json");
+        symlink(&path, &alias).unwrap();
+        assert!(open_profile_reader(&alias).is_err());
+        assert!(open_profile_reader(directory.path()).is_err());
     }
 
     #[test]

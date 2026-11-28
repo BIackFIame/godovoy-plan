@@ -422,6 +422,8 @@ fn restore_recovers_broken_or_missing_calendar_without_reviving_tokens() {
     drop(store);
 
     let calendar = profile.join("calendar.json");
+    // A copy from an older version may still have this profile's credentials.
+    fs::write(copy_path(&profile), fs::read(&calendar).unwrap()).unwrap();
     fs::write(&calendar, b"{ damaged").unwrap();
     let result = Store::restore_backup(&profile, &backup).unwrap();
     assert_eq!(fs::read(result.original.unwrap()).unwrap(), b"{ damaged");

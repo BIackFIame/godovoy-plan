@@ -1,7 +1,7 @@
 use super::{
     Fallible, Id, LocalState, PROFILE_LIMIT, ProfileOpenIssue, SharedStore, Store,
     check_private_directory, check_profile_file, open_profile_lock, preserve_original,
-    read_calendar_file, stage, stage_profile,
+    read_calendar_file, stage, stage_profile, sync_directory,
 };
 use blake2::{Blake2s256, Digest};
 use chrono::{DateTime, Utc};
@@ -209,6 +209,7 @@ impl Store {
     pub fn restore_backup(directory: &Path, backup: &BackupEntry) -> Fallible<RestoreResult> {
         let _lock = open_profile_lock(directory)?;
         let (_, _, result) = Self::replace_calendar(directory, backup, None)?;
+        sync_directory(directory)?;
         Ok(result)
     }
 
@@ -218,16 +219,20 @@ impl Store {
     ) -> Fallible<RestoredProfile> {
         let lock = open_profile_lock(directory)?;
         let (state, bytes, result) = Self::replace_calendar(directory, backup, None)?;
+        // A later failure to open the restored profile is recoverable. A failed
+        // directory flush must still be reported as an unconfirmed restore.
+        sync_directory(directory)?;
         let store = Self::open_saved_profile(directory, state, bytes, lock);
         Ok(RestoredProfile { result, store })
     }
 
     pub fn restore_open_backup(&mut self, backup: &BackupEntry) -> Fallible<RestoreResult> {
         self.ensure_current_generation()?;
+        self.finish_directory_sync(sync_directory)?;
         let directory = self.path.parent().ok_or("Не указана папка профиля.")?;
         let (restored, bytes, result) =
             Self::replace_calendar(directory, backup, Some(&self.state))?;
-        self.publish_calendar(restored, bytes);
+        self.publish_replaced_profile(restored, bytes, sync_directory)?;
         Ok(result)
     }
 
@@ -243,8 +248,7 @@ impl Store {
             .ok_or("Сведения о профиле копии отсутствуют.")?;
         let (mut restored, _) = read_calendar_file(&folder.join(backup.file_name()))?;
         origin.require_match(&restored)?;
-        restored.api = None;
-        restored.enrollment_grants.clear();
+        clear_backup_credentials(&mut restored);
 
         let calendar = directory.join("calendar.json");
         let (disk, has_original) = match read_calendar_file(&calendar) {
@@ -318,13 +322,18 @@ impl Store {
     }
 }
 
+fn clear_backup_credentials(state: &mut LocalState) {
+    state.api = None;
+    state.enrollment_grants.clear();
+}
+
 fn write_backup(folder: &Path, state: &LocalState, copy: BackupEntry) -> Fallible<BackupEntry> {
     let name = folder.join(copy.file_name());
     let mut calendar = state.clone();
-    calendar.api = None;
-    calendar.enrollment_grants.clear();
+    clear_backup_credentials(&mut calendar);
     let (file, _) = stage_profile(&name, &calendar)?;
     file.persist_noclobber(&name)?;
+    sync_directory(folder)?;
     Ok(copy)
 }
 

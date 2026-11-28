@@ -1,6 +1,6 @@
 [package]
 name = "godovoy-plan"
-version = "0.6.6"
+version = "0.7.0"
 edition = "2024"
 default-run = "godovoy-plan"
 # Only the named integration suites below are executable test targets.
@@ -16,7 +16,7 @@ required-features = ["desktop"]
 [[bin]]
 name = "godovoy-bridge"
 path = "src/bin/godovoy-bridge.rs"
-required-features = ["desktop"]
+required-features = ["bridge"]
 
 [[bin]]
 name = "godovoy-online"
@@ -25,11 +25,11 @@ required-features = ["server"]
 
 [[test]]
 name = "api"
-required-features = ["desktop"]
+required-features = ["bridge"]
 
 [[test]]
 name = "api_scenarios"
-required-features = ["desktop"]
+required-features = ["local-api"]
 
 [[test]]
 name = "backup"
@@ -48,7 +48,7 @@ name = "exchange_scenarios"
 
 [[test]]
 name = "import_cross_year"
-required-features = ["desktop"]
+required-features = ["local-api"]
 
 [[test]]
 name = "lan"
@@ -69,8 +69,17 @@ name = "storage_permissions"
 
 [features]
 default = ["desktop"]
-server = ["serde_json/raw_value", "dep:sha2", "dep:axum", "dep:hyper", "dep:hyper-util", "dep:tower", "dep:tokio"]
-desktop = ["server", "dep:ureq", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+http-runtime = ["dep:axum", "dep:tower", "dep:tokio"]
+server = ["http-runtime", "dep:base64", "dep:brotli", "dep:flate2", "serde_json/raw_value", "dep:sha2", "dep:hyper", "dep:hyper-util"]
+local-api = ["http-runtime"]
+bridge = ["local-api", "dep:ureq"]
+desktop = ["server", "bridge", "dep:dirs", "dep:eframe", "dep:notify-rust", "dep:rfd"]
+
+[build-dependencies]
+base64 = { version = "0.22", optional = true }
+sha2 = { version = "0.10", optional = true }
+brotli = { version = "9", optional = true }
+flate2 = { optional = true, version = "1", default-features = false, features = ["rust_backend"] }
 
 [dependencies]
 curve25519-dalek = { version = "4", default-features = false }
@@ -98,6 +107,9 @@ socket2 = { version = "0.6", features = ["all"] }
 tempfile = "3"
 uuid = { version = "1", features = ["serde", "v4", "v5"] }
 zeroize = "1"
+
+[target.'cfg(not(all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
+sha2 = { version = "0.10", optional = true }
 
 [target.'cfg(all(target_os = "macos", target_arch = "aarch64"))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"], optional = true }

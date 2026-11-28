@@ -1,0 +1,28 @@
+[Unit]
+Description=Godovoy Plan calendar
+After=network.target
+
+[Service]
+Type=exec
+User=godovoy-office
+Group=godovoy-office
+EnvironmentFile=/etc/godovoy-quick/office.env
+StateDirectory=godovoy-office
+StateDirectoryMode=0700
+RuntimeDirectory=godovoy-quick-calendar
+RuntimeDirectoryMode=0750
+UMask=0077
+ExecStartPre=/etc/godovoy-quick/profile
+ExecStart=/etc/godovoy-quick/godovoy-online serve-office-socket /var/lib/godovoy-office/calendar /run/godovoy-quick-calendar/http.sock https://${GODOVOY_OFFICE_HOST}
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,20 @@
+[Unit]
+Description=Godovoy Plan verified snapshot
+After=godovoy-quick-calendar.service
+AssertPathExists=/var/lib/godovoy-office/calendar/online-access-v1.json
+
+[Service]
+Type=oneshot
+User=godovoy-office
+Group=godovoy-office
+StateDirectory=godovoy-office
+StateDirectoryMode=0700
+UMask=0077
+ExecStart=/bin/sh -ec 'exec /etc/godovoy-quick/godovoy-online backup /var/lib/godovoy-office/calendar "/var/lib/godovoy-office/snapshots/calendar-$(date -u +%%Y%%m%%dT%%H%%M%%S%%NZ)"'
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+CapabilityBoundingSet=
+PrivateNetwork=true

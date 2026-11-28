@@ -2,7 +2,6 @@ use std::{
     net::{Ipv4Addr, SocketAddrV4},
     path::{Path, PathBuf},
     sync::mpsc::{Receiver, TryRecvError, TrySendError, sync_channel},
-    thread,
 };
 
 use chrono::Local;
@@ -18,13 +17,15 @@ use godovoy_plan::{
 
 use crate::{
     theme::{self, ACCENT, BACK, RED, brand, card, dialog, muted, primary, title},
-    ui::{App, RestoreRequest},
+    ui::{App, LocalWorkStatus, RestoreRequest, spawn_worker},
 };
 
 const APP_SIZE: Vec2 = vec2(1340.0, 850.0);
 const APP_MIN_SIZE: Vec2 = vec2(800.0, 500.0);
 const RECOVERY_SIZE: Vec2 = vec2(710.0, 400.0);
 const RECOVERY_MIN_SIZE: Vec2 = vec2(600.0, 360.0);
+const PICKER_SIZE: Vec2 = vec2(RECOVERY_SIZE.x, 510.0);
+const PICKER_MIN_SIZE: Vec2 = vec2(RECOVERY_MIN_SIZE.x, 470.0);
 
 pub fn run(
     directory: PathBuf,
@@ -34,11 +35,7 @@ pub fn run(
 ) -> Fallible<()> {
     let (directory, initial) = match Store::active_directory(&directory) {
         Ok(active) => {
-            let opened = if active == directory {
-                Store::open(&active)
-            } else {
-                Store::open_existing(&active)
-            };
+            let opened = open_profile(&active, active != directory);
             (active, opened)
         }
         Err(error) => (directory, Err(error)),
@@ -75,6 +72,7 @@ pub fn run(
         Box::new(move |context| {
             theme::setup(&context.egui_ctx);
             let mut desktop = Desktop {
+                larger_font_atlas: None,
                 directory,
                 config,
                 standard_profile,
@@ -101,6 +99,14 @@ pub fn run(
         }),
     )
     .map_err(|error| error.to_string().into())
+}
+
+fn open_profile(directory: &Path, existing_required: bool) -> Fallible<SharedStore> {
+    if existing_required {
+        Store::open_existing(directory)
+    } else {
+        Store::open(directory)
+    }
 }
 
 pub(crate) fn start_network(store: SharedStore, mut config: Config) -> Result<Network, String> {
@@ -250,10 +256,7 @@ enum ExitState {
     Idle,
     WaitingForRestore,
     WaitingForLocalWork {
-        exchange: bool,
-        reminders: bool,
-        api: bool,
-        backup: bool,
+        started: LocalWorkStatus,
     },
     Confirm {
         previous_focus: Option<egui::Id>,
@@ -264,6 +267,7 @@ enum ExitState {
 }
 
 struct Desktop {
+    larger_font_atlas: Option<usize>,
     directory: PathBuf,
     config: Config,
     standard_profile: bool,
@@ -307,11 +311,7 @@ impl Desktop {
                 return;
             }
         }
-        let store = if self.existing_required {
-            Store::open_existing(&self.directory)
-        } else {
-            Store::open(&self.directory)
-        };
+        let store = open_profile(&self.directory, self.existing_required);
         self.start(store);
         if self.app.is_some() {
             resize(ctx, APP_SIZE, APP_MIN_SIZE);
@@ -342,7 +342,7 @@ impl Desktop {
             error,
         });
         if self.app.is_none() {
-            resize(ctx, vec2(710.0, 510.0), vec2(600.0, 470.0));
+            resize(ctx, PICKER_SIZE, PICKER_MIN_SIZE);
         }
         ctx.request_repaint();
     }
@@ -366,23 +366,21 @@ impl Desktop {
 
     fn apply_restore(&mut self, ctx: &egui::Context, copy: BackupEntry) {
         let (send_app, receive_app) = sync_channel::<Option<Box<App>>>(1);
-        let (send_result, completed) = sync_channel(1);
         let directory = self.directory.clone();
-        let worker_ctx = ctx.clone();
-        let worker = thread::Builder::new()
-            .name("calendar-restore".into())
-            .spawn(move || {
-                if let Ok(mut previous) = receive_app.recv() {
-                    let outcome = restore_calendar(&directory, &copy, &mut previous);
-                    let _ = send_result.send(RestoreCompletion { previous, outcome });
-                    worker_ctx.request_repaint();
-                }
-            });
-        if worker.is_err() {
-            self.restore_error("Не удалось запустить восстановление.".into());
-            ctx.request_repaint();
-            return;
-        }
+        let completed = match spawn_worker("calendar-restore", ctx, move || {
+            let Ok(mut previous) = receive_app.recv() else {
+                return None;
+            };
+            let outcome = restore_calendar(&directory, &copy, &mut previous);
+            Some(RestoreCompletion { previous, outcome })
+        }) {
+            Ok(completed) => completed,
+            Err(_) => {
+                self.restore_error("Не удалось запустить восстановление.".into());
+                ctx.request_repaint();
+                return;
+            }
+        };
         let recovery_window = self.app.is_none();
         // Move the live profile only after the worker has been created.
         if let Err(TrySendError::Disconnected(app) | TrySendError::Full(app)) =
@@ -565,7 +563,7 @@ impl Desktop {
         if let Some(app) = &mut self.app
             && app.close_api_listener(ctx)
         {
-            self.exit = if app.api_controls_busy() {
+            self.exit = if app.local_work_status().api.busy {
                 ExitState::ClosingApi
             } else {
                 ExitState::Idle
@@ -578,7 +576,32 @@ impl Desktop {
     }
 }
 
+// egui uses the renderer's reported maximum as its initial RGBA glyph atlas width.
+// Keep its native limit available if many glyphs or large type need more room.
+fn font_atlas_limit(
+    renderer_limit: Option<usize>,
+    larger: &mut Option<usize>,
+    crowded: impl FnOnce() -> bool,
+) -> Option<usize> {
+    const INITIAL_LIMIT: usize = 4096;
+    if let Some(limit) = renderer_limit {
+        *larger = (limit > INITIAL_LIMIT).then_some(limit);
+        Some(limit.min(INITIAL_LIMIT))
+    } else if larger.is_some() && crowded() {
+        larger.take()
+    } else {
+        None
+    }
+}
+
 impl eframe::App for Desktop {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, input: &mut egui::RawInput) {
+        input.max_texture_side =
+            font_atlas_limit(input.max_texture_side, &mut self.larger_font_atlas, || {
+                ctx.fonts(|fonts| fonts.font_atlas_fill_ratio() > 0.6)
+            });
+    }
+
     fn clear_color(&self, _visuals: &egui::Visuals) -> [f32; 4] {
         BACK.to_normalized_gamma_f32()
     }
@@ -612,7 +635,7 @@ impl eframe::App for Desktop {
             && self
                 .app
                 .as_ref()
-                .is_some_and(|app| app.backup_creation_busy());
+                .is_some_and(|app| app.local_work_status().backup.busy);
         if let Some(app) = &mut self.app {
             app.logic(context, frame);
         }
@@ -627,38 +650,20 @@ impl eframe::App for Desktop {
             return;
         }
         let waiting = match self.exit {
-            ExitState::WaitingForLocalWork {
-                exchange,
-                reminders,
-                api,
-                backup,
-            } => Some((exchange, reminders, api, backup)),
+            ExitState::WaitingForLocalWork { started } => Some(started),
             _ => None,
         };
         if (waiting.is_some() || (close_requested && matches!(self.exit, ExitState::Idle)))
             && let Some(app) = self.app.as_deref()
         {
-            let exchange = app.file_exchange_busy();
-            let reminders = app.reminder_work_busy();
-            let api = app.api_controls_busy();
-            let backup = app.backup_creation_busy();
-            if exchange || reminders || api || backup {
+            let current = app.local_work_status();
+            let started =
+                waiting.unwrap_or_else(|| current.with_backup_was_writing(backup_was_writing));
+            if current.any_busy() {
                 if waiting.is_none() {
-                    self.exit = ExitState::WaitingForLocalWork {
-                        exchange,
-                        reminders,
-                        api,
-                        backup: backup || backup_was_writing,
-                    };
+                    self.exit = ExitState::WaitingForLocalWork { started };
                 }
-            } else if (close_requested && backup_was_writing && app.backup_creation_failed())
-                || waiting.is_some_and(|(exchange, reminders, api, backup)| {
-                    (exchange && app.file_exchange_failed())
-                        || (reminders && app.reminder_work_failed())
-                        || (api && app.api_controls_failed())
-                        || (backup && app.backup_creation_failed())
-                })
-            {
+            } else if (backup_was_writing && current.backup.failed) || started.failed_for(current) {
                 self.exit = ExitState::Idle;
             } else if app.has_unsaved_changes() {
                 self.exit = ExitState::Confirm {
@@ -671,12 +676,14 @@ impl eframe::App for Desktop {
         }
         if matches!(self.exit, ExitState::ClosingApi)
             && let Some(app) = self.app.as_deref()
-            && !app.api_controls_busy()
         {
-            if app.api_controls_failed() {
-                self.exit = ExitState::Idle;
-            } else {
-                self.finish_exit(context);
+            let api = app.local_work_status().api;
+            if !api.busy {
+                if api.failed {
+                    self.exit = ExitState::Idle;
+                } else {
+                    self.finish_exit(context);
+                }
             }
         }
         let keep_open = matches!(
@@ -696,20 +703,9 @@ impl eframe::App for Desktop {
             return;
         }
         match self.exit {
-            ExitState::WaitingForLocalWork {
-                exchange,
-                reminders,
-                api,
-                backup,
-            } => {
+            ExitState::WaitingForLocalWork { started } => {
                 let ctx = ui.ctx();
-                let caption = match (exchange, reminders, api, backup) {
-                    (true, false, false, false) => "Завершаем обмен через файл",
-                    (false, true, false, false) => "Сохраняем отметки напоминаний",
-                    (false, false, true, false) => "Завершаем работу с интеграциями",
-                    (false, false, false, true) => "Сохраняем резервную копию",
-                    _ => "Завершаем локальные операции",
-                };
+                let caption = started.caption();
                 let modal = egui::Modal::new(egui::Id::new("exit-after-local-work"))
                     .frame(dialog(ctx))
                     .backdrop_color(theme::MODAL_BACKDROP)
@@ -811,4 +807,48 @@ fn recovery_panel(ui: &mut Ui, body: impl FnOnce(&mut Ui)) {
                     );
                 });
         });
+}
+
+#[cfg(test)]
+mod profile_tests {
+    #[test]
+    fn missing_replacement_profile_is_not_created() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing = temp.path().join("replacement");
+        assert!(super::open_profile(&missing, true).is_err());
+        assert!(!missing.join("calendar.json").exists());
+        assert!(super::open_profile(&missing, false).is_ok());
+    }
+}
+
+#[cfg(test)]
+mod atlas_tests {
+    use super::font_atlas_limit;
+
+    #[test]
+    fn respects_renderer_limit_and_rechecks_only_while_expansion_is_possible() {
+        for native in [1024, 2048, 4096, 8192, 16384] {
+            let mut larger = None;
+            let unexpected = || panic!("the initial GPU limit needs no font lookup");
+            assert_eq!(
+                font_atlas_limit(Some(native), &mut larger, unexpected),
+                Some(native.min(4096))
+            );
+            if native > 4096 {
+                assert_eq!(font_atlas_limit(None, &mut larger, || false), None);
+                assert_eq!(font_atlas_limit(None, &mut larger, || true), Some(native));
+            }
+            assert_eq!(font_atlas_limit(None, &mut larger, unexpected), None);
+        }
+    }
+
+    #[test]
+    fn new_renderer_replaces_the_previous_expansion_limit() {
+        let mut larger = Some(16384);
+        assert_eq!(
+            font_atlas_limit(Some(2048), &mut larger, || true),
+            Some(2048)
+        );
+        assert_eq!(font_atlas_limit(None, &mut larger, || true), None);
+    }
 }
